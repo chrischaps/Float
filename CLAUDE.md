@@ -80,7 +80,8 @@ when ready). Plan: `C:\Users\chris\.claude\plans\please-make-a-plan-fluffy-pearl
 
 ## Debug controls in play
 
-F3 — ocean tuning panel (waves, colors, clarity/turbidity, grid).
-Time of day: edit `tod.time_of_day.time_hours` (0-24) / `auto_advance`
-via the panel-less route for now: `flint edit` inspector, or tweak
-`day_length_sec` in the scene. Escape releases the mouse; click recaptures.
+F3 toggles both panels: **Ocean Debug** (waves, colors, foam, water
+clarity/turbidity, grid) and **Time of Day** (0-24h scrub slider, natural
+advance toggle, day length, sun path tilt). Edits apply live through the
+world's components; "Commit to File" writes them back into the scene TOML.
+Escape releases the mouse (for panel use); click recaptures.
