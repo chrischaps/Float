@@ -1,0 +1,22 @@
+//! Flint Core - Foundational types for the Flint engine
+//!
+//! This crate provides the core types that all other Flint crates depend on:
+//! - `EntityId` - Stable entity identifiers
+//! - `ContentHash` - SHA-256 based content hashing
+//! - `Transform`, `Vec3` - Spatial types
+//! - Error types and Result alias
+
+pub mod callbacks;
+pub mod components;
+mod error;
+pub mod events;
+mod hash;
+mod id;
+pub mod spline;
+pub mod toml_util;
+mod types;
+
+pub use error::{FlintError, Result};
+pub use hash::ContentHash;
+pub use id::EntityId;
+pub use types::{mat4_mul, Color, Transform, Vec3};
