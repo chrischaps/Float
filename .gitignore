@@ -1,0 +1,14 @@
+# Rust build artifacts (engine subtree builds into engine/target)
+engine/target/
+
+# Render snapshots / scratch output
+snapshots/
+*.png.tmp
+
+# Python
+__pycache__/
+*.pyc
+
+# OS noise
+Thumbs.db
+.DS_Store
