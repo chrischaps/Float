@@ -96,6 +96,9 @@ foam_threshold = 0.62
 foam_noise_scale = 0.35
 ramp_steps = 3.0
 specular_strength = 1.0
+turbidity = 0.8
+refraction_strength = 0.6
+absorption_color = [0.9, 0.35, 0.22]
 grid_scale = 60.0
 fade_start = 90.0
 fade_end = 170.0
@@ -131,6 +134,18 @@ yaw_sway_deg = 5.0
 yaw_sway_rate = 0.05
 [entities.raft.script]
 source = "raft.rhai"
+
+# ── The player's legs, dangling over the +Z edge into the water ──
+#    (script-pinned to the seat; swap models/legs.glb for a nicer
+#    model any time — same origin/pose contract)
+
+[entities.legs]
+[entities.legs.transform]
+position = [0.0, 0.3, 1.0]
+[entities.legs.model]
+asset = "legs"
+[entities.legs.script]
+source = "legs_idle.rhai"
 
 # ── Seated first-person camera (declared after the raft so it reads
 #    this frame's raft transform) ─────────────────────────────────
