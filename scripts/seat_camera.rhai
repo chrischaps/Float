@@ -51,8 +51,12 @@ fn on_update() {
     }
 
     // ── Look input ──────────────────────────────────────────────────
-    look_yaw += mouse_delta_x() * sens + action_value("look_x") * STICK_SPEED * dt;
-    look_pitch += mouse_delta_y() * sens + action_value("look_y") * STICK_SPEED * dt;
+    // Subtract deltas (engine FPS convention, see flint-physics
+    // character.rs): with dir = (sin(yaw), _, cos(yaw)), increasing yaw
+    // turns toward +X = screen-LEFT, so mouse-right must decrease yaw.
+    // Mouse-forward (negative dy) must increase pitch (look up).
+    look_yaw -= mouse_delta_x() * sens + action_value("look_x") * STICK_SPEED * dt;
+    look_pitch -= mouse_delta_y() * sens + action_value("look_y") * STICK_SPEED * dt;
     look_yaw = clamp(look_yaw, -YAW_LIMIT, YAW_LIMIT);
     look_pitch = clamp(look_pitch, PITCH_MIN, PITCH_MAX);
 
@@ -88,11 +92,12 @@ fn on_update() {
     let eye_z = rp["z"] + r20 * lx + r21 * ly + r22 * lz;
 
     // ── View direction ──────────────────────────────────────────────
-    // World look yaw = raft yaw + seat-relative yaw (seat faces raft +Z).
-    // Deck tilt leans into the gaze: facing the bow you feel pitch,
-    // facing sideways you feel roll — projected by the look yaw.
+    // World look yaw = raft yaw + seat-relative yaw (seat faces raft +Z;
+    // positive look_yaw = looking LEFT of the bow under the engine
+    // convention above). Deck tilt leans into the gaze: facing the bow
+    // you feel pitch, facing sideways you feel roll — projected by yaw.
     let world_yaw = ay + look_yaw;
-    let tilt = (-ax * cos(look_yaw) + az * sin(look_yaw)) * transfer;
+    let tilt = (-ax * cos(look_yaw) - az * sin(look_yaw)) * transfer;
     let eff_pitch = clamp(look_pitch + tilt, -1.45, 1.45);
 
     let cp = cos(eff_pitch);

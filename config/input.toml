@@ -38,7 +38,7 @@ type = "gamepad_axis"
 axis = "RightStickY"
 gamepad = "any"
 deadzone = 0.15
-scale = 1.0
+scale = -1.0    # gilrs stick-up is +1; the seat script subtracts (look up)
 
 # ── Recapture mouse after Escape released it ────────────────────────────
 
