@@ -1,0 +1,147 @@
+# ================================================================
+#  FLOAT — adrift
+# ================================================================
+#
+#  You sit on a hand-lashed raft on an endless ocean. That's it.
+#  That's the game.
+#
+#  Launch: play.bat
+#
+#  Controls:
+#    Mouse / Arrows / Right stick — look around
+#    Escape                       — exit
+#
+#  M0: static raft on a flat placeholder slab. The real ocean
+#  arrives with the M1 ocean pipeline.
+# ================================================================
+
+[scene]
+name = "Float — adrift"
+version = "0.1"
+description = "First-person raft on an endless stylized ocean"
+input_config = "config/input.toml"
+
+[post_process]
+enabled = true
+bloom_enabled = true
+bloom_intensity = 0.06
+bloom_threshold = 1.0
+vignette_enabled = true
+vignette = 0.18
+fog_enabled = true
+fog_color = [0.85, 0.45, 0.35]
+fog_density = 0.0015
+fog_start = 60.0
+
+# ── Light: late-morning sun (M3 animates this via time_of_day.rhai) ──
+
+# Note: Flint's light `direction` points FROM surfaces TOWARD the light
+# (shadow eye sits along +direction; PBR uses L = normalize(direction)).
+# Direction/color/intensity are driven per-frame by time_of_day.rhai.
+[entities.sun]
+[entities.sun.light]
+type = "directional"
+direction = [0.30, 0.10, 0.94]
+color = [1.0, 0.34, 0.13]
+intensity = 1.1
+
+# ── Procedural sky (replaces the texture skybox; sun disc follows the
+#    sun light). Fields driven per-frame by time_of_day.rhai. ──────
+
+[entities.sky_dome]
+[entities.sky_dome.sky]
+zenith_color = [0.22, 0.16, 0.42, 1.0]
+horizon_color = [1.0, 0.38, 0.20, 1.0]
+haze_color = [1.0, 0.45, 0.30, 0.8]
+cloud_tint = [0.95, 0.50, 0.48, 0.85]
+sun_disc_size = 0.035
+sun_glow = 1.0
+star_opacity = 0.06
+cloud_coverage = 0.38
+cloud_density = 0.22
+cloud_scale = 0.9
+cloud_drift_x = 0.004
+cloud_drift_y = 0.0015
+
+# ── Time of day: one continuous 0-24h parameter driving sun, sky,
+#    fog, ambient, and the ocean palette ───────────────────────────
+
+[entities.tod]
+[entities.tod.time_of_day]
+time_hours = 10.5
+day_length_sec = 600.0
+auto_advance = true
+sun_path_tilt_deg = 28.0
+[entities.tod.script]
+source = "time_of_day.rhai"
+
+# ── The ocean ────────────────────────────────────────────────────
+
+[entities.ocean]
+[entities.ocean.ocean]
+seed = 7
+num_waves = 12
+wavelength_min = 5.0
+wavelength_max = 70.0
+amplitude = 1.15
+choppiness = 0.72
+direction_deg = 25.0
+spread_deg = 40.0
+speed_scale = 1.0
+deep_color = [0.016, 0.06, 0.22, 1.0]
+shallow_color = [0.30, 0.22, 0.35, 1.0]
+foam_color = [0.97, 0.99, 1.0, 1.0]
+sss_color = [0.35, 0.25, 0.28, 1.0]
+foam_threshold = 0.62
+foam_noise_scale = 0.35
+ramp_steps = 3.0
+specular_strength = 1.0
+grid_scale = 60.0
+fade_start = 90.0
+fade_end = 170.0
+
+# ── Wave probe: CPU/GPU parity check (bright buoy pinned to
+#    ocean_height; if it detaches from the surface, parity broke) ──
+
+[entities.wave_probe]
+[entities.wave_probe.transform]
+position = [4.0, 0.0, 6.0]
+[entities.wave_probe.model]
+asset = "buoy"
+[entities.wave_probe.script]
+source = "wave_probe.rhai"
+
+# ── The raft ─────────────────────────────────────────────────────
+
+[entities.raft]
+[entities.raft.transform]
+position = [0.0, 0.05, 0.0]
+rotation = [0.0, 0.0, 0.0]
+[entities.raft.model]
+asset = "raft"
+[entities.raft.raft_float]
+heave_response = 3.0
+angular_response = 2.0
+draft = 0.08
+half_width = 1.0
+half_length = 0.9
+drift_speed = 0.25
+drift_dir_deg = 25.0
+yaw_sway_deg = 5.0
+yaw_sway_rate = 0.05
+[entities.raft.script]
+source = "raft.rhai"
+
+# ── Seated first-person camera (declared after the raft so it reads
+#    this frame's raft transform) ─────────────────────────────────
+
+[entities.seat_camera]
+[entities.seat_camera.seat]
+raft = "raft"
+edge_offset_z = 1.05
+eye_height = 0.55
+deck_top = 0.26
+roll_transfer = 0.3
+mouse_sens = 0.0028
+[entities.seat_camera.script]
+source = "seat_camera.rhai"

@@ -1,0 +1,8 @@
+[component.time_of_day]
+description = "Day/night controller state (scripts/time_of_day.rhai interpolates keyframes into sun/sky/fog/ocean fields)"
+
+[component.time_of_day.fields]
+time_hours = { type = "float", description = "Current time of day, 0-24 (0 = midnight). Set directly to force a time.", default = 10.5 }
+day_length_sec = { type = "float", description = "Real seconds per full 24h cycle", default = 600.0 }
+auto_advance = { type = "boolean", description = "Advance time naturally; off = frozen at time_hours", default = true }
+sun_path_tilt_deg = { type = "float", description = "Tilt of the sun arc from vertical (higher = lower sun all day)", default = 28.0 }

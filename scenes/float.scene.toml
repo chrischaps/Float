@@ -37,12 +37,43 @@ fog_start = 60.0
 
 # Note: Flint's light `direction` points FROM surfaces TOWARD the light
 # (shadow eye sits along +direction; PBR uses L = normalize(direction)).
+# Direction/color/intensity are driven per-frame by time_of_day.rhai.
 [entities.sun]
 [entities.sun.light]
 type = "directional"
 direction = [0.35, 0.75, -0.45]
 color = [1.0, 0.96, 0.86]
 intensity = 1.5
+
+# ── Procedural sky (replaces the texture skybox; sun disc follows the
+#    sun light). Fields driven per-frame by time_of_day.rhai. ──────
+
+[entities.sky_dome]
+[entities.sky_dome.sky]
+zenith_color = [0.10, 0.32, 0.70, 1.0]
+horizon_color = [0.55, 0.75, 0.90, 1.0]
+haze_color = [0.80, 0.88, 0.95, 0.55]
+cloud_tint = [1.0, 1.0, 1.0, 0.85]
+sun_disc_size = 0.035
+sun_glow = 1.0
+star_opacity = 0.0
+cloud_coverage = 0.38
+cloud_density = 0.22
+cloud_scale = 0.9
+cloud_drift_x = 0.004
+cloud_drift_y = 0.0015
+
+# ── Time of day: one continuous 0-24h parameter driving sun, sky,
+#    fog, ambient, and the ocean palette ───────────────────────────
+
+[entities.tod]
+[entities.tod.time_of_day]
+time_hours = 10.5
+day_length_sec = 600.0
+auto_advance = true
+sun_path_tilt_deg = 28.0
+[entities.tod.script]
+source = "time_of_day.rhai"
 
 # ── The ocean ────────────────────────────────────────────────────
 
