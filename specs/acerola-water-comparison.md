@@ -71,22 +71,24 @@ We also go one step further than any of the videos: Eulerian inversion
 
 ## Ideas worth stealing later (ranked)
 
-1. **JONSWAP-shaped spectrum sampling** (video 3, easy win). Our amplitudes
-   are A ∝ λ over log-spaced wavelengths — a crude spectrum. Sampling our
-   16 waves from a JONSWAP distribution (wind speed/fetch → peak-enhanced
-   spectrum) would concentrate energy around a dominant swell the way real
-   seas do, at zero runtime cost. Small change in `WaveSpectrum::generate`.
+1. ~~**JONSWAP-shaped spectrum sampling**~~ — **DONE.** Amplitudes now draw
+   from the JONSWAP density (A² /2 = S(ω)·Δω per log-spaced bin) with
+   `wind_speed` / `fetch_km` / `peak_enhancement` params; `amplitude` still
+   scales the total. Steepness is distributed by energy share
+   (Qᵢ = choppiness/(kᵢ·ΣA)) — the old equal split gave dead waves full
+   horizontal pinch, which JONSWAP exposed as phantom foam mist.
 2. **Foam accumulation buffer** (video 3). He injects foam where J < 0 and
    exponentially decays it over time, so foam *lingers* behind crests. Ours
    is stateless (foam exists only while pinched). Needs a persistent texture
    + decay pass — moderate engine work, big realism-per-effort at high
    choppiness.
-3. **Analytic sky reflection with Fresnel** (video 1's cubemap idea, but
-   better). He samples a static skybox cubemap; our sky is a *function* —
-   the ocean fragment could evaluate the same gradient/sun math with the
-   reflected ray and blend by Schlick Fresnel. No cubemap, always matches
-   the time of day. Would add the mirror-at-grazing-angles quality our water
-   currently lacks.
+3. ~~**Analytic sky reflection with Fresnel**~~ — **DONE.** The ocean
+   uniform carries a per-frame snapshot of the sky gradient (zenith/
+   horizon/haze); the fragment evaluates it with the reflected ray and
+   blends by Schlick Fresnel (F0 = 0.02), suppressed by foam and shadow.
+   Deliberately no sun disc in the reflection — the cel specular already IS
+   the sun's reflection. `sky_reflection_strength` in the schema/panel;
+   auto-disabled for scenes without a procedural sky.
 4. **Sea spray particles** (video 3 cut it; we deferred it) — emit from
    fragments/regions where J crosses the threshold, already planned as M8.
 5. **Screen-space reflections** — he's right that they're a sham; skip.
