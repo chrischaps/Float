@@ -147,6 +147,28 @@ asset = "legs"
 [entities.legs.script]
 source = "legs_idle.rhai"
 
+# ── Audio: ocean bed + light wind, plus physics-driven laps/creaks ──
+
+[entities.ocean_ambience]
+[entities.ocean_ambience.audio_source]
+file = "audio/ocean_loop.ogg"
+loop = true
+autoplay = true
+spatial = false
+volume = 0.55
+
+[entities.wind_ambience]
+[entities.wind_ambience.audio_source]
+file = "audio/wind_light.ogg"
+loop = true
+autoplay = true
+spatial = false
+volume = 0.3
+
+[entities.raft_audio]
+[entities.raft_audio.script]
+source = "raft_audio.rhai"
+
 # ── Seated first-person camera (declared after the raft so it reads
 #    this frame's raft transform) ─────────────────────────────────
 

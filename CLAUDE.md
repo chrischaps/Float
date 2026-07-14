@@ -71,7 +71,16 @@ Pull updates: `git subtree pull --prefix=engine engine main --squash`.
 
 ## Milestones
 
-M0 scaffold ✅ → M1 ocean core → M2 raft buoyancy + first person →
-M3 sky/time-of-day → M4 legs + refraction/turbidity → M5 audio + polish.
-Later: scooting along the raft edge, music, wildlife.
-Plan: `C:\Users\chris\.claude\plans\please-make-a-plan-fluffy-pearl.md`
+M0 scaffold ✅ → M1 ocean core ✅ → M2 raft buoyancy + first person ✅ →
+M3 sky/time-of-day ✅ → M4 legs + refraction/turbidity ✅ → M5 audio ✅.
+Next: scooting along the raft edge (M6), music (M7), wildlife (M8 — the
+distant whale breach at dusk from reference/water).
+Engine changes live on Flint branch `feature/ocean-pipeline` (merge to main
+when ready). Plan: `C:\Users\chris\.claude\plans\please-make-a-plan-fluffy-pearl.md`
+
+## Debug controls in play
+
+F3 — ocean tuning panel (waves, colors, clarity/turbidity, grid).
+Time of day: edit `tod.time_of_day.time_hours` (0-24) / `auto_advance`
+via the panel-less route for now: `flint edit` inspector, or tweak
+`day_length_sec` in the scene. Escape releases the mouse; click recaptures.
