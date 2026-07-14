@@ -29,26 +29,56 @@ bloom_threshold = 1.0
 vignette_enabled = true
 vignette = 0.18
 fog_enabled = true
-fog_color = [0.66, 0.78, 0.88]
-fog_density = 0.004
-fog_start = 40.0
+fog_color = [0.70, 0.82, 0.92]
+fog_density = 0.0015
+fog_start = 60.0
 
 # ── Light: late-morning sun (M3 animates this via time_of_day.rhai) ──
 
+# Note: Flint's light `direction` points FROM surfaces TOWARD the light
+# (shadow eye sits along +direction; PBR uses L = normalize(direction)).
 [entities.sun]
 [entities.sun.light]
 type = "directional"
-direction = [-0.35, -0.75, 0.45]
+direction = [0.35, 0.75, -0.45]
 color = [1.0, 0.96, 0.86]
 intensity = 1.5
 
-# ── The ocean (M0 placeholder slab; replaced by ocean pipeline in M1) ──
+# ── The ocean ────────────────────────────────────────────────────
 
-[entities.water]
-[entities.water.transform]
-position = [0.0, 0.0, 0.0]
-[entities.water.model]
-asset = "water_placeholder"
+[entities.ocean]
+[entities.ocean.ocean]
+seed = 7
+num_waves = 12
+wavelength_min = 5.0
+wavelength_max = 70.0
+amplitude = 1.15
+choppiness = 0.72
+direction_deg = 25.0
+spread_deg = 40.0
+speed_scale = 1.0
+deep_color = [0.016, 0.14, 0.50, 1.0]
+shallow_color = [0.10, 0.46, 0.85, 1.0]
+foam_color = [0.97, 0.99, 1.0, 1.0]
+sss_color = [0.05, 0.45, 0.50, 1.0]
+foam_threshold = 0.62
+foam_noise_scale = 0.35
+ramp_steps = 3.0
+specular_strength = 1.0
+grid_scale = 60.0
+fade_start = 90.0
+fade_end = 170.0
+
+# ── Wave probe: CPU/GPU parity check (bright buoy pinned to
+#    ocean_height; if it detaches from the surface, parity broke) ──
+
+[entities.wave_probe]
+[entities.wave_probe.transform]
+position = [4.0, 0.0, 6.0]
+[entities.wave_probe.model]
+asset = "buoy"
+[entities.wave_probe.script]
+source = "scripts/wave_probe.rhai"
 
 # ── The raft ─────────────────────────────────────────────────────
 

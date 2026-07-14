@@ -125,12 +125,13 @@ raft_path = os.path.join(OUT_DIR, "raft.glb")
 scene.export(raft_path)
 print(f"wrote {raft_path}  ({len(parts)} parts, deck top ~{deck_top:.2f} m)")
 
-# ── Placeholder water slab (M0 only) ────────────────────────────────────
-water = trimesh.creation.box(extents=[400.0, 0.1, 400.0])
-water.apply_translation([0.0, -0.05, 0.0])  # top surface at y=0
-water = pbr(water, (0.13, 0.38, 0.66, 1.0), roughness=0.35)
-wscene = trimesh.Scene()
-wscene.add_geometry(water, node_name="water")
-water_path = os.path.join(OUT_DIR, "water_placeholder.glb")
-wscene.export(water_path)
-print(f"wrote {water_path}")
+# ── Debug buoy: a bright sphere scripts pin to ocean_height(x, z) ───────
+# If it ever detaches from the rendered water surface, CPU/GPU wave parity
+# is broken (see scripts/wave_probe.rhai).
+buoy = trimesh.creation.icosphere(subdivisions=2, radius=0.18)
+buoy = pbr(buoy, (1.0, 0.25, 0.1, 1.0), roughness=0.4)
+bscene = trimesh.Scene()
+bscene.add_geometry(buoy, node_name="buoy")
+buoy_path = os.path.join(OUT_DIR, "buoy.glb")
+bscene.export(buoy_path)
+print(f"wrote {buoy_path}")
