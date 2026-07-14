@@ -1,0 +1,66 @@
+# ================================================================
+#  FLOAT — adrift
+# ================================================================
+#
+#  You sit on a hand-lashed raft on an endless ocean. That's it.
+#  That's the game.
+#
+#  Launch: play.bat
+#
+#  Controls:
+#    Mouse / Arrows / Right stick — look around
+#    Escape                       — exit
+#
+#  M0: static raft on a flat placeholder slab. The real ocean
+#  arrives with the M1 ocean pipeline.
+# ================================================================
+
+[scene]
+name = "Float — adrift"
+version = "0.1"
+description = "First-person raft on an endless stylized ocean"
+input_config = "config/input.toml"
+
+[post_process]
+enabled = true
+bloom_enabled = true
+bloom_intensity = 0.06
+bloom_threshold = 1.0
+vignette_enabled = true
+vignette = 0.18
+fog_enabled = true
+fog_color = [0.66, 0.78, 0.88]
+fog_density = 0.004
+fog_start = 40.0
+
+# ── Light: late-morning sun (M3 animates this via time_of_day.rhai) ──
+
+[entities.sun]
+[entities.sun.light]
+type = "directional"
+direction = [-0.35, -0.75, 0.45]
+color = [1.0, 0.96, 0.86]
+intensity = 1.5
+
+# ── The ocean (M0 placeholder slab; replaced by ocean pipeline in M1) ──
+
+[entities.water]
+[entities.water.transform]
+position = [0.0, 0.0, 0.0]
+[entities.water.model]
+asset = "water_placeholder"
+
+# ── The raft ─────────────────────────────────────────────────────
+
+[entities.raft]
+[entities.raft.transform]
+position = [0.0, 0.05, 0.0]
+rotation = [0.0, 0.0, 0.0]
+[entities.raft.model]
+asset = "raft"
+
+# ── Seated first-person camera ───────────────────────────────────
+
+[entities.seat_camera]
+[entities.seat_camera.script]
+source = "scripts/seat_camera.rhai"

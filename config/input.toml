@@ -1,0 +1,49 @@
+version = 1
+game_id = "float"
+
+# ── Look: arrow keys + gamepad right stick ──────────────────────────────
+# Mouse look reads mouse_delta_x()/mouse_delta_y() directly in
+# seat_camera.rhai once cursor capture lands (M2, set_cursor_captured).
+# These bindings are the M0 fallback and remain as gamepad support.
+
+[actions.look_x]
+kind = "axis1d"
+[[actions.look_x.bindings]]
+type = "key"
+code = "ArrowLeft"
+scale = -1.0
+[[actions.look_x.bindings]]
+type = "key"
+code = "ArrowRight"
+scale = 1.0
+[[actions.look_x.bindings]]
+type = "gamepad_axis"
+axis = "RightStickX"
+gamepad = "any"
+deadzone = 0.15
+scale = 1.0
+
+[actions.look_y]
+kind = "axis1d"
+[[actions.look_y.bindings]]
+type = "key"
+code = "ArrowUp"
+scale = -1.0
+[[actions.look_y.bindings]]
+type = "key"
+code = "ArrowDown"
+scale = 1.0
+[[actions.look_y.bindings]]
+type = "gamepad_axis"
+axis = "RightStickY"
+gamepad = "any"
+deadzone = 0.15
+scale = 1.0
+
+# ── Debug ───────────────────────────────────────────────────────────────
+
+[actions.toggle_debug]
+kind = "button"
+[[actions.toggle_debug.bindings]]
+type = "key"
+code = "F1"
