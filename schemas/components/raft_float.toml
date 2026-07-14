@@ -1,0 +1,13 @@
+[component.raft_float]
+description = "Buoyancy tuning for a raft riding the ocean surface (scripts/raft.rhai)"
+
+[component.raft_float.fields]
+heave_response = { type = "float", description = "Vertical follow rate (1/s); lower = heavier raft", default = 3.0 }
+angular_response = { type = "float", description = "Pitch/roll follow rate (1/s); lower = lazier tilt", default = 2.0 }
+draft = { type = "float", description = "How deep the raft sits below the surface mean (m)", default = 0.08 }
+half_width = { type = "float", description = "Height-sampling half extent across the logs, X (m)", default = 1.0 }
+half_length = { type = "float", description = "Height-sampling half extent along the logs, Z (m)", default = 0.9 }
+drift_speed = { type = "float", description = "Slow drift speed (m/s)", default = 0.25 }
+drift_dir_deg = { type = "float", description = "Drift direction in degrees (0 = +Z); usually the wave direction", default = 25.0 }
+yaw_sway_deg = { type = "float", description = "Amplitude of the slow yaw oscillation (degrees)", default = 5.0 }
+yaw_sway_rate = { type = "float", description = "Frequency of the yaw oscillation (rad/s)", default = 0.05 }

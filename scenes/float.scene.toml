@@ -78,7 +78,7 @@ position = [4.0, 0.0, 6.0]
 [entities.wave_probe.model]
 asset = "buoy"
 [entities.wave_probe.script]
-source = "scripts/wave_probe.rhai"
+source = "wave_probe.rhai"
 
 # ── The raft ─────────────────────────────────────────────────────
 
@@ -88,9 +88,29 @@ position = [0.0, 0.05, 0.0]
 rotation = [0.0, 0.0, 0.0]
 [entities.raft.model]
 asset = "raft"
+[entities.raft.raft_float]
+heave_response = 3.0
+angular_response = 2.0
+draft = 0.08
+half_width = 1.0
+half_length = 0.9
+drift_speed = 0.25
+drift_dir_deg = 25.0
+yaw_sway_deg = 5.0
+yaw_sway_rate = 0.05
+[entities.raft.script]
+source = "raft.rhai"
 
-# ── Seated first-person camera ───────────────────────────────────
+# ── Seated first-person camera (declared after the raft so it reads
+#    this frame's raft transform) ─────────────────────────────────
 
 [entities.seat_camera]
+[entities.seat_camera.seat]
+raft = "raft"
+edge_offset_z = 1.05
+eye_height = 0.55
+deck_top = 0.26
+roll_transfer = 0.3
+mouse_sens = 0.0028
 [entities.seat_camera.script]
-source = "scripts/seat_camera.rhai"
+source = "seat_camera.rhai"

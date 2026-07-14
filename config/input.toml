@@ -40,6 +40,14 @@ gamepad = "any"
 deadzone = 0.15
 scale = 1.0
 
+# ── Recapture mouse after Escape released it ────────────────────────────
+
+[actions.recapture]
+kind = "button"
+[[actions.recapture.bindings]]
+type = "mouse_button"
+button = "Left"
+
 # ── Debug ───────────────────────────────────────────────────────────────
 
 [actions.toggle_debug]

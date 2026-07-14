@@ -1,0 +1,10 @@
+[component.seat]
+description = "Seated first-person camera anchor on the raft edge (scripts/seat_camera.rhai)"
+
+[component.seat.fields]
+raft = { type = "string", description = "Name of the raft entity to sit on", default = "raft" }
+edge_offset_z = { type = "float", description = "Seat position along raft-local +Z (m from center)", default = 1.05 }
+eye_height = { type = "float", description = "Eye height above the deck top (m)", default = 0.55 }
+deck_top = { type = "float", description = "Deck surface height above the raft origin (m)", default = 0.26 }
+roll_transfer = { type = "float", description = "Fraction of raft roll transferred to the camera (0-1)", default = 0.3 }
+mouse_sens = { type = "float", description = "Mouse look sensitivity (rad per count)", default = 0.0028 }
