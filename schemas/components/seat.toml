@@ -6,15 +6,24 @@ raft = { type = "string", description = "Name of the raft entity to sit on", def
 edge_offset_z = { type = "float", description = "Scoot path half-extent along raft-local Z (m from center)", default = 1.05 }
 half_x = { type = "float", description = "Scoot path half-extent along raft-local X (m from center)", default = 0.95 }
 corner_radius = { type = "float", description = "Rounded-corner radius of the scoot path (m); the turn IS the corner transition", default = 0.3 }
-scoot_speed = { type = "float", description = "Max scoot speed along the edge (m/s)", default = 0.4 }
-scoot_ease = { type = "float", description = "Scoot velocity slew rate (1/s); lower = heavier body", default = 5.0 }
+scoot_speed = { type = "float", description = "Max scoot speed along the edge (m/s) — continuous fallback mode only", default = 0.4 }
+scoot_ease = { type = "float", description = "Scoot velocity slew rate (1/s); lower = heavier body — continuous fallback mode only", default = 5.0 }
+
+# Animation-driven stepped scooting (the body pushes itself; see body.rhai)
+animated_scoot = { type = "bool", description = "true = discrete scoot steps synced to the body's scoot clips; false = the old continuous slide", default = true }
+step_time = { type = "float", description = "One scoot step duration (s) — MUST match the scoot clip length in tools/generate_body.py", default = 1.4 }
+step_distance = { type = "float", description = "Seat travel per scoot step (m along the perimeter)", default = 0.35 }
+step_pause = { type = "float", description = "Rest between chained steps while the key is held (s)", default = 0.18 }
+step_bob = { type = "float", description = "Eye lift at the push-up peak of a step (m) — matches the clip's pelvis lift", default = 0.06 }
 eye_height = { type = "float", description = "Eye height above the deck top (m)", default = 0.55 }
+eye_inboard = { type = "float", description = "Eye pulled inboard of the scoot path (m); lean-back posture that also flattens the eye-to-knee angle so the legs reach the frame", default = 0.1 }
 deck_top = { type = "float", description = "Deck surface height above the raft origin (m)", default = 0.26 }
 roll_transfer = { type = "float", description = "Fraction of raft roll transferred to the camera (0-1)", default = 0.3 }
 mouse_sens = { type = "float", description = "Mouse look sensitivity (rad per count)", default = 0.0028 }
 
-# Written by seat_camera.rhai every frame; read by legs_idle.rhai so the
+# Written by seat_camera.rhai every frame; read by body.rhai so the
 # body is placed from the SAME scoot state as the eye. Not hand-tuned.
 seat_x = { type = "float", description = "RUNTIME: raft-local seat X on the scoot path", default = 0.0 }
 seat_z = { type = "float", description = "RUNTIME: raft-local seat Z on the scoot path", default = 1.05 }
+step_dir = { type = "float", description = "RUNTIME: -1/0/+1 — scoot step in progress and its direction (body.rhai fires clips off transitions)", default = 0.0 }
 seat_out_deg = { type = "float", description = "RUNTIME: seat-outward heading (deg, 0 = raft +Z)", default = 0.0 }

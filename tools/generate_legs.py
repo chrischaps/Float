@@ -2,9 +2,13 @@
 
 Slightly male: slim, navy shorts, warm tan skin with a subtly darker,
 speckle-toned lower leg (reads as light hair at this stylization level).
-Origin is at the hip on the deck; thighs angle over the +Z edge, calves
-hang, feet trail in the water. Swappable later: anything that exports a
-GLB with the same origin/pose can replace this file.
+Origin is at the hip on the deck; knees ride slightly ABOVE the hips
+(low-dock sit — deck is only 0.26 m over the water), calves hang, feet
+trail in the water. The raised knees are deliberate first-person
+framing: they crest into the bottom of the seated camera's view, which
+is what sells "this is my body" in the periphery. Swappable later:
+anything that exports a GLB with the same origin/pose can replace this
+file.
 
 Output: models/legs.glb
 Usage:  python tools/generate_legs.py
@@ -28,7 +32,7 @@ THIGH_R, THIGH_LEN = 0.072, 0.40
 CALF_R, CALF_LEN = 0.055, 0.42
 LEG_X = 0.115                          # half-distance between legs
 
-THIGH_DROP = np.deg2rad(28)            # thigh angle below horizontal
+THIGH_DROP = np.deg2rad(-4)            # thigh angle below horizontal; negative = knees raised
 CALF_SWING = np.deg2rad(12)            # calves hang slightly forward
 
 
@@ -77,10 +81,11 @@ for side in (-1.0, 1.0):
     parts.append(capsule_between(hip, knee, THIGH_R, SKIN))
     parts.append(capsule_between(knee, ankle, CALF_R, SKIN_LOWER))
 
-    # Foot: stylized rounded block pointing forward (+Z), toes slightly down.
+    # Foot: stylized rounded block pointing forward (+Z), toes dipped
+    # toward the water (the raised knees leave only the feet submerged).
     foot = trimesh.creation.box(extents=[0.085, 0.055, 0.22])
     foot.apply_transform(transform(
-        tx=ankle[0], ty=ankle[1] - 0.015, tz=ankle[2] + 0.07, rx=np.deg2rad(-8)
+        tx=ankle[0], ty=ankle[1] - 0.015, tz=ankle[2] + 0.07, rx=np.deg2rad(-14)
     ))
     parts.append(pbr(foot, FOOT))
 

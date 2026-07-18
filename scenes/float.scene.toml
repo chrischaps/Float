@@ -348,25 +348,44 @@ raft = "raft"
 edge_offset_z = 1.05
 half_x = 0.95          # scoot path stops shy of the log ends (deck half 1.2)
 corner_radius = 0.3
-scoot_speed = 0.4      # a shuffle, not a stride
+scoot_speed = 0.4      # continuous-fallback slide speed
 scoot_ease = 5.0
+animated_scoot = true  # discrete body-driven steps (false = old slide)
+step_time = 1.4        # MUST match the scoot clip length (generate_body.py)
+step_distance = 0.35
+step_pause = 0.18
+step_bob = 0.06
 eye_height = 0.55
+eye_inboard = 0.10     # propped-on-hands lean-back; helps the knees reach the frame
 deck_top = 0.26
 roll_transfer = 0.45
 mouse_sens = 0.0028
+[entities.seat_camera.camera_tuning]
+fov_deg = 75.0         # F3 Camera panel tunes this live. 75° + the ~10°-down
+                       # resting gaze puts the raised knees just inside the
+                       # bottom of the frame without rectilinear smear
 [entities.seat_camera.script]
 source = "seat_camera.rhai"
 
-# ── The player's legs, dangling over the deck edge into the water.
-#    Declared AFTER seat_camera: legs_idle.rhai reads the scoot state
-#    the seat script published THIS frame (seat_x/seat_z/seat_out_deg).
-#    Swap models/legs.glb for a nicer model any time — same
-#    origin/pose contract. ──
+# ── The player's body: rigged and skinned (models/body.glb), legs
+#    dangling over the deck edge, arms that plant and push during
+#    scoots. Declared AFTER seat_camera: body.rhai reads the scoot
+#    state the seat script published (seat_x/seat_z/seat_out_deg/
+#    step_dir). Idle sway and the scoot sequence are skeletal clips
+#    embedded in the GLB (tools/generate_body.py). ──
 
-[entities.legs]
-[entities.legs.transform]
-position = [0.0, 0.3, 1.0]
-[entities.legs.model]
-asset = "legs"
-[entities.legs.script]
-source = "legs_idle.rhai"
+[entities.body]
+[entities.body.transform]
+position = [0.0, 0.28, 1.0]
+[entities.body.model]
+asset = "body"
+[entities.body.skeleton]
+skin = "body_rig"
+[entities.body.animator]
+clip = "idle"
+autoplay = true
+loop = true
+playing = true
+speed = 1.0
+[entities.body.script]
+source = "body.rhai"

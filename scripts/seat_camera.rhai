@@ -7,34 +7,53 @@
 // direction (roll_transfer): full transfer is nauseating, zero feels like
 // floating on a tripod.
 //
-// Scooting (M6): A/D or left stick slide the seat along the raft's
-// perimeter — a rounded rectangle (straight edges, quarter-circle
-// corners) parametrized by arc length. The seat-outward heading turns
-// with the path, so rounding a corner swings your whole view to face the
-// new edge; there is no discrete "edge switch", the corner IS the
-// transition. Velocity is slewed (scoot_ease) so motion starts and stops
-// like a body shifting its weight, not a cursor.
+// Scooting (M6): the seat rides the raft's perimeter — a rounded
+// rectangle (straight edges, quarter-circle corners) parametrized by arc
+// length. The seat-outward heading turns with the path, so rounding a
+// corner swings your whole view to face the new edge; there is no
+// discrete "edge switch", the corner IS the transition.
 //
-// The raft-local seat point + outward heading are written back to this
-// entity's seat component (seat_x / seat_z / seat_out_deg) so
-// legs_idle.rhai places the body from the SAME state — the eye and the
-// legs can never drift apart. (legs is declared after seat_camera in the
-// scene so it reads this frame's values.)
+// With animated_scoot (default), A/D triggers discrete scoot STEPS
+// synced to the body's skeletal clips: travel follows the clip's
+// weight-shift phase, the eye inherits the pelvis lift (step_bob), and
+// held keys chain steps with a rest between — a shuffle, not a slide.
+// animated_scoot = false restores the original continuous slide.
+//
+// The raft-local seat point + outward heading + step state are written
+// back to this entity's seat component (seat_x / seat_z / seat_out_deg /
+// step_dir) so body.rhai places the body and fires the clips from the
+// SAME state — the eye and the body can never drift apart. (body is
+// declared after seat_camera in the scene so it reads this frame's
+// values.)
 //
 // Look: mouse (cursor captured via set_cursor_captured) + arrows/stick.
 // Yaw is clamped around seat-outward so you can't look through your own
 // back; click to recapture the mouse after Escape.
 
 let look_yaw = 0.0;     // radians, relative to seat-outward
-let look_pitch = -0.12; // slight downward gaze toward the water line
+let look_pitch = -0.18; // resting gaze ~10° down: horizon rides the upper
+                        // third of the frame (human resting gaze is below
+                        // horizontal) and the knees crest the bottom edge
+let glance = 0.0;       // slewed scoot glance-down overlay (rad, <= 0)
 let captured_once = false;
 let scoot_s = 0.0;      // arc length along the perimeter (m, 0 = +Z mid)
-let scoot_vel = 0.0;    // slewed scoot velocity (m/s)
+let scoot_vel = 0.0;    // scoot velocity (m/s; slewed in continuous mode)
+let step_dir = 0.0;     // -1/0/+1: scoot step in progress (animated mode)
+let step_t = 0.0;       // seconds into the current step
+let pause_left = 0.0;   // rest before the next chained step
 
 const STICK_SPEED = 2.4;   // rad/s at full deflection
 const PITCH_MIN = -1.3;    // ~-75 deg (down at your legs)
 const PITCH_MAX = 1.25;
 const YAW_LIMIT = 2.1;     // ~±120 deg around seat-outward
+const GLANCE_PITCH = 0.14; // ~8 deg: scooting dips the gaze toward the
+                           // body doing the work, re-showing the legs
+const GLANCE_EASE = 3.0;   // 1/s — a head motion, not a snap
+
+fn sstep(t) {
+    let c = clamp(t, 0.0, 1.0);
+    c * c * (3.0 - 2.0 * c)
+}
 
 // Rounded-rectangle perimeter point. s = arc length from the +Z-edge
 // midpoint, increasing toward +X (screen-left when facing outward).
@@ -92,8 +111,9 @@ fn perimeter_point(s, xe, ze, rc) {
     return #{ x: -hx + t, z: ze, yaw: 0.0 };
 }
 
+// FOV lives in the seat_camera entity's camera_tuning component (the player
+// applies it at load; the F3 Camera panel edits it live) — not set here.
 fn on_init() {
-    set_camera_fov(65.0);
     set_cursor_captured(true);
 }
 
@@ -112,6 +132,7 @@ fn on_update() {
     let scoot_speed = get_field(me, "seat", "scoot_speed");
     let scoot_ease = get_field(me, "seat", "scoot_ease");
     let eye_h = get_field(me, "seat", "eye_height");
+    let eye_in = get_field(me, "seat", "eye_inboard");
     let deck = get_field(me, "seat", "deck_top");
     let transfer = get_field(me, "seat", "roll_transfer");
     let sens = get_field(me, "seat", "mouse_sens");
@@ -133,13 +154,68 @@ fn on_update() {
     }
 
     // ── Scoot along the deck edge ───────────────────────────────────
-    let want = action_value("scoot") * scoot_speed;
-    let kv = clamp(scoot_ease * dt, 0.0, 1.0);
-    scoot_vel += (want - scoot_vel) * kv;
-    scoot_s += scoot_vel * dt;
+    // Animated mode (default): A/D triggers a discrete scoot STEP.
+    // body.rhai plays the matching scoot clip (it watches step_dir);
+    // the seat's travel follows the clip's weight-shift phase, and the
+    // eye inherits the pelvis lift — the body does the moving, the
+    // camera just rides it. Held keys chain steps with a short rest:
+    // a shuffle rhythm, not a conveyor belt. step_time MUST match the
+    // clip length in tools/generate_body.py.
+    let animated = get_field(me, "seat", "animated_scoot");
+    let eye_bob = 0.0;
+    if animated {
+        let step_time = get_field(me, "seat", "step_time");
+        let step_dist = get_field(me, "seat", "step_distance");
+        let input = action_value("scoot");
+        pause_left -= dt;
+        if step_dir == 0.0 && pause_left <= 0.0 {
+            if input > 0.35 {
+                step_dir = 1.0;
+                step_t = 0.0;
+            } else if input < -0.35 {
+                step_dir = -1.0;
+                step_t = 0.0;
+            }
+        }
+        scoot_vel = 0.0;
+        if step_dir != 0.0 {
+            let u0 = clamp(step_t / step_time, 0.0, 1.0);
+            step_t += dt;
+            let u = clamp(step_t / step_time, 0.0, 1.0);
+            // Travel synced to the clip's weight-shift (u 0.32→0.87):
+            // the seat moves only while the body is actually pushing.
+            let move_d = step_dist * (sstep((u - 0.32) / 0.55)
+                                      - sstep((u0 - 0.32) / 0.55));
+            scoot_s += step_dir * move_d;
+            scoot_vel = step_dir * move_d / dt;   // feeds the glance below
+            // Eye rides the clip's pelvis lift (rise into the push,
+            // settle before the clip ends).
+            eye_bob = get_field(me, "seat", "step_bob")
+                * sstep((u - 0.21) / 0.25) * (1.0 - sstep((u - 0.55) / 0.35));
+            if step_t >= step_time {
+                step_dir = 0.0;
+                pause_left = get_field(me, "seat", "step_pause");
+            }
+        }
+    } else {
+        // Continuous fallback: the original M6 slide.
+        let want = action_value("scoot") * scoot_speed;
+        scoot_vel += (want - scoot_vel) * clamp(scoot_ease * dt, 0.0, 1.0);
+        scoot_s += scoot_vel * dt;
+    }
 
     let seat_pt = perimeter_point(scoot_s, half_x, edge_z, rc);
     let out_yaw = seat_pt.yaw;
+
+    // Scooting glances the gaze down at the body doing the work — a view
+    // overlay (not look_pitch), so it eases back out on its own and the
+    // legs get re-shown every shuffle without stealing the mouse.
+    let g_target = if scoot_speed > 0.0 {
+        -GLANCE_PITCH * clamp(abs(scoot_vel) / scoot_speed, 0.0, 1.0)
+    } else {
+        0.0
+    };
+    glance += (g_target - glance) * clamp(GLANCE_EASE * dt, 0.0, 1.0);
 
     // ── Look input ──────────────────────────────────────────────────
     // Subtract deltas (engine FPS convention, see flint-physics
@@ -173,10 +249,13 @@ fn on_update() {
     let r21 = sx * cy;
     let r22 = cx * cy;
 
-    // Seat point in raft-local space: on the scoot path, eye above deck.
-    let lx = seat_pt.x;
-    let ly = deck + eye_h;
-    let lz = seat_pt.z;
+    // Seat point in raft-local space: eye above the deck, pulled INBOARD
+    // of the scoot path (propped-on-hands lean-back — head behind hips).
+    // Besides reading as the right posture, the extra horizontal distance
+    // to the knees flattens the eye→knee angle so they reach the frame.
+    let lx = seat_pt.x - sin(out_yaw) * eye_in;
+    let ly = deck + eye_h + eye_bob;
+    let lz = seat_pt.z - cos(out_yaw) * eye_in;
 
     let eye_x = rp["x"] + r00 * lx + r01 * ly + r02 * lz;
     let eye_y = rp["y"] + r10 * lx + r11 * ly + r12 * lz;
@@ -191,7 +270,7 @@ fn on_update() {
     let gaze = out_yaw + look_yaw;
     let world_yaw = ay + gaze;
     let tilt = (-ax * cos(gaze) - az * sin(gaze)) * transfer;
-    let eff_pitch = clamp(look_pitch + tilt, -1.45, 1.45);
+    let eff_pitch = clamp(look_pitch + tilt + glance, -1.45, 1.45);
 
     let cp = cos(eff_pitch);
     let dir_x = sin(world_yaw) * cp;
@@ -201,8 +280,9 @@ fn on_update() {
     set_camera_position(eye_x, eye_y, eye_z);
     set_camera_target(eye_x + dir_x, eye_y + dir_y, eye_z + dir_z);
 
-    // ── Publish scoot state for legs_idle.rhai ──────────────────────
+    // ── Publish scoot state for body.rhai ───────────────────────────
     set_field(me, "seat", "seat_x", seat_pt.x);
     set_field(me, "seat", "seat_z", seat_pt.z);
     set_field(me, "seat", "seat_out_deg", rad_to_deg(out_yaw));
+    set_field(me, "seat", "step_dir", step_dir);
 }

@@ -96,15 +96,28 @@ crossing the sunrise). All wildlife is lit from TOD-driven sources —
 never a constant color (see `specs/foam_followups.md`). Event scripts
 share the whale's scheduling pattern: window entry schedules, scrubbing
 out cancels, the event runs on real seconds.
-All milestones complete. Polish backlog: skeletal scoot animation
-(tasks filed), real M6/M8 SFX from `specs/elevenlabs_audio_prompts.md`.
+All milestones complete. Skeletal scoot ✅: `models/body.glb`
+(tools/generate_body.py — pygltflib, rigid-skinned 14-joint seated body,
+embedded `idle`/`scoot_right`/`scoot_left` clips; keeps the raised-knee
+framing contract) replaces legs.glb in the main scene. A/D triggers
+discrete steps: seat travel follows the clip's weight-shift phase, the
+eye rides the pelvis lift, `body.rhai` fires `blend_to` off the seat's
+published `step_dir` and creaks on the hand plant. NO skeletal
+on_animation_end exists — `seat.step_time` mirrors the clip length; keep
+them in sync. `animated_scoot = false` restores the continuous slide.
+Snap fixtures still use static legs.glb (skinned mesh needs the
+animation system; `flint render` runs neither).
+Polish backlog: body visual detail pass (geometry + texture), real
+M6/M8 SFX from `specs/elevenlabs_audio_prompts.md`.
 Engine changes live on Flint branch `feature/ocean-pipeline` (merge to main
 when ready). Plan: `C:\Users\chris\.claude\plans\please-make-a-plan-fluffy-pearl.md`
 
 ## Debug controls in play
 
-F3 toggles both panels: **Ocean Debug** (waves, colors, foam, water
-clarity/turbidity, grid) and **Time of Day** (0-24h scrub slider, natural
-advance toggle, day length, sun path tilt). Edits apply live through the
+F3 toggles the panels: **Ocean Debug** (waves, colors, foam, water
+clarity/turbidity, grid), **Time of Day** (0-24h scrub slider, natural
+advance toggle, day length, sun path tilt), and **Camera** (vertical FOV
+slider — FOV lives in the seat_camera entity's `camera_tuning` component,
+not in `seat_camera.rhai`). Edits apply live through the
 world's components; "Commit to File" writes them back into the scene TOML.
 Escape releases the mouse (for panel use); click recaptures.
