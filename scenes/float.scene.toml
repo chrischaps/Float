@@ -115,6 +115,10 @@ splash_flicker_speed = 1.600000023841858
 splash_noise_scale = 5.0
 splash_baseline = 0.15000000596046448
 splash_response = 1.0
+# Bioluminescence (M8): color is a scene constant; strength is animated
+# by time_of_day.rhai (0 by day, waking after dusk, 0.55 at midnight).
+foam_glow_color = [0.35, 0.95, 0.75, 1.0]
+foam_glow = 0.0
 
 # ── Wave probe: CPU/GPU parity check (bright buoy pinned to
 #    ocean_height; if it detaches from the surface, parity broke) ──

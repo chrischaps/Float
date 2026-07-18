@@ -101,6 +101,10 @@ foam_threshold = 0.62
 foam_noise_scale = 0.35
 ramp_steps = 3.0
 specular_strength = 1.0
+# Baked midnight value of the TOD glow channel (keep in sync with
+# time_of_day.rhai key 0).
+foam_glow_color = [0.35, 0.95, 0.75, 1.0]
+foam_glow = 0.55
 sky_reflection_strength = 0.8
 grid_scale = 60.0
 fade_start = 90.0
