@@ -350,14 +350,12 @@ IDLE_VARIANTS = {
 
 
 def make_idle(name, lpose_fn, rpose_fn, dur, seed):
+    # NOTE: no leg channels here — ALL lower-leg motion lives in the
+    # legs_rock additive layer, which loops independently and survives
+    # variant crossfades and fidgets (legs never freeze).
     rng = np.random.default_rng(seed)
     rot = {}
     trans = {}
-    # Legs: water-tugged pendulums, desynced per leg and per variant.
-    for j, amp, cyc in (("calf_l", 9.0, 2.0), ("calf_r", 8.0, 2.3),
-                        ("foot_l", 6.0, 2.0), ("foot_r", 5.5, 2.3)):
-        rot[j] = wobble_rot((0, 0, 0), amp * rng.uniform(0.85, 1.15), cyc,
-                            rng.uniform(0.0, 6.28), dur)
     # Breathing: one cycle per loop, spine + chest compound to the eye.
     # Water variants bake a spine lean toward the trailing side (extends
     # the reach and reads as the body committing to the gesture; the
@@ -399,6 +397,41 @@ def make_idle(name, lpose_fn, rpose_fn, dur, seed):
     tk[-1] = (dur, tk[0][1])
     trans["root"] = tk
     return name, rot, trans
+
+
+# ── The legs_rock additive layer ────────────────────────────────────────
+# Chris: "the legs kick out at the knee during idle, a sort of
+# self-soothing almost rocking chair action." One kick per cycle per
+# leg, legs alternating half a phase apart: the knee extends fairly
+# briskly, hangs, then the calf pendulums back past neutral and
+# settles — a rocking chair's push-glide-return. Feet flex with a lag;
+# thighs lift a touch so the motion connects to the pelvis. Runs as an
+# ADDITIVE layer on its own clock, so it persists through variant
+# crossfades, fidgets, everything (ducked only during scoot steps).
+ROCK_TIME = 5.2
+
+
+def rock_wave(tn):
+    """Kick-hang-return waveform over one normalized cycle."""
+    pts_t = [0.0, 0.12, 0.30, 0.55, 0.78, 1.0]
+    pts_v = [0.0, 24.0, 18.0, -7.0, 3.0, 0.0]
+    return np.interp(tn, pts_t, pts_v)
+
+
+def make_legs_rock():
+    rot = {}
+    n = 33
+    for side, phase, scale in (("l", 0.0, 1.0), ("r", 0.5, 0.94)):
+        for j, gain, lag in (("calf", 1.0, 0.0), ("foot", 0.38, 0.06),
+                             ("thigh", -0.12, 0.0)):
+            keys = []
+            for i in range(n):
+                t = ROCK_TIME * i / (n - 1)
+                tn = (t / ROCK_TIME + phase + lag) % 1.0
+                keys.append((t, (rock_wave(tn) * gain * scale, 0.0, 0.0)))
+            keys[-1] = (ROCK_TIME, keys[0][1])
+            rot[f"{j}_{side}"] = keys
+    return "legs_rock", rot, {}
 
 
 # ── Fidgets: one-shots layered over a variant's held poses ──────────────
@@ -552,6 +585,7 @@ ROT_L, TRANS_L = mirror_clip(ROT_R, TRANS_R)
 CLIPS = [
     ("scoot_right", ROT_R, TRANS_R),
     ("scoot_left", ROT_L, TRANS_L),
+    make_legs_rock(),
 ]
 for vname, (lp, rp, dur, seed) in IDLE_VARIANTS.items():
     CLIPS.append(make_idle(vname, lp, rp, dur, seed))

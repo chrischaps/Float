@@ -388,6 +388,8 @@ skin = "body_rig"
 joint = "eye"      # seat_camera.rhai follows this joint (eye_follow)
 [entities.body.animator]
 clip = "idle_deck"     # default variant: propped lean-back matches the camera
+layer_clip = "legs_rock"   # additive: the self-soothing knee rock, always on
+layer_weight = 1.0
 [entities.body.idle_brain]
 enabled = true
 dwell_min = 12.0

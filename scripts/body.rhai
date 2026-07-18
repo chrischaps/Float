@@ -38,6 +38,8 @@ const BIG_DURS  = [3.6];
 let prev_dir = 0.0;
 let step_clock = -1.0;  // seconds since scoot step start (-1 = not stepping)
 let creak_done = false;
+let layer_w = 1.0;      // slewed legs_rock layer weight (ducked in scoots)
+let layer_w_written = 1.0;
 let cur_v = 0;          // current variant index (idle_deck default)
 let mode = 0;           // 0 = idling, 1 = mid-fidget
 let dwell = 6.0;        // settle-in before the brain's first act
@@ -105,6 +107,15 @@ fn on_update() {
         dwell = random_range(4.0, 9.0);   // settle before the brain acts
     }
     prev_dir = dir;
+
+    // Duck the legs_rock additive layer while a scoot step owns the
+    // legs; ease it back in as the body settles.
+    let lw_target = if step_clock >= 0.0 { 0.0 } else { 1.0 };
+    layer_w += (lw_target - layer_w) * clamp(6.0 * dt, 0.0, 1.0);
+    if abs(layer_w - layer_w_written) > 0.005 {
+        layer_w_written = layer_w;
+        set_field(me, "animator", "layer_weight", layer_w);
+    }
 
     // The planting hand takes weight: one soft creak from the deck.
     if step_clock >= 0.0 {
