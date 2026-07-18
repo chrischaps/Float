@@ -252,11 +252,18 @@ def mirror_rot_keys(keys):
 
 
 def idle_clip():
+    # Amplitudes are THEATRICAL, not realistic: at this stylization (and
+    # against wave motion) subtle reads as stiff. Verified by probing the
+    # eye bone: the first pass moved the camera 2 mm and was invisible.
     rot = {}
     n = 17
     for j, amp, rate, phase in (
-        ("calf_l", 3.4, 1.0, 0.0), ("calf_r", 3.0, 1.15, 2.1),
-        ("foot_l", 2.0, 1.0, 0.7), ("foot_r", 1.8, 1.15, 2.8),
+        # Calves swing like the water is tugging them — desynced.
+        ("calf_l", 9.0, 1.0, 0.0), ("calf_r", 8.0, 1.15, 2.1),
+        ("foot_l", 6.0, 1.0, 0.7), ("foot_r", 5.5, 1.15, 2.8),
+        # Arms are alive: slow micro-sway, desynced from the legs.
+        ("upper_arm_l", 1.8, 0.55, 1.2), ("upper_arm_r", 1.6, 0.62, 3.9),
+        ("forearm_l", 2.2, 0.55, 1.9), ("forearm_r", 2.0, 0.62, 4.6),
     ):
         keys = []
         for i in range(n):
@@ -265,8 +272,12 @@ def idle_clip():
         # force exact loop closure
         keys[-1] = (IDLE_TIME, keys[0][1])
         rot[j] = keys
-    # breathing: tiny spine sway
-    rot["spine"] = [(0.0, (0.0, 0.0, 0.0)), (IDLE_TIME * 0.5, (1.2, 0.0, 0.4)),
+    # Breathing: one cycle per loop (~12 breaths/min), spine + chest
+    # compound so the eye bone carries ~2 cm of slow sway — felt on calm
+    # water, gentle under weather.
+    rot["spine"] = [(0.0, (0.0, 0.0, 0.0)), (IDLE_TIME * 0.5, (2.4, 0.0, 0.7)),
+                    (IDLE_TIME, (0.0, 0.0, 0.0))]
+    rot["chest"] = [(0.0, (0.0, 0.0, 0.0)), (IDLE_TIME * 0.45, (1.6, 0.0, -0.4)),
                     (IDLE_TIME, (0.0, 0.0, 0.0))]
     return rot, {}
 
