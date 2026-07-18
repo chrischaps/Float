@@ -459,12 +459,16 @@ def make_legs_rock():
     rot = {}
     for side, kicks in (("l", KICKS_L), ("r", KICKS_R)):
         ts, vs = kick_train_signal(kicks)
-        # Foot lags the calf by ~0.35 s (drag through the air/water);
-        # thigh lifts slightly with the kick. Calf/foot NEGATED: the
-        # signal is in extension units, engine extension is negative rx.
+        # The foot POINTS as the leg extends (plantar flexion — water
+        # drag trails the toes behind the swing) and flexes slightly up
+        # on the backswing; it lags the calf ~0.35 s. A 90° foot on an
+        # extended leg reads rigid — a relaxed foot follows through.
+        # Signs: calf extension is NEGATIVE rx; foot pointing (toes
+        # down) is POSITIVE rx — so the foot takes the signal unnegated
+        # at full gain. Thigh lifts slightly with the kick.
         lag_vs = np.interp((ts - 0.35) % ROCK_TIME, ts, vs)
         rot[f"calf_{side}"] = [(float(t), (-float(v), 0.0, 0.0)) for t, v in zip(ts, vs)]
-        rot[f"foot_{side}"] = [(float(t), (-float(v) * 0.38, 0.0, 0.0)) for t, v in zip(ts, lag_vs)]
+        rot[f"foot_{side}"] = [(float(t), (float(v) * 1.0, 0.0, 0.0)) for t, v in zip(ts, lag_vs)]
         rot[f"thigh_{side}"] = [(float(t), (float(v) * -0.12, 0.0, 0.0)) for t, v in zip(ts, vs)]
     return "legs_rock", rot, {}
 
@@ -498,11 +502,12 @@ def make_fidget(kind, vname, lpose_fn, rpose_fn):
 
     if kind == "kick":
         # One deliberate kick THROUGH the water (extension = negative
-        # rx), toes just breaking the surface, follow-through, settle.
+        # rx), toes just breaking the surface — foot POINTS with the
+        # kick (positive rx), flexes up on the return drag.
         rot["calf_l"] = [(0.0, (0, 0, 0)), (0.5, (-27, 0, 0)), (0.9, (8, 0, 0)),
                          (1.4, (-10, 0, 0)), (2.0, (0, 0, 0)), (2.4, (0, 0, 0))]
-        rot["foot_l"] = [(0.0, (0, 0, 0)), (0.55, (-16, 0, 0)), (1.0, (10, 0, 0)),
-                         (1.6, (-5, 0, 0)), (2.2, (0, 0, 0)), (2.4, (0, 0, 0))]
+        rot["foot_l"] = [(0.0, (0, 0, 0)), (0.55, (24, 0, 0)), (1.0, (-8, 0, 0)),
+                         (1.6, (6, 0, 0)), (2.2, (0, 0, 0)), (2.4, (0, 0, 0))]
     elif kind == "drum":
         # Fingers drumming on the deck — on whichever hand is planted.
         d = "l" if lpose_fn is arm_pose_deck else "r"
