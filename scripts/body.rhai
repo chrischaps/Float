@@ -21,8 +21,9 @@
 // comes from the entity position following the seat point, which is
 // already eased to the clip's weight-shift phase by seat_camera.rhai.
 
-const INSET = 0.03;     // hips sit just inside the eye's edge path
-const SEAT_Y = 0.28;    // pelvis height above raft origin (root bone adds lift)
+// Body placement (inset from the scoot path, height above raft origin)
+// comes from the seat component's body_inset / body_seat_y — SHARED with
+// seat_camera.rhai, which mirrors this placement to follow the eye bone.
 const PLANT_T = 0.30;   // seconds into a step when the hand takes weight
 
 let prev_dir = 0.0;
@@ -41,9 +42,10 @@ fn on_update() {
     if out_deg == () { return; }   // seat hasn't published yet (first frames)
     let psi = deg_to_rad(out_deg);
     // Pull the hips slightly inboard, opposite the outward heading.
-    let lx = get_field(seat, "seat", "seat_x") - sin(psi) * INSET;
-    let lz = get_field(seat, "seat", "seat_z") - cos(psi) * INSET;
-    let ly = SEAT_Y;
+    let inset = get_field(seat, "seat", "body_inset");
+    let lx = get_field(seat, "seat", "seat_x") - sin(psi) * inset;
+    let lz = get_field(seat, "seat", "seat_z") - cos(psi) * inset;
+    let ly = get_field(seat, "seat", "body_seat_y");
 
     let rp = get_position(raft);
     let rr = get_rotation(raft);

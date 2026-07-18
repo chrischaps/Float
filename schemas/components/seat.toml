@@ -15,8 +15,11 @@ step_time = { type = "float", description = "One scoot step duration (s) — MUS
 step_distance = { type = "float", description = "Seat travel per scoot step (m along the perimeter)", default = 0.35 }
 step_pause = { type = "float", description = "Rest between chained steps while the key is held (s)", default = 0.18 }
 step_bob = { type = "float", description = "Eye lift at the push-up peak of a step (m) — matches the clip's pelvis lift", default = 0.06 }
-eye_height = { type = "float", description = "Eye height above the deck top (m)", default = 0.55 }
-eye_inboard = { type = "float", description = "Eye pulled inboard of the scoot path (m); lean-back posture that also flattens the eye-to-knee angle so the legs reach the frame", default = 0.1 }
+eye_height = { type = "float", description = "Eye height above the deck top (m) — legacy fixed-offset path", default = 0.55 }
+eye_inboard = { type = "float", description = "Eye pulled inboard of the scoot path (m); lean-back posture that also flattens the eye-to-knee angle so the legs reach the frame — legacy fixed-offset path", default = 0.1 }
+eye_follow = { type = "float", description = "0-1: how much the camera follows the body's 'eye' bone (bone_probe) instead of the fixed offset. 1 = pose motion is fully felt in the view; the motion-comfort dial", default = 1.0 }
+body_inset = { type = "float", description = "Body origin pulled inboard of the scoot path (m) — read by BOTH seat_camera.rhai and body.rhai so eye and body can never disagree", default = 0.03 }
+body_seat_y = { type = "float", description = "Body origin height above the raft origin (m) — shared like body_inset", default = 0.28 }
 deck_top = { type = "float", description = "Deck surface height above the raft origin (m)", default = 0.26 }
 roll_transfer = { type = "float", description = "Fraction of raft roll transferred to the camera (0-1)", default = 0.3 }
 mouse_sens = { type = "float", description = "Mouse look sensitivity (rad per count)", default = 0.0028 }

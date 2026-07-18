@@ -357,6 +357,9 @@ step_pause = 0.18
 step_bob = 0.06
 eye_height = 0.55
 eye_inboard = 0.10     # propped-on-hands lean-back; helps the knees reach the frame
+eye_follow = 1.0       # camera rides the body's eye bone (0 = legacy fixed offset)
+body_inset = 0.03      # shared with body.rhai — body origin inboard of the path
+body_seat_y = 0.28     # shared with body.rhai — body origin above raft origin
 deck_top = 0.26
 roll_transfer = 0.45
 mouse_sens = 0.0028
@@ -381,6 +384,8 @@ position = [0.0, 0.28, 1.0]
 asset = "body"
 [entities.body.skeleton]
 skin = "body_rig"
+[entities.body.bone_probe]
+joint = "eye"      # seat_camera.rhai follows this joint (eye_follow)
 [entities.body.animator]
 clip = "idle"
 autoplay = true

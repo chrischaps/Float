@@ -129,6 +129,11 @@ JOINTS = [
     ("upper_arm_r", "clavicle_r",  np.array([-SHOULDER, 0.29, SHOULDER_Z])),
     ("forearm_r",   "upper_arm_r", ELBOW_R),
     ("hand_r",      "forearm_r",   WRIST_R),
+    # Camera anchor: the "center eye". No geometry — seat_camera.rhai
+    # follows this joint (via the engine bone_probe), so any clip that
+    # moves the spine/chest chain is FELT in the first-person camera.
+    # Bind position = exactly where the legacy fixed-offset eye sat.
+    ("eye",         "chest",       np.array([0.0, 0.53, -0.07])),
 ]
 JIDX = {name: i for i, (name, _, _) in enumerate(JOINTS)}
 
@@ -196,9 +201,22 @@ for side, elbow, wrist in ((+1.0, ELBOW_L, WRIST_L), (-1.0, ELBOW_R, WRIST_R)):
     parts.append((f"upper_arm_{sfx}",
                   capsule_between(shoulder, shoulder + svec * 0.10, 0.058), TEE, 0.9))
     parts.append((f"forearm_{sfx}", capsule_between(elbow, wrist, 0.038), SKIN, 0.9))
-    hand = box_at([0.075, 0.03, 0.16],
-                  tx=wrist[0], ty=wrist[1] - 0.005, tz=wrist[2] + 0.065, rx=d2r(-8))
-    parts.append((f"hand_{sfx}", hand, SKIN, 0.9))
+    # Proper mitt: palm block, fused finger mass curling slightly down
+    # (knuckle bevel from the angle change), opposable thumb on the
+    # inboard side. One joint — the SHAPE carries the read, which
+    # matters most when a palm is planted on the deck near the camera.
+    palm = box_at([0.072, 0.026, 0.085],
+                  tx=wrist[0], ty=wrist[1] - 0.004, tz=wrist[2] + 0.045, rx=d2r(-8))
+    parts.append((f"hand_{sfx}", palm, SKIN, 0.9))
+    fingers = box_at([0.066, 0.021, 0.082],
+                     tx=wrist[0], ty=wrist[1] - 0.016, tz=wrist[2] + 0.122, rx=d2r(-22))
+    parts.append((f"hand_{sfx}", fingers, SKIN, 0.9))
+    thumb = capsule_between(
+        [wrist[0] - side * 0.032, wrist[1] - 0.006, wrist[2] + 0.028],
+        [wrist[0] - side * 0.058, wrist[1] - 0.018, wrist[2] + 0.088],
+        0.015,
+    )
+    parts.append((f"hand_{sfx}", thumb, SKIN, 0.9))
 
 
 # ── Quaternion helpers (x, y, z, w) ─────────────────────────────────────

@@ -249,10 +249,8 @@ fn on_update() {
     let r21 = sx * cy;
     let r22 = cx * cy;
 
-    // Seat point in raft-local space: eye above the deck, pulled INBOARD
-    // of the scoot path (propped-on-hands lean-back — head behind hips).
-    // Besides reading as the right posture, the extra horizontal distance
-    // to the knees flattens the eye→knee angle so they reach the frame.
+    // ── Eye position ────────────────────────────────────────────────
+    // Legacy path: a fixed offset above/inboard of the seat point.
     let lx = seat_pt.x - sin(out_yaw) * eye_in;
     let ly = deck + eye_h + eye_bob;
     let lz = seat_pt.z - cos(out_yaw) * eye_in;
@@ -260,6 +258,50 @@ fn on_update() {
     let eye_x = rp["x"] + r00 * lx + r01 * ly + r02 * lz;
     let eye_y = rp["y"] + r10 * lx + r11 * ly + r12 * lz;
     let eye_z = rp["z"] + r20 * lx + r21 * ly + r22 * lz;
+
+    // Bone path: follow the body's "eye" joint (bone_probe, model-local,
+    // one frame of POSE lag only) so breathing, weight shifts, and the
+    // scoot push-up are FELT in the view. The body placement is mirrored
+    // here with THIS frame's raft transform (seat_camera runs before
+    // body.rhai; reading the body entity would lag the raft by a frame)
+    // — the shared body_inset/body_seat_y fields keep the two scripts in
+    // agreement. At bind pose this path equals the legacy one exactly.
+    let follow = clamp(get_field(me, "seat", "eye_follow"), 0.0, 1.0);
+    let body = get_entity("body");
+    if follow > 0.001 && body >= 0 {
+        let ex = get_field(body, "bone_probe", "x");
+        if ex != () {
+            let ey = get_field(body, "bone_probe", "y");
+            let ez = get_field(body, "bone_probe", "z");
+
+            let b_in = get_field(me, "seat", "body_inset");
+            let b_y = get_field(me, "seat", "body_seat_y");
+            let blx = seat_pt.x - sin(out_yaw) * b_in;
+            let blz = seat_pt.z - cos(out_yaw) * b_in;
+            let bpx = rp["x"] + r00 * blx + r01 * b_y + r02 * blz;
+            let bpy = rp["y"] + r10 * blx + r11 * b_y + r12 * blz;
+            let bpz = rp["z"] + r20 * blx + r21 * b_y + r22 * blz;
+
+            // Body entity rotation (matches body.rhai's set_rotation):
+            // euler ZYX of (raft pitch, raft yaw + outward, damped roll).
+            let bx2 = ax;
+            let by2 = ay + out_yaw;
+            let bz2 = az * 0.6;
+            let sx2 = sin(bx2); let cx2 = cos(bx2);
+            let sy2 = sin(by2); let cy2 = cos(by2);
+            let sz2 = sin(bz2); let cz2 = cos(bz2);
+            let bex = bpx + (cy2 * cz2) * ex + (sx2 * sy2 * cz2 - cx2 * sz2) * ey + (cx2 * sy2 * cz2 + sx2 * sz2) * ez;
+            let bey = bpy + (cy2 * sz2) * ex + (sx2 * sy2 * sz2 + cx2 * cz2) * ey + (cx2 * sy2 * sz2 - sx2 * cz2) * ez;
+            let bez = bpz + (-sy2) * ex + (sx2 * cy2) * ey + (cx2 * cy2) * ez;
+
+            // Blend: the motion-comfort dial. In bone mode the scoot
+            // lift comes from the clip's own pelvis motion, so the
+            // scripted eye_bob envelope fades out with the legacy path.
+            eye_x += (bex - eye_x) * follow;
+            eye_y += (bey - eye_y) * follow;
+            eye_z += (bez - eye_z) * follow;
+        }
+    }
 
     // ── View direction ──────────────────────────────────────────────
     // World look yaw = raft yaw + seat-outward heading + seat-relative
