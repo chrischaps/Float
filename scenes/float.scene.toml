@@ -387,7 +387,15 @@ skin = "body_rig"
 [entities.body.bone_probe]
 joint = "eye"      # seat_camera.rhai follows this joint (eye_follow)
 [entities.body.animator]
-clip = "idle"
+clip = "idle_deck"     # default variant: propped lean-back matches the camera
+[entities.body.idle_brain]
+enabled = true
+dwell_min = 12.0
+dwell_max = 30.0
+fidget_chance = 0.45
+big_chance = 0.08      # the rare big stretch — keep infrequent
+variant_blend = 2.0
+fidget_blend = 0.5
 autoplay = true
 loop = true
 playing = true

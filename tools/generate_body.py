@@ -251,35 +251,246 @@ def mirror_rot_keys(keys):
     return [(t, (rx, -ry, -rz)) for (t, (rx, ry, rz)) in keys]
 
 
-def idle_clip():
-    # Amplitudes are THEATRICAL, not realistic: at this stylization (and
-    # against wave motion) subtle reads as stiff. Verified by probing the
-    # eye bone: the first pass moved the camera 2 mm and was invisible.
+# ── Idle variant library ────────────────────────────────────────────────
+# Amplitudes are THEATRICAL, not realistic: at this stylization (and
+# against wave motion) subtle reads as stiff. Verified by probing the eye
+# bone: the first calibration pass moved the camera 2 mm and was
+# invisible; the current numbers give ~19 mm of breathing sway.
+#
+# Arm-chain POSES (left-side eulers; right side mirrors ry/rz). Every
+# idle variant is base poses + layered sway; every fidget HOLDS the
+# variant's poses on un-moving joints, because sparse clips fall back to
+# bind — a fidget that didn't key the arms would yank them to rest.
+
+def euler_to_mat(rx, ry, rz):
+    """Rotation matrix matching quat_from_euler's composition (Rx·Ry·Rz)."""
+    q = quat_from_euler(rx, ry, rz)
+    x, y, z, w = q
+    return np.array([
+        [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+        [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+        [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+    ])
+
+
+def solve_arm(wrist_target, coarse=6.0):
+    """Brute-force 2-bone IK for the LEFT arm: grid-search upper_arm
+    (rx, rz) x forearm rx so the wrist lands on the model-space target.
+    Blind euler authoring kept missing (the forearm's effective axis
+    flips as the upper arm swings); solving is exact and reusable."""
+    s = np.array([+SHOULDER, 0.29, SHOULDER_Z])
+    e_off = ELBOW_L - s
+    w_off = WRIST_L - ELBOW_L
+    target = np.array(wrist_target, dtype=float)
+    best = (1e9, (0.0, 0.0), 0.0)
+    for ua_x in np.arange(-70, 71, coarse):
+        for ua_z in np.arange(-10, 61, coarse):
+            r_ua = euler_to_mat(ua_x, 0.0, ua_z)
+            e = r_ua @ e_off
+            for fa_x in np.arange(-70, 71, coarse):
+                w = s + e + r_ua @ (euler_to_mat(fa_x, 0.0, 0.0) @ w_off)
+                err = np.linalg.norm(w - target)
+                # prefer the elbow OUTBOARD of the shoulder (natural)
+                if (s + e)[0] < s[0]:
+                    err += 0.05
+                if err < best[0]:
+                    best = (err, (ua_x, ua_z), fa_x)
+    (ua_x, ua_z), fa_x = best[1], best[2]
+    return best[0], (float(ua_x), 0.0, float(ua_z)), (float(fa_x), 0.0, 0.0)
+
+
+def arm_pose_thigh():
+    return {"upper_arm": (0, 0, 0), "forearm": (0, 0, 0), "hand": (0, 0, 0)}
+
+
+# Solved once at generation time (targets in model space, LEFT side):
+# deck: palm flat on the deck (y -0.02) outboard beside the hip;
+# water: arm slack over the deck edge reaching toward the water. The
+# CALM waterline (y ~ -0.33) is beyond arm reach (needs 0.75 m, arm has
+# 0.52) — so the hand DANGLES toward it and the swells rise to meet it,
+# helped by a baked spine lean in the water variants.
+_err_d, _UA_DECK, _FA_DECK = solve_arm((0.27, 0.01, -0.02))
+_err_w, _UA_WATER, _FA_WATER = solve_arm((0.20, -0.19, 0.27))
+print(f"  arm IK: deck wrist err {_err_d * 100:.1f} cm, water wrist err {_err_w * 100:.1f} cm")
+
+
+def arm_pose_deck():
+    return {"upper_arm": _UA_DECK, "forearm": _FA_DECK, "hand": (-12, 0, 0)}
+
+
+def arm_pose_water():
+    return {"upper_arm": _UA_WATER, "forearm": _FA_WATER, "hand": (16, 0, 0)}
+
+
+def side_euler(e, side):
+    return e if side == "l" else (e[0], -e[1], -e[2])
+
+
+def wobble_rot(base, amp, cycles, phase, dur, axis=0, n=17):
+    keys = []
+    for i in range(n):
+        t = dur * i / (n - 1)
+        e = list(base)
+        e[axis] = e[axis] + amp * np.sin(2 * np.pi * cycles * t / dur + phase)
+        keys.append((t, tuple(e)))
+    keys[-1] = (dur, keys[0][1])  # exact loop closure
+    return keys
+
+
+# name: (left arm pose, right arm pose, loop seconds, seed). Durations
+# deliberately differ so variant rhythms never phase-lock.
+IDLE_VARIANTS = {
+    "idle_deck":       (arm_pose_deck,  arm_pose_deck,  8.6, 11),
+    "idle_thighs":     (arm_pose_thigh, arm_pose_thigh, 9.4, 22),
+    "idle_left_deck":  (arm_pose_deck,  arm_pose_thigh, 8.9, 33),
+    "idle_right_deck": (arm_pose_thigh, arm_pose_deck,  9.1, 44),
+    "idle_water_l":    (arm_pose_water, arm_pose_deck,  10.2, 55),
+    "idle_water_r":    (arm_pose_deck,  arm_pose_water, 10.0, 66),
+}
+
+
+def make_idle(name, lpose_fn, rpose_fn, dur, seed):
+    rng = np.random.default_rng(seed)
     rot = {}
+    trans = {}
+    # Legs: water-tugged pendulums, desynced per leg and per variant.
+    for j, amp, cyc in (("calf_l", 9.0, 2.0), ("calf_r", 8.0, 2.3),
+                        ("foot_l", 6.0, 2.0), ("foot_r", 5.5, 2.3)):
+        rot[j] = wobble_rot((0, 0, 0), amp * rng.uniform(0.85, 1.15), cyc,
+                            rng.uniform(0.0, 6.28), dur)
+    # Breathing: one cycle per loop, spine + chest compound to the eye.
+    # Water variants bake a spine lean toward the trailing side (extends
+    # the reach and reads as the body committing to the gesture; the
+    # camera leans with it via the eye bone). Negative roll = toward +X.
+    lean = 0.0
+    if lpose_fn is arm_pose_water:
+        lean = -7.0
+    elif rpose_fn is arm_pose_water:
+        lean = 7.0
+    br = rng.uniform(0.9, 1.1)
+    rot["spine"] = [(0.0, (0, 0, lean)), (dur * 0.5, (2.4 * br, 0, 0.7 + lean)),
+                    (dur, (0, 0, lean))]
+    rot["chest"] = [(0.0, (0, 0, lean * 0.5)),
+                    (dur * 0.45, (1.6 * br, 0, -0.4 + lean * 0.5)),
+                    (dur, (0, 0, lean * 0.5))]
+    # Arms: base pose + micro-sway. A water-trailing hand drags BIG and
+    # slow — the water is moving it, not the muscles.
+    for side, pose_fn in (("l", lpose_fn), ("r", rpose_fn)):
+        in_water = pose_fn is arm_pose_water
+        for j, base in pose_fn().items():
+            b = side_euler(base, side)
+            if in_water and j == "hand":
+                amp, cyc = 7.0, 1.0
+            elif in_water:
+                amp, cyc = 3.0, 1.0
+            else:
+                amp = {"upper_arm": 1.8, "forearm": 2.2, "hand": 3.0}[j]
+                cyc = rng.uniform(2.2, 3.2)
+            rot[f"{j}_{side}"] = wobble_rot(
+                b, amp * rng.uniform(0.8, 1.2), cyc, rng.uniform(0.0, 6.28), dur)
+    # Slow weight sway in the pelvis (millimeters — felt via the eye).
     n = 17
-    for j, amp, rate, phase in (
-        # Calves swing like the water is tugging them — desynced.
-        ("calf_l", 9.0, 1.0, 0.0), ("calf_r", 8.0, 1.15, 2.1),
-        ("foot_l", 6.0, 1.0, 0.7), ("foot_r", 5.5, 1.15, 2.8),
-        # Arms are alive: slow micro-sway, desynced from the legs.
-        ("upper_arm_l", 1.8, 0.55, 1.2), ("upper_arm_r", 1.6, 0.62, 3.9),
-        ("forearm_l", 2.2, 0.55, 1.9), ("forearm_r", 2.0, 0.62, 4.6),
-    ):
-        keys = []
-        for i in range(n):
-            t = IDLE_TIME * i / (n - 1)
-            keys.append((t, (amp * np.sin(2 * np.pi * t / IDLE_TIME * 2.0 * rate + phase), 0.0, 0.0)))
-        # force exact loop closure
-        keys[-1] = (IDLE_TIME, keys[0][1])
-        rot[j] = keys
-    # Breathing: one cycle per loop (~12 breaths/min), spine + chest
-    # compound so the eye bone carries ~2 cm of slow sway — felt on calm
-    # water, gentle under weather.
-    rot["spine"] = [(0.0, (0.0, 0.0, 0.0)), (IDLE_TIME * 0.5, (2.4, 0.0, 0.7)),
-                    (IDLE_TIME, (0.0, 0.0, 0.0))]
-    rot["chest"] = [(0.0, (0.0, 0.0, 0.0)), (IDLE_TIME * 0.45, (1.6, 0.0, -0.4)),
-                    (IDLE_TIME, (0.0, 0.0, 0.0))]
-    return rot, {}
+    ph = rng.uniform(0.0, 6.28)
+    tk = []
+    for i in range(n):
+        t = dur * i / (n - 1)
+        tk.append((t, (0.006 * np.sin(2 * np.pi * t / dur + ph),
+                       0.003 * np.sin(2 * np.pi * 2.0 * t / dur + ph * 1.7), 0.0)))
+    tk[-1] = (dur, tk[0][1])
+    trans["root"] = tk
+    return name, rot, trans
+
+
+# ── Fidgets: one-shots layered over a variant's held poses ──────────────
+FIDGET_DURS = {"kick": 2.4, "drum": 2.0, "shift": 2.6, "sigh": 3.0, "stretch": 3.6}
+
+
+def held_arms(lpose_fn, rpose_fn, dur):
+    rot = {}
+    for side, fn in (("l", lpose_fn), ("r", rpose_fn)):
+        for j, base in fn().items():
+            b = side_euler(base, side)
+            rot[f"{j}_{side}"] = [(0.0, b), (dur, b)]
+    return rot
+
+
+def eadd(a, b):
+    return (a[0] + b[0], a[1] + b[1], a[2] + b[2])
+
+
+def make_fidget(kind, vname, lpose_fn, rpose_fn):
+    dur = FIDGET_DURS[kind]
+    rot = held_arms(lpose_fn, rpose_fn, dur)
+    trans = {}
+    lean = 0.0
+    if lpose_fn is arm_pose_water:
+        lean = -7.0
+    elif rpose_fn is arm_pose_water:
+        lean = 7.0
+
+    if kind == "kick":
+        # One lazy kick at the water, follow-through, settle.
+        rot["calf_l"] = [(0.0, (0, 0, 0)), (0.5, (26, 0, 0)), (0.9, (-8, 0, 0)),
+                         (1.4, (10, 0, 0)), (2.0, (0, 0, 0)), (2.4, (0, 0, 0))]
+        rot["foot_l"] = [(0.0, (0, 0, 0)), (0.55, (14, 0, 0)), (1.0, (-10, 0, 0)),
+                         (1.6, (4, 0, 0)), (2.2, (0, 0, 0)), (2.4, (0, 0, 0))]
+    elif kind == "drum":
+        # Fingers drumming on the deck — on whichever hand is planted.
+        d = "l" if lpose_fn is arm_pose_deck else "r"
+        base = side_euler(arm_pose_deck()["hand"], d)
+        sgn = 1.0 if d == "l" else -1.0
+        taps = [(0.0, 0.0), (0.35, 6.0), (0.5, -3.0), (0.65, 7.0), (0.8, -3.0),
+                (0.95, 6.0), (1.1, -2.0), (1.3, 4.0), (1.7, 0.0), (2.0, 0.0)]
+        rot[f"hand_{d}"] = [(t, (base[0], base[1], base[2] + sgn * v)) for t, v in taps]
+    elif kind == "shift":
+        # Weight rocks onto one hip and back.
+        trans["root"] = [(0.0, (0, 0, 0)), (0.9, (-0.03, 0.004, 0)),
+                         (1.7, (-0.026, 0.002, 0)), (2.6, (0, 0, 0))]
+        rot["spine"] = [(0.0, (0, 0, 0)), (0.9, (0.5, 0, 3.5)),
+                        (1.8, (0.4, 0, 3.0)), (2.6, (0, 0, 0))]
+    elif kind == "sigh":
+        # One deep breath: shoulders rise, hold, drop.
+        rot["spine"] = [(0.0, (0, 0, 0)), (1.1, (4.5, 0, 0)), (1.9, (3.6, 0, 0)),
+                        (3.0, (0, 0, 0))]
+        rot["chest"] = [(0.0, (0, 0, 0)), (1.0, (2.6, 0, 0)), (2.0, (2.0, 0, 0)),
+                        (3.0, (0, 0, 0))]
+        rot["clavicle_l"] = [(0.0, (0, 0, 0)), (1.05, (0, 0, -6)),
+                             (2.0, (0, 0, -4)), (3.0, (0, 0, 0))]
+        rot["clavicle_r"] = [(0.0, (0, 0, 0)), (1.05, (0, 0, 6)),
+                             (2.0, (0, 0, 4)), (3.0, (0, 0, 0))]
+    elif kind == "stretch":
+        # The rare big gesture: arch back, shoulders roll up and back,
+        # arms pull back, release. Felt strongly through the eye bone.
+        rot["spine"] = [(0.0, (0, 0, 0)), (1.2, (-5, 0, 0)), (2.2, (-4.4, 0, 0)),
+                        (3.3, (0.6, 0, 0)), (3.6, (0, 0, 0))]
+        rot["chest"] = [(0.0, (0, 0, 0)), (1.2, (-3, 0, 0)), (2.2, (-2.6, 0, 0)),
+                        (3.6, (0, 0, 0))]
+        rot["clavicle_l"] = [(0.0, (0, 0, 0)), (1.3, (0, 0, -13)),
+                             (2.3, (0, 0, -11)), (3.6, (0, 0, 0))]
+        rot["clavicle_r"] = [(0.0, (0, 0, 0)), (1.3, (0, 0, 13)),
+                             (2.3, (0, 0, 11)), (3.6, (0, 0, 0))]
+        for side, fn in (("l", lpose_fn), ("r", rpose_fn)):
+            ua = side_euler(fn()["upper_arm"], side)
+            pull = (16, 0, 8 if side == "l" else -8)
+            rot[f"upper_arm_{side}"] = [
+                (0.0, ua), (1.3, eadd(ua, pull)),
+                (2.3, eadd(ua, (14, 0, pull[2] * 0.85))), (3.6, ua)]
+        trans["root"] = [(0.0, (0, 0, 0)), (1.3, (0, 0.012, 0)),
+                         (2.3, (0, 0.010, 0)), (3.6, (0, 0, 0))]
+
+    # Water variants hold their spine lean through every fidget —
+    # otherwise blending into one would un-lean the body mid-gesture.
+    if lean != 0.0:
+        if "spine" in rot:
+            rot["spine"] = [(t, (x, y, z + lean)) for t, (x, y, z) in rot["spine"]]
+        else:
+            rot["spine"] = [(0.0, (0, 0, lean)), (dur, (0, 0, lean))]
+        if "chest" in rot:
+            rot["chest"] = [(t, (x, y, z + lean * 0.5)) for t, (x, y, z) in rot["chest"]]
+        else:
+            rot["chest"] = [(0.0, (0, 0, lean * 0.5)), (dur, (0, 0, lean * 0.5))]
+
+    return f"fid_{kind}_{vname}", rot, trans
 
 
 def scoot_right_clip():
@@ -337,13 +548,18 @@ def mirror_clip(rot, trans):
 
 ROT_R, TRANS_R = scoot_right_clip()
 ROT_L, TRANS_L = mirror_clip(ROT_R, TRANS_R)
-ROT_I, TRANS_I = idle_clip()
 
 CLIPS = [
-    ("idle", ROT_I, TRANS_I),
     ("scoot_right", ROT_R, TRANS_R),
     ("scoot_left", ROT_L, TRANS_L),
 ]
+for vname, (lp, rp, dur, seed) in IDLE_VARIANTS.items():
+    CLIPS.append(make_idle(vname, lp, rp, dur, seed))
+    for kind in FIDGET_DURS:
+        # Drumming needs a deck-planted hand.
+        if kind == "drum" and arm_pose_deck not in (lp, rp):
+            continue
+        CLIPS.append(make_fidget(kind, vname, lp, rp))
 
 
 # ── glTF assembly ───────────────────────────────────────────────────────
@@ -496,5 +712,7 @@ gltf.set_binary_blob(bytes(blob))
 
 path = os.path.join(OUT_DIR, "body.glb")
 gltf.save_binary(path)
-print(f"wrote {path}  ({len(parts)} parts, {len(JOINTS)} joints, "
-      f"clips: {', '.join(name for name, _, _ in CLIPS)})")
+print(f"wrote {path}  ({len(parts)} parts, {len(JOINTS)} joints, {len(CLIPS)} clips)")
+print("  variants:", ", ".join(IDLE_VARIANTS))
+print("  fidget durations (mirror in body.rhai!):",
+      ", ".join(f"{k}={v}" for k, v in FIDGET_DURS.items()))

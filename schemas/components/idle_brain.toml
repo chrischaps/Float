@@ -1,0 +1,11 @@
+[component.idle_brain]
+description = "Idle variant selection + fidgets for the seated body (scripts/body.rhai): dwell in a pose, occasionally fidget or drift to another pose; rare big gestures"
+
+[component.idle_brain.fields]
+enabled = { type = "bool", description = "Master switch (false = stay in the current idle loop forever)", default = true }
+dwell_min = { type = "float", description = "Minimum seconds in a variant before acting", default = 12.0 }
+dwell_max = { type = "float", description = "Maximum seconds in a variant before acting", default = 30.0 }
+fidget_chance = { type = "float", description = "When dwell expires: probability of a small fidget (vs drifting to another pose)", default = 0.45 }
+big_chance = { type = "float", description = "When dwell expires: probability of a RARE big gesture (stretch)", default = 0.08 }
+variant_blend = { type = "float", description = "Crossfade seconds when drifting between poses — the slow blend IS the repositioning move", default = 2.0 }
+fidget_blend = { type = "float", description = "Crossfade seconds into/out of fidgets", default = 0.5 }
