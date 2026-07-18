@@ -115,8 +115,8 @@ splash_flicker_speed = 1.600000023841858
 splash_noise_scale = 5.0
 splash_baseline = 0.15000000596046448
 splash_response = 1.0
-# Bioluminescence (M8): color is a scene constant; strength is animated
-# by time_of_day.rhai (0 by day, waking after dusk, 0.55 at midnight).
+# Bioluminescence (M8): color is a scene constant; strength is owned by
+# biolum.rhai — zero except during rare night bloom windows.
 foam_glow_color = [0.35, 0.95, 0.75, 1.0]
 foam_glow = 0.0
 
@@ -273,6 +273,23 @@ shape_radius = 2.5
 shape_angle = 50.0
 world_space = true
 autoplay = false
+
+# ── Bioluminescent bloom nights (M8): biolum.rhai rolls the dice each
+#    night; most nights nothing, some nights an hour or two of glowing
+#    churn. It owns ocean.foam_glow. ──────────────────────────────────
+
+[entities.biolum_controller]
+[entities.biolum_controller.biolum]
+enabled = true
+chance = 0.4
+earliest = 21.6
+latest = 26.5           # hours >24 = after midnight (2:30)
+duration_min = 0.8
+duration_max = 2.0
+fade_hours = 0.3
+strength = 0.5
+[entities.biolum_controller.script]
+source = "biolum.rhai"
 
 # ── Dawn birds (M8): five silhouettes in a loose V cross the sunrise
 #    glow; birds.rhai schedules and flies them, parked deep otherwise ──

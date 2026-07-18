@@ -1,0 +1,12 @@
+[component.biolum]
+description = "Rare bioluminescent bloom nights (scripts/biolum.rhai): some nights, for an hour or two, the churned foam lights up — most nights nothing"
+
+[component.biolum.fields]
+enabled = { type = "bool", description = "Master switch for bloom events", default = true }
+chance = { type = "float", description = "Probability a given night has a bloom (0-1)", default = 0.4 }
+earliest = { type = "float", description = "Earliest bloom start (game hours; may exceed 24 for after midnight)", default = 21.6 }
+latest = { type = "float", description = "Latest bloom start (game hours; >24 = after midnight)", default = 26.5 }
+duration_min = { type = "float", description = "Shortest bloom (game hours)", default = 0.8 }
+duration_max = { type = "float", description = "Longest bloom (game hours)", default = 2.0 }
+fade_hours = { type = "float", description = "Fade-in/out ramp at the bloom edges (game hours)", default = 0.3 }
+strength = { type = "float", description = "Peak foam_glow strength at full bloom", default = 0.5 }
