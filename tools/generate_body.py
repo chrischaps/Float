@@ -75,9 +75,15 @@ def d2r(d):
 #     the real rotation happens), with the shoulder ball outboard.
 # Relaxed dock-sit pose: knees splayed wider than the hips, calves
 # dropping, feet drifting back inward under the knees.
-LEG_X = 0.10         # hip socket lateral offset (~20 cm femoral spacing)
-KNEE_SPLAY = 0.10    # knee outward of hip (m) — legs apart, at ease
-ANKLE_TUCK = 0.025   # ankle back inward from the knee (m)
+# Legs like the ledge-sit reference (reference/raft): near-PARALLEL
+# thighs with a clear gap running their whole length — not a V fanning
+# out from the crotch. The gap comes from the socket spacing (wide, per
+# the rigging-wiki "run it to the outside" rule — on this chunky
+# stylized body the sockets carry outward with the mesh), not from
+# splaying the knees.
+LEG_X = 0.13         # hip socket lateral offset — clears the shorts cuffs
+KNEE_SPLAY = 0.03    # knees barely wider than the sockets (parallel read)
+ANKLE_TUCK = 0.01    # feet nearly under the knees
 
 
 def leg_points(side):
@@ -100,8 +106,8 @@ CLAV_L = np.array([+0.035, 0.295, -0.13])   # near center, slightly front
 CLAV_R = np.array([-0.035, 0.295, -0.13])
 ELBOW_L = np.array([+0.225, 0.03, -0.04])
 ELBOW_R = np.array([-0.225, 0.03, -0.04])
-WRIST_L = np.array([+0.165, 0.11, 0.17])  # resting on the (splayed) thigh
-WRIST_R = np.array([-0.165, 0.11, 0.17])
+WRIST_L = np.array([+0.155, 0.11, 0.17])  # resting on the thigh
+WRIST_R = np.array([-0.155, 0.11, 0.17])
 
 JOINTS = [
     # name          parent         global bind position
@@ -156,20 +162,23 @@ for side, hip, knee, ankle in ((+1.0, HIP_L, KNEE_L, ANKLE_L), (-1.0, HIP_R, KNE
     # Toes dipped toward the water and turned slightly OUT — feet at ease.
     foot = box_at([0.085, 0.055, 0.22],
                   tx=ankle[0], ty=ankle[1] - 0.015, tz=ankle[2] + 0.07,
-                  rx=d2r(-14), ry=side * d2r(9))
+                  rx=d2r(-14), ry=side * d2r(5))
     parts.append((f"foot_{sfx}", foot, FOOT, 0.9))
     # Shorts cuff on the upper thigh (rides with the thigh joint).
     cvec = (knee - hip) / np.linalg.norm(knee - hip)
     c0 = hip + np.array([0.0, 0.012, 0.0])
     parts.append((f"thigh_{sfx}", capsule_between(c0, c0 + cvec * 0.20, THIGH_R + 0.022), SHORTS, 0.9))
 
-# Pelvis/seat block (shorts) on the root.
-parts.append(("root", box_at([2 * (LEG_X + 0.10), 0.16, 0.26], ty=0.03, tz=-0.16), SHORTS, 0.9))
+# Pelvis/seat block (shorts) on the root — spans the hips, stops shy of
+# the legs' outer edges so the thighs read as separate from it.
+parts.append(("root", box_at([0.42, 0.16, 0.26], ty=0.03, tz=-0.16), SHORTS, 0.9))
 # Torso: belly on root, chest + shoulder bar on spine (tee). Slim and
 # pulled BACK: the chest must stay clear of the first-person camera's
 # near plane (the eye sits ~6 cm above and just inboard of it) or it
 # clips open into a dome with a hole when the player looks down.
-parts.append(("spine", capsule_between([0.0, 0.06, -0.15], [0.0, 0.19, -0.16], 0.105), TEE, 0.9))
+# Belly slim and pulled back — looking down it should foreshorten under
+# the chest, not sit on the lap like a ball.
+parts.append(("spine", capsule_between([0.0, 0.06, -0.17], [0.0, 0.19, -0.17], 0.095), TEE, 0.9))
 parts.append(("chest", capsule_between([0.0, 0.19, -0.16], [0.0, 0.30, -0.155], 0.10), TEE, 0.9))
 # Clavicles: from near-center chest out to each shoulder ball.
 for side, clav in ((+1.0, CLAV_L), (-1.0, CLAV_R)):
