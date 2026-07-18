@@ -225,6 +225,55 @@ swell_fade_seconds = 15.0
 [entities.music_controller.script]
 source = "music.rhai"
 
+# ── The dusk whale (M8): parked far underwater until whale.rhai
+#    schedules a breach against the sunset band ──────────────────────
+
+[entities.whale]
+[entities.whale.transform]
+position = [0.0, -40.0, 130.0]
+[entities.whale.model]
+asset = "whale"
+[entities.whale.whale]
+enabled = true
+distance = 130.0
+bearing_deg = 278.0     # sunset azimuth (sun sets 272-285) — breach in the light
+bearing_spread_deg = 30.0
+window_start = 19.2
+window_end = 20.6
+breach_height = 6.0
+breach_duration = 3.4
+encore_chance = 0.35
+[entities.whale.script]
+source = "whale.rhai"
+
+# Splash column at the breach point. The spray tint is baked dusk-warm:
+# the emitter only ever fires inside the dusk window, so the constant
+# IS the TOD-correct color (particles are unlit).
+
+[entities.whale_splash]
+[entities.whale_splash.transform]
+position = [0.0, -40.0, 130.0]
+[entities.whale_splash.particle_emitter]
+emission_rate = 0.0
+max_particles = 256
+lifetime_min = 0.9
+lifetime_max = 1.9
+speed_min = 6.0
+speed_max = 14.0
+direction = [0.0, 1.0, 0.0]
+spread = 55.0
+gravity = [0.0, -9.81, 0.0]
+damping = 0.4
+size_start = 1.2
+size_end = 0.25
+color_start = [0.98, 0.86, 0.82, 0.9]
+color_end = [0.75, 0.62, 0.68, 0.0]
+shape = "cone"
+shape_radius = 2.5
+shape_angle = 50.0
+world_space = true
+autoplay = false
+
 # ── Seated first-person camera (declared after the raft so it reads
 #    this frame's raft transform) ─────────────────────────────────
 

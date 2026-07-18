@@ -1,0 +1,13 @@
+[component.whale]
+description = "Distant dusk whale breach (scripts/whale.rhai): schedules one breach (maybe two) per dusk window, placed against the sunset band"
+
+[component.whale.fields]
+enabled = { type = "bool", description = "Master switch for the breach event", default = true }
+distance = { type = "float", description = "Breach distance from the raft (m)", default = 130.0 }
+bearing_deg = { type = "float", description = "Base world bearing of the breach point — aim at the sunset azimuth so the whale rises against the bright sky band", default = 278.0 }
+bearing_spread_deg = { type = "float", description = "Random bearing variation (±deg)", default = 30.0 }
+window_start = { type = "float", description = "Dusk window start (game hours)", default = 19.2 }
+window_end = { type = "float", description = "Dusk window end (game hours)", default = 20.6 }
+breach_height = { type = "float", description = "Body-center rise above the surface at apex (m)", default = 6.0 }
+breach_duration = { type = "float", description = "Full breach length, exit to splash (real seconds)", default = 3.4 }
+encore_chance = { type = "float", description = "Chance of a second breach if the window has room (0-1)", default = 0.35 }
