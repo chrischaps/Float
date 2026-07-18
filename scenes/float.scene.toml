@@ -274,6 +274,54 @@ shape_angle = 50.0
 world_space = true
 autoplay = false
 
+# ── Dawn birds (M8): five silhouettes in a loose V cross the sunrise
+#    glow; birds.rhai schedules and flies them, parked deep otherwise ──
+
+[entities.bird_flock]
+[entities.bird_flock.birds]
+enabled = true
+distance = 110.0
+height = 12.0
+speed = 9.0
+bearing_deg = 85.0      # sunrise azimuth — cross the glow
+bearing_spread_deg = 25.0
+window_start = 5.6
+window_end = 7.2
+crossing_length = 260.0
+encore_chance = 0.4
+[entities.bird_flock.script]
+source = "birds.rhai"
+
+[entities.bird_0]
+[entities.bird_0.transform]
+position = [0.0, -60.0, 0.0]
+[entities.bird_0.model]
+asset = "bird"
+
+[entities.bird_1]
+[entities.bird_1.transform]
+position = [0.0, -60.0, 0.0]
+[entities.bird_1.model]
+asset = "bird"
+
+[entities.bird_2]
+[entities.bird_2.transform]
+position = [0.0, -60.0, 0.0]
+[entities.bird_2.model]
+asset = "bird"
+
+[entities.bird_3]
+[entities.bird_3.transform]
+position = [0.0, -60.0, 0.0]
+[entities.bird_3.model]
+asset = "bird"
+
+[entities.bird_4]
+[entities.bird_4.transform]
+position = [0.0, -60.0, 0.0]
+[entities.bird_4.model]
+asset = "bird"
+
 # ── Seated first-person camera (declared after the raft so it reads
 #    this frame's raft transform) ─────────────────────────────────
 

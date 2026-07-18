@@ -1,0 +1,14 @@
+[component.birds]
+description = "Dawn seabird crossing (scripts/birds.rhai): a small trailing-V of silhouettes crosses the sunrise glow once (maybe twice) per dawn window"
+
+[component.birds.fields]
+enabled = { type = "bool", description = "Master switch for the crossing event", default = true }
+distance = { type = "float", description = "Closest approach of the flight line to the raft (m)", default = 110.0 }
+height = { type = "float", description = "Flight height above the sea (m)", default = 12.0 }
+speed = { type = "float", description = "Flight speed (m/s)", default = 9.0 }
+bearing_deg = { type = "float", description = "Base world bearing of the crossing — aim at the sunrise azimuth so the flock crosses the glow", default = 85.0 }
+bearing_spread_deg = { type = "float", description = "Random bearing variation (±deg)", default = 25.0 }
+window_start = { type = "float", description = "Dawn window start (game hours)", default = 5.6 }
+window_end = { type = "float", description = "Dawn window end (game hours)", default = 7.2 }
+crossing_length = { type = "float", description = "Total length of the flight line (m)", default = 260.0 }
+encore_chance = { type = "float", description = "Chance of a second crossing if the window has room (0-1)", default = 0.4 }

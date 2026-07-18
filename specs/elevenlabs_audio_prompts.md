@@ -160,3 +160,6 @@ overwrite them with real takes.
   faint lingering echo, then calm." (~4–6 s one-shot)
 - **M8 whale song (optional):** "A faint, low whale song heard from above
   the surface, muffled and distant, melancholic, two slow calls." (~8 s)
+- **M8 dawn birds:** "A few distant seagull cries over the open ocean at
+  dawn, sparse and far away, gentle, no traffic or people, airy." (~6 s,
+  2-3 takes for variety)

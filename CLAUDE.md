@@ -87,11 +87,17 @@ M6 scooting ✅ (A/D or left stick slides the seat around a
 rounded-rectangle perimeter path; `seat_camera.rhai` owns the path math
 and publishes `seat_x`/`seat_z`/`seat_out_deg` through the seat component
 for `legs_idle.rhai` — set_field is deferred, so readers guard against
-unit on the first frames).
-Next: wildlife (M8 — the distant whale breach at dusk from
-reference/water; every new element must be lit from TOD-driven sources,
-never a constant color). Foam/palette polish record (all items done):
-`specs/foam_followups.md`.
+unit on the first frames) →
+M8 wildlife ✅: bioluminescent night foam (emissive `foam_glow` on the
+ocean, strength driven by a TOD keyframe channel), the dusk whale breach
+(`whale.rhai`, once per dusk toward the sunset band; fixture:
+`scenes/snap_breach.scene.toml`), dawn birds (`birds.rhai`, a loose V
+crossing the sunrise). All wildlife is lit from TOD-driven sources —
+never a constant color (see `specs/foam_followups.md`). Event scripts
+share the whale's scheduling pattern: window entry schedules, scrubbing
+out cancels, the event runs on real seconds.
+All milestones complete. Polish backlog: skeletal scoot animation
+(tasks filed), real M6/M8 SFX from `specs/elevenlabs_audio_prompts.md`.
 Engine changes live on Flint branch `feature/ocean-pipeline` (merge to main
 when ready). Plan: `C:\Users\chris\.claude\plans\please-make-a-plan-fluffy-pearl.md`
 
