@@ -422,10 +422,13 @@ KICK_SHAPE_T = [0.0, 0.14, 0.32, 0.58, 0.80, 1.0]
 KICK_SHAPE_V = [0.0, 1.0, 0.72, -0.29, 0.12, 0.0]
 
 # Per-leg kick trains (amplitude fraction of full extension, seconds).
-# Both trains total the same loop length; the full-extension kicks land
-# far apart, so somewhere a leg swings all the way out every ~10 s.
-KICKS_L = [(0.35, 4.4), (1.0, 6.6), (0.5, 4.6), (0.7, 5.4)]
-KICKS_R = [(0.62, 5.0), (0.38, 4.4), (1.0, 6.8), (0.45, 4.8)]
+# Both trains total the same loop length. SCALE: the feet live IN the
+# water — the ankle crosses the calm waterline at ~14° of extension
+# (0.18 of full), toes at ~22° — so the ordinary kicks slosh below the
+# surface and only the biggest (0.33 ≈ 26°) briefly breaks it with the
+# toes. Full extension was tried and read as too much (feet in the sky).
+KICKS_L = [(0.12, 4.4), (0.32, 6.6), (0.17, 4.6), (0.24, 5.4)]
+KICKS_R = [(0.21, 5.0), (0.13, 4.4), (0.33, 6.8), (0.15, 4.8)]
 ROCK_TIME = 21.0
 assert abs(sum(d for _, d in KICKS_L) - ROCK_TIME) < 1e-9
 assert abs(sum(d for _, d in KICKS_R) - ROCK_TIME) < 1e-9
@@ -494,10 +497,10 @@ def make_fidget(kind, vname, lpose_fn, rpose_fn):
         lean = 7.0
 
     if kind == "kick":
-        # One lazy kick OUT at the water (extension = negative rx),
-        # follow-through tuck, settle.
-        rot["calf_l"] = [(0.0, (0, 0, 0)), (0.5, (-32, 0, 0)), (0.9, (9, 0, 0)),
-                         (1.4, (-11, 0, 0)), (2.0, (0, 0, 0)), (2.4, (0, 0, 0))]
+        # One deliberate kick THROUGH the water (extension = negative
+        # rx), toes just breaking the surface, follow-through, settle.
+        rot["calf_l"] = [(0.0, (0, 0, 0)), (0.5, (-27, 0, 0)), (0.9, (8, 0, 0)),
+                         (1.4, (-10, 0, 0)), (2.0, (0, 0, 0)), (2.4, (0, 0, 0))]
         rot["foot_l"] = [(0.0, (0, 0, 0)), (0.55, (-16, 0, 0)), (1.0, (10, 0, 0)),
                          (1.6, (-5, 0, 0)), (2.2, (0, 0, 0)), (2.4, (0, 0, 0))]
     elif kind == "drum":
