@@ -64,37 +64,47 @@ def d2r(d):
 
 
 # ── Skeleton: (name, parent, global bind position) ──────────────────────
+# Relaxed dock-sit: knees SPLAYED well wider than the hips (the diamond
+# a body actually makes sitting slack on an edge), calves dropping with
+# the feet drifting back inward under the knees.
+KNEE_SPLAY = 0.085   # knee outward of hip (m) — legs apart, at ease
+ANKLE_TUCK = 0.025   # ankle back inward from the knee (m)
+
+
 def leg_points(side):
     hip = np.array([side * LEG_X, 0.02, -0.06])
     knee = hip + np.array(
-        [side * 0.015, -np.sin(THIGH_DROP) * THIGH_LEN, np.cos(THIGH_DROP) * THIGH_LEN]
+        [side * KNEE_SPLAY, -np.sin(THIGH_DROP) * THIGH_LEN, np.cos(THIGH_DROP) * THIGH_LEN]
     )
-    ankle = knee + np.array([0.0, -np.cos(CALF_SWING) * CALF_LEN, np.sin(CALF_SWING) * CALF_LEN])
+    ankle = knee + np.array(
+        [-side * ANKLE_TUCK, -np.cos(CALF_SWING) * CALF_LEN, np.sin(CALF_SWING) * CALF_LEN]
+    )
     return hip, knee, ankle
 
 
 HIP_L, KNEE_L, ANKLE_L = leg_points(+1.0)
 HIP_R, KNEE_R, ANKLE_R = leg_points(-1.0)
 SHOULDER = 0.20
-ELBOW_L = np.array([+0.225, 0.03, -0.03])
-ELBOW_R = np.array([-0.225, 0.03, -0.03])
-WRIST_L = np.array([+0.14, 0.11, 0.17])   # resting on the thigh
-WRIST_R = np.array([-0.14, 0.11, 0.17])
+SHOULDER_Z = -0.15   # shoulders sit back with the (reclined) chest
+ELBOW_L = np.array([+0.225, 0.03, -0.04])
+ELBOW_R = np.array([-0.225, 0.03, -0.04])
+WRIST_L = np.array([+0.165, 0.11, 0.17])  # resting on the (splayed) thigh
+WRIST_R = np.array([-0.165, 0.11, 0.17])
 
 JOINTS = [
     # name          parent        global bind position
     ("root",        None,         np.array([0.0, 0.02, -0.10])),
-    ("spine",       "root",       np.array([0.0, 0.17, -0.13])),
+    ("spine",       "root",       np.array([0.0, 0.17, -0.15])),
     ("thigh_l",     "root",       HIP_L),
     ("calf_l",      "thigh_l",    KNEE_L),
     ("foot_l",      "calf_l",     ANKLE_L),
     ("thigh_r",     "root",       HIP_R),
     ("calf_r",      "thigh_r",    KNEE_R),
     ("foot_r",      "calf_r",     ANKLE_R),
-    ("upper_arm_l", "spine",      np.array([+SHOULDER, 0.30, -0.11])),
+    ("upper_arm_l", "spine",      np.array([+SHOULDER, 0.29, SHOULDER_Z])),
     ("forearm_l",   "upper_arm_l", ELBOW_L),
     ("hand_l",      "forearm_l",  WRIST_L),
-    ("upper_arm_r", "spine",      np.array([-SHOULDER, 0.30, -0.11])),
+    ("upper_arm_r", "spine",      np.array([-SHOULDER, 0.29, SHOULDER_Z])),
     ("forearm_r",   "upper_arm_r", ELBOW_R),
     ("hand_r",      "forearm_r",  WRIST_R),
 ]
@@ -113,9 +123,9 @@ def capsule_between(p0, p1, radius):
     return cap
 
 
-def box_at(extents, tx=0.0, ty=0.0, tz=0.0, rx=0.0):
+def box_at(extents, tx=0.0, ty=0.0, tz=0.0, rx=0.0, ry=0.0):
     b = trimesh.creation.box(extents=extents)
-    m = trimesh.transformations.euler_matrix(rx, 0.0, 0.0, "sxyz")
+    m = trimesh.transformations.euler_matrix(rx, ry, 0.0, "sxyz")
     m[:3, 3] = [tx, ty, tz]
     b.apply_transform(m)
     return b
@@ -127,8 +137,10 @@ for side, hip, knee, ankle in ((+1.0, HIP_L, KNEE_L, ANKLE_L), (-1.0, HIP_R, KNE
     sfx = "l" if side > 0 else "r"
     parts.append((f"thigh_{sfx}", capsule_between(hip, knee, THIGH_R), SKIN, 0.9))
     parts.append((f"calf_{sfx}", capsule_between(knee, ankle, CALF_R), SKIN_LOWER, 0.9))
+    # Toes dipped toward the water and turned slightly OUT — feet at ease.
     foot = box_at([0.085, 0.055, 0.22],
-                  tx=ankle[0], ty=ankle[1] - 0.015, tz=ankle[2] + 0.07, rx=d2r(-14))
+                  tx=ankle[0], ty=ankle[1] - 0.015, tz=ankle[2] + 0.07,
+                  rx=d2r(-14), ry=side * d2r(9))
     parts.append((f"foot_{sfx}", foot, FOOT, 0.9))
     # Shorts cuff on the upper thigh (rides with the thigh joint).
     cvec = (knee - hip) / np.linalg.norm(knee - hip)
@@ -137,15 +149,18 @@ for side, hip, knee, ankle in ((+1.0, HIP_L, KNEE_L, ANKLE_L), (-1.0, HIP_R, KNE
 
 # Pelvis/seat block (shorts) on the root.
 parts.append(("root", box_at([2 * (LEG_X + 0.10), 0.16, 0.26], ty=0.03, tz=-0.16), SHORTS, 0.9))
-# Torso: belly on root, chest + shoulder bar on spine (tee).
-parts.append(("root", capsule_between([0.0, 0.06, -0.13], [0.0, 0.20, -0.14], 0.13), TEE, 0.9))
-parts.append(("spine", capsule_between([0.0, 0.20, -0.135], [0.0, 0.34, -0.12], 0.125), TEE, 0.9))
-parts.append(("spine", capsule_between([+SHOULDER - 0.02, 0.30, -0.11],
-                                       [-SHOULDER + 0.02, 0.30, -0.11], 0.062), TEE, 0.9))
+# Torso: belly on root, chest + shoulder bar on spine (tee). Slim and
+# pulled BACK: the chest must stay clear of the first-person camera's
+# near plane (the eye sits ~6 cm above and just inboard of it) or it
+# clips open into a dome with a hole when the player looks down.
+parts.append(("root", capsule_between([0.0, 0.06, -0.15], [0.0, 0.19, -0.16], 0.105), TEE, 0.9))
+parts.append(("spine", capsule_between([0.0, 0.19, -0.16], [0.0, 0.30, -0.155], 0.10), TEE, 0.9))
+parts.append(("spine", capsule_between([+SHOULDER - 0.02, 0.29, SHOULDER_Z],
+                                       [-SHOULDER + 0.02, 0.29, SHOULDER_Z], 0.058), TEE, 0.9))
 
 for side, elbow, wrist in ((+1.0, ELBOW_L, WRIST_L), (-1.0, ELBOW_R, WRIST_R)):
     sfx = "l" if side > 0 else "r"
-    shoulder = np.array([side * SHOULDER, 0.30, -0.11])
+    shoulder = np.array([side * SHOULDER, 0.29, SHOULDER_Z])
     parts.append((f"upper_arm_{sfx}", capsule_between(shoulder, elbow, 0.045), SKIN, 0.9))
     # Tee sleeve over the upper third.
     svec = (elbow - shoulder) / np.linalg.norm(elbow - shoulder)
