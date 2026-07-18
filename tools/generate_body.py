@@ -64,15 +64,25 @@ def d2r(d):
 
 
 # ── Skeleton: (name, parent, global bind position) ──────────────────────
-# Relaxed dock-sit: knees SPLAYED well wider than the hips (the diamond
-# a body actually makes sitting slack on an edge), calves dropping with
-# the feet drifting back inward under the knees.
-KNEE_SPLAY = 0.085   # knee outward of hip (m) — legs apart, at ease
+# Standard humanoid layout (Hips → Spine → Chest → Clavicle → UpperArm;
+# legs branch from Hips at the anatomical hip sockets):
+#   - the root sits at the TOP of the pelvis near the sacrum, toward the
+#     back of the mesh, and the spine runs near the back — not centered;
+#   - the leg joints do NOT meet at the pelvis center: they sit at the
+#     femoral heads — lateral (about halfway out to the pelvis edge),
+#     FORWARD of the spine base, mid-pelvis height;
+#   - arms hang from clavicles placed near the body center (that's where
+#     the real rotation happens), with the shoulder ball outboard.
+# Relaxed dock-sit pose: knees splayed wider than the hips, calves
+# dropping, feet drifting back inward under the knees.
+LEG_X = 0.10         # hip socket lateral offset (~20 cm femoral spacing)
+KNEE_SPLAY = 0.10    # knee outward of hip (m) — legs apart, at ease
 ANKLE_TUCK = 0.025   # ankle back inward from the knee (m)
 
 
 def leg_points(side):
-    hip = np.array([side * LEG_X, 0.02, -0.06])
+    # Hip sockets: forward of the spine base, mid-pelvis height.
+    hip = np.array([side * LEG_X, 0.0, -0.05])
     knee = hip + np.array(
         [side * KNEE_SPLAY, -np.sin(THIGH_DROP) * THIGH_LEN, np.cos(THIGH_DROP) * THIGH_LEN]
     )
@@ -85,28 +95,34 @@ def leg_points(side):
 HIP_L, KNEE_L, ANKLE_L = leg_points(+1.0)
 HIP_R, KNEE_R, ANKLE_R = leg_points(-1.0)
 SHOULDER = 0.20
-SHOULDER_Z = -0.15   # shoulders sit back with the (reclined) chest
+SHOULDER_Z = -0.15   # shoulder balls sit back with the (reclined) chest
+CLAV_L = np.array([+0.035, 0.295, -0.13])   # near center, slightly front
+CLAV_R = np.array([-0.035, 0.295, -0.13])
 ELBOW_L = np.array([+0.225, 0.03, -0.04])
 ELBOW_R = np.array([-0.225, 0.03, -0.04])
 WRIST_L = np.array([+0.165, 0.11, 0.17])  # resting on the (splayed) thigh
 WRIST_R = np.array([-0.165, 0.11, 0.17])
 
 JOINTS = [
-    # name          parent        global bind position
-    ("root",        None,         np.array([0.0, 0.02, -0.10])),
-    ("spine",       "root",       np.array([0.0, 0.17, -0.15])),
-    ("thigh_l",     "root",       HIP_L),
-    ("calf_l",      "thigh_l",    KNEE_L),
-    ("foot_l",      "calf_l",     ANKLE_L),
-    ("thigh_r",     "root",       HIP_R),
-    ("calf_r",      "thigh_r",    KNEE_R),
-    ("foot_r",      "calf_r",     ANKLE_R),
-    ("upper_arm_l", "spine",      np.array([+SHOULDER, 0.29, SHOULDER_Z])),
+    # name          parent         global bind position
+    # Hips root: top of the pelvis by the sacrum, toward the back.
+    ("root",        None,          np.array([0.0, 0.06, -0.17])),
+    ("spine",       "root",        np.array([0.0, 0.17, -0.175])),
+    ("chest",       "spine",       np.array([0.0, 0.26, -0.165])),
+    ("thigh_l",     "root",        HIP_L),
+    ("calf_l",      "thigh_l",     KNEE_L),
+    ("foot_l",      "calf_l",      ANKLE_L),
+    ("thigh_r",     "root",        HIP_R),
+    ("calf_r",      "thigh_r",     KNEE_R),
+    ("foot_r",      "calf_r",      ANKLE_R),
+    ("clavicle_l",  "chest",       CLAV_L),
+    ("upper_arm_l", "clavicle_l",  np.array([+SHOULDER, 0.29, SHOULDER_Z])),
     ("forearm_l",   "upper_arm_l", ELBOW_L),
-    ("hand_l",      "forearm_l",  WRIST_L),
-    ("upper_arm_r", "spine",      np.array([-SHOULDER, 0.29, SHOULDER_Z])),
+    ("hand_l",      "forearm_l",   WRIST_L),
+    ("clavicle_r",  "chest",       CLAV_R),
+    ("upper_arm_r", "clavicle_r",  np.array([-SHOULDER, 0.29, SHOULDER_Z])),
     ("forearm_r",   "upper_arm_r", ELBOW_R),
-    ("hand_r",      "forearm_r",  WRIST_R),
+    ("hand_r",      "forearm_r",   WRIST_R),
 ]
 JIDX = {name: i for i, (name, _, _) in enumerate(JOINTS)}
 
@@ -153,10 +169,14 @@ parts.append(("root", box_at([2 * (LEG_X + 0.10), 0.16, 0.26], ty=0.03, tz=-0.16
 # pulled BACK: the chest must stay clear of the first-person camera's
 # near plane (the eye sits ~6 cm above and just inboard of it) or it
 # clips open into a dome with a hole when the player looks down.
-parts.append(("root", capsule_between([0.0, 0.06, -0.15], [0.0, 0.19, -0.16], 0.105), TEE, 0.9))
-parts.append(("spine", capsule_between([0.0, 0.19, -0.16], [0.0, 0.30, -0.155], 0.10), TEE, 0.9))
-parts.append(("spine", capsule_between([+SHOULDER - 0.02, 0.29, SHOULDER_Z],
-                                       [-SHOULDER + 0.02, 0.29, SHOULDER_Z], 0.058), TEE, 0.9))
+parts.append(("spine", capsule_between([0.0, 0.06, -0.15], [0.0, 0.19, -0.16], 0.105), TEE, 0.9))
+parts.append(("chest", capsule_between([0.0, 0.19, -0.16], [0.0, 0.30, -0.155], 0.10), TEE, 0.9))
+# Clavicles: from near-center chest out to each shoulder ball.
+for side, clav in ((+1.0, CLAV_L), (-1.0, CLAV_R)):
+    sfx = "l" if side > 0 else "r"
+    parts.append((f"clavicle_{sfx}",
+                  capsule_between(clav, [side * (SHOULDER - 0.01), 0.29, SHOULDER_Z], 0.055),
+                  TEE, 0.9))
 
 for side, elbow, wrist in ((+1.0, ELBOW_L, WRIST_L), (-1.0, ELBOW_R, WRIST_R)):
     sfx = "l" if side > 0 else "r"
@@ -244,9 +264,12 @@ def scoot_right_clip():
         "hand_l": [(0.0, (0, 0, 0)), (0.32, (14, 0, 0)), (0.90, (10, 0, 0)),
                    (1.25, (0, 0, 0))],
         # Shoulders dip toward the planted (left, +X) arm while it bears
-        # weight: negative roll leans the spine toward +X.
+        # weight: negative roll leans the spine toward +X, and the left
+        # clavicle shrugs up as the arm takes the load.
         "spine": [(0.0, (0, 0, 0)), (0.35, (4, 0, -7)), (0.70, (5, 0, -9)),
                   (1.05, (1, 0, -2)), (1.35, (0, 0, 0))],
+        "clavicle_l": [(0.0, (0, 0, 0)), (0.35, (0, 0, -9)), (0.75, (0, 0, -11)),
+                       (1.05, (0, 0, -3)), (1.35, (0, 0, 0))],
     }
     # Root: the lift-and-settle. Only lift + lateral LEAN — travel comes
     # from the entity transform.
