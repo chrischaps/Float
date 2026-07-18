@@ -68,13 +68,24 @@ Pull updates: `git subtree pull --prefix=engine engine main --squash`.
   phase in f32 in the shader.
 - The raft is a plain transform-driven entity (no Rapier body needed); its
   buoyancy is `scripts/raft.rhai` sampling `ocean_height` at 5 points.
+- Music sources (`music_*` entities) must keep `autoplay = true`: there is
+  no play/stop script API for `audio_source` components — `music.rhai`
+  fades volumes, never stops sources.
+- trimesh GLB export OMITS vertex normals unless you pass
+  `scene.export(path, include_normals=True)` — without them the engine
+  falls back to flat [0,1,0] normals and shading goes flat/banded. All
+  `tools/generate_*.py` exporters must pass it.
 
 ## Milestones
 
 M0 scaffold ✅ → M1 ocean core ✅ → M2 raft buoyancy + first person ✅ →
-M3 sky/time-of-day ✅ → M4 legs + refraction/turbidity ✅ → M5 audio ✅.
-Next: scooting along the raft edge (M6), music (M7), wildlife (M8 — the
-distant whale breach at dusk from reference/water).
+M3 sky/time-of-day ✅ → M4 legs + refraction/turbidity ✅ → M5 audio ✅ →
+M7 music wiring ✅ (`scripts/music.rhai` crossfades 4 TOD beds with a
+swell/ebb gate; `audio/music_*.ogg` are placeholders until the ElevenLabs
+tracks from `specs/elevenlabs_audio_prompts.md` are generated).
+Next: scooting along the raft edge (M6), wildlife (M8 — the
+distant whale breach at dusk from reference/water). Foam/palette polish
+record (all items done): `specs/foam_followups.md`.
 Engine changes live on Flint branch `feature/ocean-pipeline` (merge to main
 when ready). Plan: `C:\Users\chris\.claude\plans\please-make-a-plan-fluffy-pearl.md`
 

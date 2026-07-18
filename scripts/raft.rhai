@@ -3,6 +3,9 @@
 //
 // Five height samples (center + 4 edge midpoints in the raft's yawed local
 // frame) give heave (mean) and deck tilt (front/back, left/right slope).
+// That footprint slope under-reads steep waves (it's the *average* plane),
+// so the analytic ocean_normal at the center is blended in (normal_blend)
+// to recover the true local wave slope on extreme seas.
 // Critically-damped-ish exponential smoothing supplies the inertia of a
 // heavy waterlogged raft: it hesitates, then follows — that lag is most of
 // what makes the motion feel real from the deck.
@@ -31,6 +34,7 @@ fn on_update() {
     let drift_dir = deg_to_rad(get_field(me, "raft_float", "drift_dir_deg"));
     let sway_amp = get_field(me, "raft_float", "yaw_sway_deg");
     let sway_rate = get_field(me, "raft_float", "yaw_sway_rate");
+    let normal_blend = get_field(me, "raft_float", "normal_blend");
 
     if !init_done {
         let p = get_position(me);
@@ -59,9 +63,22 @@ fn on_update() {
     let h_l = ocean_height(drift_x - right_x * half_w, drift_z - right_z * half_w);
 
     let target_y = (h_c + h_f + h_b + h_r + h_l) / 5.0 - draft;
+
+    // Footprint-average slope (rises toward bow / starboard = positive) ...
+    let slope_f = (h_f - h_b) / (2.0 * half_l);
+    let slope_r = (h_r - h_l) / (2.0 * half_w);
+    // ... blended with the exact local wave slope from the analytic normal,
+    // projected onto the yawed raft axes. normal_blend = 0 keeps the pure
+    // averaged plane; 1 rides the point-local surface.
+    let n = ocean_normal(drift_x, drift_z);
+    let n_slope_f = -(n["x"] * fwd_x + n["z"] * fwd_z) / n["y"];
+    let n_slope_r = -(n["x"] * right_x + n["z"] * right_z) / n["y"];
+    let s_f = slope_f + (n_slope_f - slope_f) * normal_blend;
+    let s_r = slope_r + (n_slope_r - slope_r) * normal_blend;
+
     // Bow lower than stern → positive pitch (bow-down); starboard higher → positive roll.
-    let target_pitch = rad_to_deg(atan2(h_b - h_f, 2.0 * half_l));
-    let target_roll = rad_to_deg(atan2(h_r - h_l, 2.0 * half_w));
+    let target_pitch = rad_to_deg(atan(-s_f));
+    let target_roll = rad_to_deg(atan(s_r));
 
     // ── Heavy-raft smoothing ────────────────────────────────────────
     let ky = clamp(heave_resp * dt, 0.0, 1.0);
