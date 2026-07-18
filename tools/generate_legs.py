@@ -52,7 +52,7 @@ def capsule_between(p0, p1, radius, color):
     p0, p1 = np.asarray(p0, float), np.asarray(p1, float)
     vec = p1 - p0
     length = np.linalg.norm(vec)
-    cap = trimesh.creation.capsule(radius=radius, height=length, count=[12, 12])
+    cap = trimesh.creation.capsule(radius=radius, height=length, count=[32, 32])
     # capsule extends along +Z from origin; align to vec
     align = trimesh.geometry.align_vectors([0, 0, 1], vec / length)
     cap.apply_transform(align)
@@ -100,6 +100,7 @@ scene = trimesh.Scene()
 for i, part in enumerate(parts):
     scene.add_geometry(part, node_name=f"leg_part_{i}")
 path = os.path.join(OUT_DIR, "legs.glb")
-scene.export(path)
+# include_normals: without it trimesh omits NORMAL and the engine flat-shades.
+scene.export(path, include_normals=True)
 b = scene.bounds
 print(f"wrote {path}  bounds y [{b[0][1]:.2f}, {b[1][1]:.2f}] z [{b[0][2]:.2f}, {b[1][2]:.2f}]")

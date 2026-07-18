@@ -60,7 +60,7 @@ def transform(tx=0.0, ty=0.0, tz=0.0, rx=0.0, ry=0.0, rz=0.0):
 
 def log_cylinder(radius, length, color):
     # trimesh cylinders extend along +Z, which is exactly the log direction.
-    mesh = trimesh.creation.cylinder(radius=radius, height=length, sections=14)
+    mesh = trimesh.creation.cylinder(radius=radius, height=length, sections=48)
     return pbr(mesh, color)
 
 
@@ -69,8 +69,8 @@ def rope_wrap(log_radius, x, z, tilt=0.0):
     ring = trimesh.creation.torus(
         major_radius=log_radius + 0.018,
         minor_radius=0.022,
-        major_sections=18,
-        minor_sections=8,
+        major_sections=36,
+        minor_sections=12,
     )
     # Torus lies in XY plane (axis = Z); rotate so it wraps around the log's
     # Z axis -> that's already correct. Squash slightly along Y so it sits
@@ -106,7 +106,7 @@ deck_top = 2 * LOG_RADIUS  # nominal deck surface height
 
 # ── Cross-beams under the logs, near each end ──────────────────────────
 for z in (-LOG_LENGTH * 0.36, LOG_LENGTH * 0.36):
-    beam = trimesh.creation.cylinder(radius=BEAM_RADIUS, height=DECK_WIDTH + 0.25, sections=12)
+    beam = trimesh.creation.cylinder(radius=BEAM_RADIUS, height=DECK_WIDTH + 0.25, sections=32)
     # Cylinder along Z -> rotate 90° about Y to run along X.
     beam.apply_transform(transform(ty=-BEAM_RADIUS * 0.6, tz=z, ry=np.pi / 2))
     parts.append(pbr(beam, LOG_COLORS[2]))
@@ -122,7 +122,9 @@ scene = trimesh.Scene()
 for i, part in enumerate(parts):
     scene.add_geometry(part, node_name=f"part_{i}")
 raft_path = os.path.join(OUT_DIR, "raft.glb")
-scene.export(raft_path)
+# include_normals: trimesh omits the NORMAL attribute by default, and the
+# engine falls back to flat [0,1,0] normals -> banded/acne-prone shading.
+scene.export(raft_path, include_normals=True)
 print(f"wrote {raft_path}  ({len(parts)} parts, deck top ~{deck_top:.2f} m)")
 
 # ── Debug buoy: a bright sphere scripts pin to ocean_height(x, z) ───────
@@ -133,5 +135,5 @@ buoy = pbr(buoy, (1.0, 0.25, 0.1, 1.0), roughness=0.4)
 bscene = trimesh.Scene()
 bscene.add_geometry(buoy, node_name="buoy")
 buoy_path = os.path.join(OUT_DIR, "buoy.glb")
-bscene.export(buoy_path)
+bscene.export(buoy_path, include_normals=True)
 print(f"wrote {buoy_path}")
