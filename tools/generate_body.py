@@ -401,36 +401,68 @@ def make_idle(name, lpose_fn, rpose_fn, dur, seed):
 
 # ── The legs_rock additive layer ────────────────────────────────────────
 # Chris: "the legs kick out at the knee during idle, a sort of
-# self-soothing almost rocking chair action." One kick per cycle per
-# leg, legs alternating half a phase apart: the knee extends fairly
-# briskly, hangs, then the calf pendulums back past neutral and
-# settles — a rocking chair's push-glide-return. Feet flex with a lag;
-# thighs lift a touch so the motion connects to the pelvis. Runs as an
-# ADDITIVE layer on its own clock, so it persists through variant
-# crossfades, fidgets, everything (ducked only during scoot steps).
-ROCK_TIME = 5.2
+# self-soothing almost rocking chair action" — and the legs should
+# reach FULL EXTENSION regularly. Each leg runs a kick TRAIN: kicks of
+# varying amplitude (kick-hang-pendulum-return), one of which per cycle
+# swings all the way out (~78° = knee straight, the legs-off-the-dock
+# move). Bigger kicks take longer — a lazy full swing, not a punt. The
+# backswing is CAPPED at 12°: a full kick's uncapped return would swing
+# the calf into the raft hull below the deck edge. Feet flex with a
+# lag; thighs lift a touch so the motion connects to the pelvis. Runs
+# as an ADDITIVE layer on its own clock, persisting through variant
+# crossfades and fidgets (ducked only during scoot steps).
+# Calf rotation magnitude for a straight knee. SIGN: probing foot_l
+# showed POSITIVE calf rx tucks the foot back under the deck; EXTENSION
+# is NEGATIVE. The signal below is authored in positive "extension
+# units" and negated at emission.
+FULL_EXT_DEG = 78.0
+
+# Normalized kick shape: out, hang, pendulum past neutral, settle.
+KICK_SHAPE_T = [0.0, 0.14, 0.32, 0.58, 0.80, 1.0]
+KICK_SHAPE_V = [0.0, 1.0, 0.72, -0.29, 0.12, 0.0]
+
+# Per-leg kick trains (amplitude fraction of full extension, seconds).
+# Both trains total the same loop length; the full-extension kicks land
+# far apart, so somewhere a leg swings all the way out every ~10 s.
+KICKS_L = [(0.35, 4.4), (1.0, 6.6), (0.5, 4.6), (0.7, 5.4)]
+KICKS_R = [(0.62, 5.0), (0.38, 4.4), (1.0, 6.8), (0.45, 4.8)]
+ROCK_TIME = 21.0
+assert abs(sum(d for _, d in KICKS_L) - ROCK_TIME) < 1e-9
+assert abs(sum(d for _, d in KICKS_R) - ROCK_TIME) < 1e-9
 
 
-def rock_wave(tn):
-    """Kick-hang-return waveform over one normalized cycle."""
-    pts_t = [0.0, 0.12, 0.30, 0.55, 0.78, 1.0]
-    pts_v = [0.0, 24.0, 18.0, -7.0, 3.0, 0.0]
-    return np.interp(tn, pts_t, pts_v)
+def kick_train_signal(kicks, step=0.15):
+    """Dense (times, degrees) over the loop for a train of kicks."""
+    ts, vs = [], []
+    t0 = 0.0
+    for amp_frac, dur in kicks:
+        amp = FULL_EXT_DEG * amp_frac
+        neg_scale = min(1.0, 12.0 / (0.29 * amp))  # backswing cap
+        n = max(10, int(dur / step))
+        for i in range(n):
+            u = i / n
+            v = np.interp(u, KICK_SHAPE_T, KICK_SHAPE_V)
+            if v < 0.0:
+                v *= neg_scale
+            ts.append(t0 + u * dur)
+            vs.append(v * amp)
+        t0 += dur
+    ts.append(ROCK_TIME)
+    vs.append(vs[0])
+    return np.array(ts), np.array(vs)
 
 
 def make_legs_rock():
     rot = {}
-    n = 33
-    for side, phase, scale in (("l", 0.0, 1.0), ("r", 0.5, 0.94)):
-        for j, gain, lag in (("calf", 1.0, 0.0), ("foot", 0.38, 0.06),
-                             ("thigh", -0.12, 0.0)):
-            keys = []
-            for i in range(n):
-                t = ROCK_TIME * i / (n - 1)
-                tn = (t / ROCK_TIME + phase + lag) % 1.0
-                keys.append((t, (rock_wave(tn) * gain * scale, 0.0, 0.0)))
-            keys[-1] = (ROCK_TIME, keys[0][1])
-            rot[f"{j}_{side}"] = keys
+    for side, kicks in (("l", KICKS_L), ("r", KICKS_R)):
+        ts, vs = kick_train_signal(kicks)
+        # Foot lags the calf by ~0.35 s (drag through the air/water);
+        # thigh lifts slightly with the kick. Calf/foot NEGATED: the
+        # signal is in extension units, engine extension is negative rx.
+        lag_vs = np.interp((ts - 0.35) % ROCK_TIME, ts, vs)
+        rot[f"calf_{side}"] = [(float(t), (-float(v), 0.0, 0.0)) for t, v in zip(ts, vs)]
+        rot[f"foot_{side}"] = [(float(t), (-float(v) * 0.38, 0.0, 0.0)) for t, v in zip(ts, lag_vs)]
+        rot[f"thigh_{side}"] = [(float(t), (float(v) * -0.12, 0.0, 0.0)) for t, v in zip(ts, vs)]
     return "legs_rock", rot, {}
 
 
@@ -462,11 +494,12 @@ def make_fidget(kind, vname, lpose_fn, rpose_fn):
         lean = 7.0
 
     if kind == "kick":
-        # One lazy kick at the water, follow-through, settle.
-        rot["calf_l"] = [(0.0, (0, 0, 0)), (0.5, (26, 0, 0)), (0.9, (-8, 0, 0)),
-                         (1.4, (10, 0, 0)), (2.0, (0, 0, 0)), (2.4, (0, 0, 0))]
-        rot["foot_l"] = [(0.0, (0, 0, 0)), (0.55, (14, 0, 0)), (1.0, (-10, 0, 0)),
-                         (1.6, (4, 0, 0)), (2.2, (0, 0, 0)), (2.4, (0, 0, 0))]
+        # One lazy kick OUT at the water (extension = negative rx),
+        # follow-through tuck, settle.
+        rot["calf_l"] = [(0.0, (0, 0, 0)), (0.5, (-32, 0, 0)), (0.9, (9, 0, 0)),
+                         (1.4, (-11, 0, 0)), (2.0, (0, 0, 0)), (2.4, (0, 0, 0))]
+        rot["foot_l"] = [(0.0, (0, 0, 0)), (0.55, (-16, 0, 0)), (1.0, (10, 0, 0)),
+                         (1.6, (-5, 0, 0)), (2.2, (0, 0, 0)), (2.4, (0, 0, 0))]
     elif kind == "drum":
         # Fingers drumming on the deck — on whichever hand is planted.
         d = "l" if lpose_fn is arm_pose_deck else "r"
