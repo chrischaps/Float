@@ -40,6 +40,27 @@ gamepad = "any"
 deadzone = 0.15
 scale = -1.0    # gilrs stick-up is +1; the seat script subtracts (look up)
 
+# ── Scoot along the raft edge (M6): A/D or left stick ──────────────────
+# Positive = screen-left (facing outward, increasing engine yaw turns
+# toward +X = screen-LEFT, so A is +1 and stick-right is inverted).
+
+[actions.scoot]
+kind = "axis1d"
+[[actions.scoot.bindings]]
+type = "key"
+code = "KeyA"
+scale = 1.0
+[[actions.scoot.bindings]]
+type = "key"
+code = "KeyD"
+scale = -1.0
+[[actions.scoot.bindings]]
+type = "gamepad_axis"
+axis = "LeftStickX"
+gamepad = "any"
+deadzone = 0.15
+scale = -1.0
+
 # ── Recapture mouse after Escape released it ────────────────────────────
 
 [actions.recapture]

@@ -82,10 +82,16 @@ M0 scaffold ✅ → M1 ocean core ✅ → M2 raft buoyancy + first person ✅ �
 M3 sky/time-of-day ✅ → M4 legs + refraction/turbidity ✅ → M5 audio ✅ →
 M7 music wiring ✅ (`scripts/music.rhai` crossfades 4 TOD beds with a
 swell/ebb gate; `audio/music_*.ogg` are placeholders until the ElevenLabs
-tracks from `specs/elevenlabs_audio_prompts.md` are generated).
-Next: scooting along the raft edge (M6), wildlife (M8 — the
-distant whale breach at dusk from reference/water). Foam/palette polish
-record (all items done): `specs/foam_followups.md`.
+tracks from `specs/elevenlabs_audio_prompts.md` are generated) →
+M6 scooting ✅ (A/D or left stick slides the seat around a
+rounded-rectangle perimeter path; `seat_camera.rhai` owns the path math
+and publishes `seat_x`/`seat_z`/`seat_out_deg` through the seat component
+for `legs_idle.rhai` — set_field is deferred, so readers guard against
+unit on the first frames).
+Next: wildlife (M8 — the distant whale breach at dusk from
+reference/water; every new element must be lit from TOD-driven sources,
+never a constant color). Foam/palette polish record (all items done):
+`specs/foam_followups.md`.
 Engine changes live on Flint branch `feature/ocean-pipeline` (merge to main
 when ready). Plan: `C:\Users\chris\.claude\plans\please-make-a-plan-fluffy-pearl.md`
 

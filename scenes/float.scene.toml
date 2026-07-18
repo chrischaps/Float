@@ -152,18 +152,6 @@ half_z = 1.15  # log length 2.3 m
 [entities.raft.script]
 source = "raft.rhai"
 
-# ── The player's legs, dangling over the +Z edge into the water ──
-#    (script-pinned to the seat; swap models/legs.glb for a nicer
-#    model any time — same origin/pose contract)
-
-[entities.legs]
-[entities.legs.transform]
-position = [0.0, 0.3, 1.0]
-[entities.legs.model]
-asset = "legs"
-[entities.legs.script]
-source = "legs_idle.rhai"
-
 # ── Audio: ocean bed + light wind, plus physics-driven laps/creaks ──
 
 [entities.ocean_ambience]
@@ -240,9 +228,27 @@ source = "music.rhai"
 [entities.seat_camera.seat]
 raft = "raft"
 edge_offset_z = 1.05
+half_x = 0.95          # scoot path stops shy of the log ends (deck half 1.2)
+corner_radius = 0.3
+scoot_speed = 0.4      # a shuffle, not a stride
+scoot_ease = 5.0
 eye_height = 0.55
 deck_top = 0.26
 roll_transfer = 0.45
 mouse_sens = 0.0028
 [entities.seat_camera.script]
 source = "seat_camera.rhai"
+
+# ── The player's legs, dangling over the deck edge into the water.
+#    Declared AFTER seat_camera: legs_idle.rhai reads the scoot state
+#    the seat script published THIS frame (seat_x/seat_z/seat_out_deg).
+#    Swap models/legs.glb for a nicer model any time — same
+#    origin/pose contract. ──
+
+[entities.legs]
+[entities.legs.transform]
+position = [0.0, 0.3, 1.0]
+[entities.legs.model]
+asset = "legs"
+[entities.legs.script]
+source = "legs_idle.rhai"
