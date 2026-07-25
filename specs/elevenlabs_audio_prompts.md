@@ -86,6 +86,119 @@ Variation nudges for the three files:
 
 ---
 
+## Splash tiers — the edge-slap system (scripts/raft_audio.rhai)
+
+Each raft edge fires one of three intensity tiers when the water crosses
+the log underside moving upward; the tier is picked from the measured
+approach speed. Soft shares a pool with the laps; med and hard escalate.
+
+### splash_soft_1..3 (~0.6 s one-shots, peak ~0.55)
+
+> A small wave folding gently against the side of wooden logs, a soft
+> watery push with a faint droplet tail, close, quiet, very short.
+
+### splash_med_1..3 (~1 s one-shots, peak ~0.7)
+
+> A wave slapping firmly against floating wooden logs: a wet smack, a
+> burst of droplets scattering on water, one or two soft bubbles
+> surfacing after. Close perspective, short, no surf.
+
+### splash_hard_1..2 (~1.4 s one-shots, peak ~0.85)
+
+> A heavy wave hitting the underside of a wooden raft: a deep hollow
+> thump through the logs, a hard splash with spray, dense droplets
+> raining back onto the water, a low resonance fading. Very close,
+> physical, short.
+
+### leg_splash_1..3 (~0.5 s one-shots, peak ~0.5)
+
+Fires when the water reaches the sitter's shins at the raft edge.
+
+> Bare lower legs dipping suddenly into calm water: a small bright
+> "plip" splash, light and playful, a few droplets, very close and
+> quiet.
+
+### drip_1..4 (~0.4 s one-shots, peak ~0.35)
+
+The after-voice of a big slap — water running off the logs.
+
+> A few water droplets dripping off wet wood into calm water, sparse
+> and quiet, one soft plip among them, very close.
+
+### runoff_1..3 (~1.4 s one-shots, peak ~0.5)
+
+The crest breach: the swell drops out from under the raft and the logs
+come clear, water sheeting off the wood. A receding sound, not an impact.
+
+> An oar blade lifted slowly out of calm water: water streaming and
+> trickling off the wet wood back into the water, a thin draining sheet
+> that gradually thins into scattered drips. Close, quiet.
+
+KNOWN TRAP: any prompt containing "logs/raft + sea/wave" pulls the
+generator into its wave-hits-wood category — takes come back ~0.4 s,
+deep and thuddy, like a wave under a dock, regardless of the duration
+setting. Negations ("no splash impact") don't rescue it. Describe an
+object LEAVING the water instead (oar, plank, hull) so the event is a
+draining process with no impact in it, set duration LONGER than target
+(2–2.5 s, trim down), and let "streaming/trickling/draining" lead the
+prompt. Alternate action if the oar reads too small:
+
+> A wet wooden plank raised slowly from a still lake, water running off
+> it in a light stream, dribbling and trickling back into the water,
+> ending with a few soft drips. Very close.
+
+Last resort: generate "water trickling and dripping into a pond, close,
+quiet" and slice 1.4 s bodies — the in-game drip tails already finish
+the gesture.
+
+### settle_1..3 (~0.7 s one-shots, peak ~0.5)
+
+The land after the breach: the raft flops gently back onto the receding
+back face of the swell.
+
+> A wooden raft settling softly back onto calm water: a low gentle wet
+> flop, a short slosh along the logs, one soft bubble surfacing, no
+> spray, very close, quiet, short.
+
+## Near-field loops (scripts/water_ambience.rhai)
+
+### wash_loop_1..2 (~12 s seamless loops, peak ~0.5)
+
+Four spatial emitters ride the raft edges (two assets at four pitches);
+volume follows local water activity.
+
+> Water gurgling and washing gently along the side of floating wooden
+> logs: a soft continuous slosh with small bubbles surfacing now and
+> then, intimate and close, no waves breaking. Seamless loop.
+
+### foam_fizz_loop.ogg (~10 s seamless loop, peak ~0.4)
+
+Follows local wave steepness; swells with the bioluminescent bloom.
+
+> The fine fizz of sea foam dissolving on calm water: dense tiny
+> bubbles popping softly, airy and bright, like gentle carbonation,
+> steady and quiet. Seamless loop.
+
+## Wildlife (hooked)
+
+### breach_splash.ogg (~3 s one-shot, peak ~0.9)
+
+Played non-spatial by `whale.rhai` at splash-down, delayed by distance
+at the speed of sound (the boom arrives after the sight).
+
+> A huge whale crashing back into the sea far away across open water:
+> a distant deep splash, a low boom rolling over the sea, a faint
+> lingering white-water hiss, then calm.
+
+### bird_chirp_1..2 (~1 s one-shots, peak ~0.4)
+
+Sparse cries while the dawn V crosses (`birds.rhai`).
+
+> Two or three distant seabird cries over open ocean at dawn, sparse
+> and far away, soft and airy, no flocks squawking, no people.
+
+---
+
 ## Music (M7) — serene background beds
 
 For ElevenLabs Music (not the SFX generator). Aim for 2–3 minute pieces;
@@ -150,16 +263,53 @@ The current `audio/music_*.ogg` files are **placeholders** (copies of the
 ambience loops) so the scene loads and the crossfade logic is audible —
 overwrite them with real takes.
 
+## Weather system (rain, storm wind, thunder)
+
+Wired by `scripts/weather.rhai`: the two loops are volume-faded beds
+(rain follows the rain state, howl follows wind speed 8→24 m/s), the
+thunder one-shots are chosen by virtual strike distance and played
+non-spatially, delayed by distance/340 s after the lightning flash.
+
+### rain_loop.ogg — ambient bed (target ~20–30 s, seamless loop)
+
+> Steady rain falling on open deep water, a broad soft hiss of
+> countless drops striking the sea surface, gentle surges in intensity,
+> individual close droplets pattering, no thunder, no surfaces, no
+> gutters or pavement — only rain on water. Seamless loop.
+
+If takes sound urban (rain on roofs/streets), push with "middle of the
+ocean, nothing but water in every direction."
+
+### storm_howl.ogg — ambient bed (target ~20–30 s, seamless loop)
+
+Layered over `wind_light.ogg` (which stays); this is only the storm's
+extra voice, so it can be dramatic.
+
+> Strong storm wind howling across open ocean, deep powerful gusts
+> rising and falling, a low moan with an occasional thin whistle as the
+> wind tears at the water, no rain, no thunder, no debris. Seamless loop.
+
+### thunder_crack.ogg — near strike (~4–5 s one-shot, peak ~0.9)
+
+> A sudden violent thunder crack directly overhead: a sharp tearing
+> snap, immediately followed by a deep chest-shaking boom and a long
+> rolling rumble that fades across the sky. Close, huge, startling.
+
+### thunder_mid.ogg — middle distance (~5–6 s one-shot, peak ~0.8)
+
+> Thunder a few kilometers away over the sea: a muffled deep boom with
+> no sharp crack, rolling and echoing across open water, fading slowly.
+
+### thunder_far.ogg — distant rumble (~6–8 s one-shot, peak ~0.65)
+
+> Very distant thunder rumbling low on the horizon over the ocean, a
+> soft long roll with slow swells of low frequency, no crack, barely
+> more than a vibration, fading into the sound of the sea.
+
 ## Future milestones (generate later, no hooks yet)
 
 - **M6 scooting:** "Hands and fabric shuffling slowly across rough
   weathered wooden planks, small scrapes and soft cloth movement, close,
   short." (several 0.5–1 s one-shots)
-- **M8 whale breach:** "A huge whale breaching far away across open water
-  at dusk: a distant deep splash, a low boom rolling over the sea, a
-  faint lingering echo, then calm." (~4–6 s one-shot)
 - **M8 whale song (optional):** "A faint, low whale song heard from above
   the surface, muffled and distant, melancholic, two slow calls." (~8 s)
-- **M8 dawn birds:** "A few distant seagull cries over the open ocean at
-  dawn, sparse and far away, gentle, no traffic or people, airy." (~6 s,
-  2-3 takes for variety)

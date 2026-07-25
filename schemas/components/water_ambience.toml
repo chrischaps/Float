@@ -1,0 +1,20 @@
+[component.water_ambience]
+description = "Continuous water soundscape tuning: edge wash loops, foam fizz, reactive beds, proximity lowpass (scripts/water_ambience.rhai)"
+
+[component.water_ambience.fields]
+wash_max = { type = "float", description = "Peak volume of an edge wash loop", default = 0.5 }
+wash_v_ref = { type = "float", description = "Surface speed (m/s) mapping to full wash activity", default = 1.5 }
+wash_gap_range = { type = "float", description = "Water-to-log distance (m) beyond which wash activity fades to zero", default = 0.5 }
+attack_s = { type = "float", description = "Wash/fizz volume rise time (s)", default = 2.0 }
+release_s = { type = "float", description = "Wash/fizz volume fall time (s)", default = 4.0 }
+fizz_max = { type = "float", description = "Peak volume of the foam fizz loop", default = 0.35 }
+fizz_steep_gain = { type = "float", description = "Gain from mean edge steepness (1 - normal.y) to fizz activity", default = 10.0 }
+fizz_glow_boost = { type = "float", description = "Extra fizz per unit foam_glow (bioluminescent bloom nights)", default = 2.0 }
+bed_ocean_min = { type = "float", description = "Ocean bed volume on a glassy sea", default = 0.35 }
+bed_ocean_max = { type = "float", description = "Ocean bed volume at full sea energy", default = 0.7 }
+bed_wind_min = { type = "float", description = "Wind bed volume on a glassy sea", default = 0.2 }
+bed_wind_max = { type = "float", description = "Wind bed volume at full sea energy", default = 0.45 }
+bed_energy_ref = { type = "float", description = "amplitude*(0.5+0.5*choppiness) value mapping to full energy", default = 3.0 }
+bed_slew_s = { type = "float", description = "Bed volume slew time (s)", default = 5.0 }
+lowpass_near_hz = { type = "float", description = "Lowpass cutoff (Hz) when the water reaches the eye", default = 2500.0 }
+lowpass_dist = { type = "float", description = "Eye clearance (m) above which the lowpass is fully open", default = 1.2 }

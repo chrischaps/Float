@@ -1,0 +1,28 @@
+[component.raft_audio]
+description = "Impact/splash trigger tuning for the edge-slap system (scripts/raft_audio.rhai)"
+
+[component.raft_audio.fields]
+underside_y = { type = "float", description = "Log underside height relative to the raft origin (m); water crossing it moving up = slap", default = 0.02 }
+v_min = { type = "float", description = "Minimum water approach speed (m/s) that counts as a slap", default = 0.35 }
+v_ref = { type = "float", description = "Approach speed (m/s) mapping to full intensity 1.0", default = 1.8 }
+soft_max = { type = "float", description = "Intensity below this plays the lap/soft pool", default = 0.35 }
+med_max = { type = "float", description = "Intensity below this plays the med pool; above = hard", default = 0.7 }
+base_vol = { type = "float", description = "Slap volume at zero intensity", default = 0.22 }
+vol_gain = { type = "float", description = "Extra volume per unit intensity", default = 0.55 }
+refractory_min = { type = "float", description = "Per-edge re-trigger time at full intensity (s)", default = 0.15 }
+refractory_max = { type = "float", description = "Per-edge re-trigger time at zero intensity (s)", default = 0.35 }
+max_voices = { type = "float", description = "Approximate concurrent slap voices before soft/med slaps are skipped (hard always plays)", default = 4.0 }
+breach_v_min = { type = "float", description = "Minimum water departure speed (m/s) for a crest-breach runoff; also arms the land window", default = 0.3 }
+breach_vol = { type = "float", description = "Runoff volume at zero breach intensity", default = 0.14 }
+breach_vol_gain = { type = "float", description = "Extra runoff volume per unit breach intensity", default = 0.4 }
+breach_refractory = { type = "float", description = "Per-edge runoff re-trigger time (s)", default = 0.5 }
+land_window = { type = "float", description = "Seconds after a breach during which a gentle re-contact plays a settle", default = 1.5 }
+land_v_min = { type = "float", description = "Minimum approach speed (m/s) for an armed settle (below v_min, above this)", default = 0.1 }
+settle_vol = { type = "float", description = "Settle volume at full landing intensity (halved at zero)", default = 0.32 }
+leg_shin_y = { type = "float", description = "Shin height relative to the seat point (m, negative = below deck)", default = -0.1 }
+leg_v_min = { type = "float", description = "Minimum approach speed for a leg splash (m/s)", default = 0.25 }
+leg_refractory = { type = "float", description = "Leg splash re-trigger time (s)", default = 0.5 }
+creak_threshold = { type = "float", description = "Roll velocity (deg/s) above which the lashings creak", default = 3.2 }
+creak_cd_min = { type = "float", description = "Creak cooldown minimum (s)", default = 1.5 }
+creak_cd_max = { type = "float", description = "Creak cooldown maximum (s)", default = 4.0 }
+debug_log = { type = "bool", description = "Print slap/leg trigger events with intensities", default = false }

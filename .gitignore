@@ -12,3 +12,9 @@ __pycache__/
 # OS noise
 Thumbs.db
 .DS_Store
+
+# Raw third-party downloads (Mixamo) + the converted spike GLB — regenerable
+# via tools/mixamo_to_glb.py from a fresh Mixamo download; too heavy for git
+anim/raw/
+models/raw/
+models/mixamo_body.glb
