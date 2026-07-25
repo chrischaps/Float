@@ -1,0 +1,33 @@
+[component.reality]
+description = "Reality tears: rare autonomous render-mode events that bleed an alternate view through the world (scripts/reality.rhai)"
+
+[component.reality.fields]
+enabled = { type = "bool", description = "false = reality stays whole (no autonomous tears; F3 triggers still work)", default = true }
+min_interval_s = { type = "float", description = "Minimum real seconds between autonomous tears", default = 480.0 }
+max_interval_s = { type = "float", description = "Maximum real seconds between autonomous tears", default = 1200.0 }
+duration_min_s = { type = "float", description = "Shortest tear hold time (real seconds, excluding eases)", default = 20.0 }
+duration_max_s = { type = "float", description = "Longest tear hold time (real seconds, excluding eases)", default = 45.0 }
+ease_in_s = { type = "float", description = "Seconds for a tear to bleed in (0 -> full mix)", default = 2.5 }
+ease_out_s = { type = "float", description = "Seconds for a tear to heal shut (full mix -> 0)", default = 3.5 }
+w_matrix = { type = "float", description = "Matrix code-bleed weight (0 disables the mode)", default = 1.0 }
+w_blood = { type = "float", description = "Blood ocean weight (0 disables the mode)", default = 1.0 }
+w_drunk = { type = "float", description = "Drunk view weight (0 disables the mode)", default = 1.0 }
+w_tron = { type = "float", description = "Tron wireframe weight (0 disables the mode)", default = 1.0 }
+hour_center_matrix = { type = "float", description = "Game hour where the Matrix tear is most likely", default = 23.0 }
+hour_width_matrix = { type = "float", description = "Affinity half-width in hours (<= 0 = any hour)", default = 3.0 }
+hour_center_blood = { type = "float", description = "Game hour where the blood tear is most likely (dusk)", default = 19.0 }
+hour_width_blood = { type = "float", description = "Affinity half-width in hours (<= 0 = any hour)", default = 1.5 }
+hour_center_drunk = { type = "float", description = "Game hour where the drunk tear is most likely", default = 0.0 }
+hour_width_drunk = { type = "float", description = "Affinity half-width in hours (<= 0 = any hour; drunk is hour-blind)", default = 0.0 }
+hour_center_tron = { type = "float", description = "Game hour where the Tron tear is most likely (late night)", default = 22.0 }
+hour_width_tron = { type = "float", description = "Affinity half-width in hours (<= 0 = any hour)", default = 3.0 }
+mask_scale = { type = "float", description = "Bleed-mask patch frequency (higher = smaller patches)", default = 3.0 }
+mask_style = { type = "float", description = "0 = fbm patches, 1 = radial iris", default = 0.0 }
+trigger_mode = { type = "float", description = "One-shot: 1..4 starts that tear now (panel sets; script clears to -1)", default = -1.0 }
+end_now = { type = "bool", description = "One-shot: ease the active tear out immediately (panel sets; script clears)", default = false }
+mix_override = { type = "float", description = "Debug: pin the active tear's mix 0..1 (-1 = script envelope)", default = -1.0 }
+active_mode = { type = "float", description = "PUBLISHED active mode 0..4 (script-owned; read-only elsewhere)", default = 0.0 }
+mix = { type = "float", description = "PUBLISHED current tear mix 0..1 (script-owned)", default = 0.0 }
+next_in_s = { type = "float", description = "PUBLISHED real seconds until the next scheduled tear (-1 = none)", default = -1.0 }
+lowpass_scale = { type = "float", description = "PUBLISHED audio lowpass factor 0..1 — applied by water_ambience.rhai (drunk muffle)", default = 1.0 }
+debug_log = { type = "bool", description = "Print scheduling and envelope transitions", default = false }
