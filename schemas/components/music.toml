@@ -8,3 +8,5 @@ fade_seconds = { type = "float", description = "Track crossfade slew time in rea
 swell_seconds = { type = "float", description = "Approximate seconds music plays per episode (jittered +/-30%)", default = 210.0 }
 ebb_seconds = { type = "float", description = "Approximate seconds of silence between episodes (jittered +/-30%); 0 = continuous music", default = 150.0 }
 swell_fade_seconds = { type = "float", description = "Fade in/out time at episode boundaries, real seconds", default = 15.0 }
+intro_sync_day = { type = "float", description = "Day-length-ramp counterweight: the music hour stretches from scene start to intro_sync_hour of this day, holding the day bed through the compressed opening (incl. the title's looping day 0); music rejoins the world clock there. <= 0 disables", default = 1.0 }
+intro_sync_hour = { type = "float", description = "World hour on intro_sync_day where the stretched music clock lands and syncs (17.0 = the dusk crossfade edge, so the first dusk cue is that evening)", default = 17.0 }

@@ -72,17 +72,204 @@ time_hours = 10.5
 day_length_sec = 600.0
 auto_advance = true
 sun_path_tilt_deg = 28.0
+day = 0.0               # day 0 = the title day: loops (no midnight advance)
+last_hours = 10.5       #   while title.locked is up, then completes into day 1
 [entities.tod.script]
 source = "time_of_day.rhai"
+
+# ── Weather: autonomous drifting states (clear → storm), wind → sea
+#    cascade with real lag. Declared AFTER tod so it runs later the
+#    same frame and composes over the light TOD just wrote. Set
+#    enabled = false to hand-tune the ocean from the F3 panel. ──────
+
+[entities.weather_controller]
+[entities.weather_controller.weather]
+enabled = true
+forced_state = -1.0    # -1 = autonomous drift; 0..4 forces a state (F3 panel)
+snap = false
+strike_now = false
+state = 1.0            # starting weather (SCATTERED = the old baseline)
+wind = 4.0
+sea = 0.25
+fog_mul = 1.0
+fog_gray = 0.0
+sun_scale = 1.0
+amb_scale = 1.0
+star_scale = 1.0
+tint_mul = 1.0
+tint_alpha = 0.0
+ocean_dark = 1.0
+flash = 0.0
+transition_s = 60.0
+wind_tau_s = 20.0
+sea_build_tau_s = 120.0
+sea_decay_tau_s = 240.0
+gust_strength = 0.15
+amp_storm = 5.5
+rain_rate_max = 4000.0
+strike_min_s = 6.0
+strike_max_s = 25.0
+near_strike_chance = 0.2
+raft_assist = 1.0
+debug_log = false
+[entities.weather_controller.script]
+source = "weather.rhai"
+
+# ── Reality tears: rare render-mode world events (reality.rhai). The
+#    world's skin splits and another view bleeds through — waves as falling
+#    code at night, a blood sea at dusk, a drunk lean, a Tron wire-world.
+#    Autonomous scheduling with per-mode hour affinities; storm-shy; the F3
+#    Reality panel forces/ends tears and pins the mix for tuning. ──────────
+
+[entities.reality_controller]
+[entities.reality_controller.reality]
+enabled = true
+min_interval_s = 480.0   # 8-20 real minutes between tears
+max_interval_s = 1200.0
+duration_min_s = 20.0
+duration_max_s = 45.0
+ease_in_s = 2.5
+ease_out_s = 3.5
+w_matrix = 1.0
+w_blood = 1.0
+w_drunk = 1.0
+w_tron = 1.0
+hour_center_matrix = 23.0  # deep night — code against the stars
+hour_width_matrix = 3.0
+hour_center_blood = 19.0   # the sunset band
+hour_width_blood = 1.5
+hour_center_drunk = 0.0    # width 0 = hour-blind
+hour_width_drunk = 0.0
+hour_center_tron = 22.0    # late night
+hour_width_tron = 3.0
+mask_scale = 3.0
+mask_style = 0.0           # fbm patches (1 = radial iris)
+trigger_mode = -1.0        # one-shots + debug (F3 panel writes these)
+end_now = false
+mix_override = -1.0
+active_mode = 0.0          # PUBLISHED (script-owned)
+mix = 0.0
+next_in_s = -1.0
+lowpass_scale = 1.0
+debug_log = false
+[entities.reality_controller.script]
+source = "reality.rhai"
+
+# ── Dead calm (dead_calm.rhai): rare pre-dawn event — the sea collapses to
+#    near-glass for ~4 game hours, wind and soundscape die with it, the
+#    water mirrors the stars. Publishes sea/wind/bed factors that
+#    weather.rhai and water_ambience.rhai apply at their own write sites. ──
+
+[entities.dead_calm_controller]
+[entities.dead_calm_controller.dead_calm]
+enabled = true
+min_interval_s = 900.0     # attempts every 15-30 real min (~2-3 game days)
+max_interval_s = 1800.0
+retry_s = 60.0
+hour_center = 3.0          # pre-dawn — a black mirror under the stars
+hour_width = 3.0
+max_weather_state = 1.2    # only falls out of a near-clear sky
+min_day = 2.0              # learn the ocean's breathing before its absence
+ease_in_s = 8.0            # unnaturally fast collapse — that's the eeriness
+hold_hours = 4.0
+ease_out_s = 30.0          # life returns gradually
+trough_amp_frac = 0.03     # ~3 cm faint breath on a clear-state 1.1 m sea
+trough_wind_frac = 0.15
+trough_bed = 0.06
+calm_splash_baseline = 0.0 # no contact-foam ring on glass
+calm_splash_strength = 0.15
+calm_sky_reflection = 0.85 # the mirror reads
+trigger_calm = -1.0        # one-shots (F3 panel writes these)
+end_now = false
+calm = 0.0                 # PUBLISHED (script-owned)
+sea_scale = 1.0
+wind_scale = 1.0
+bed_scale = 1.0
+phase = 0.0
+next_in_s = -1.0
+debug_log = false
+[entities.dead_calm_controller.script]
+source = "dead_calm.rhai"
+
+# ── Opening title card (title.rhai): ADRIFT + Press Any Key over the
+#    living world. Look/scoot input stays locked (seat_camera.rhai reads
+#    the published `locked` factor) until the first keypress fades the
+#    card out. Sprites regenerate via tools/generate_title.py. ───────────
+
+[entities.title_controller]
+[entities.title_controller.title]
+enabled = true
+min_show_s = 0.75
+fade_in_s = 2.5
+sub_delay_s = 1.6
+fade_out_s = 2.2
+title_frac = 0.44
+locked = 1.0           # PUBLISHED (script-owned): 0 the moment a key lands
+[entities.title_controller.script]
+source = "title.rhai"
+
+# Rain: a camera-following box emitter 9 m overhead (weather.rhai
+# repositions it every frame, slants the fall with the wind via the
+# live-mutable gravity field, and scales emission with the state).
+# Budget: 4000/s x 1.2 s life ~ 4800 alive, under the 6000 cap.
+# Colors are dimmed live to match the light — unlit particles would
+# otherwise glow at night.
+
+[entities.rain_emitter]
+[entities.rain_emitter.transform]
+position = [0.0, 9.0, 0.0]
+[entities.rain_emitter.particle_emitter]
+emission_rate = 0.0
+max_particles = 6000
+lifetime_min = 1.0
+lifetime_max = 1.2
+speed_min = 10.0
+speed_max = 14.0
+direction = [0.0, -1.0, 0.0]
+spread = 3.0
+gravity = [0.0, -2.0, 0.0]
+damping = 0.0
+size_start = 0.035
+size_end = 0.03
+color_start = [0.70, 0.78, 0.88, 0.5]
+color_end = [0.60, 0.68, 0.80, 0.25]
+texture = "textures/rain_drop.png"
+stretch = 0.035          # ~0.4-0.5 m streaks at terminal fall speed
+shape = "box"
+shape_extents = [7.0, 0.5, 7.0]
+world_space = true
+autoplay = true
+
+# Weather audio beds: volume-faded by weather.rhai (component sources
+# have no play/stop — autoplay at 0 and fade, like the music beds).
+
+[entities.rain_ambience]
+[entities.rain_ambience.audio_source]
+file = "audio/rain_loop.ogg"
+loop = true
+autoplay = true
+spatial = false
+volume = 0.0
+
+[entities.storm_howl]
+[entities.storm_howl.audio_source]
+file = "audio/storm_howl.ogg"
+loop = true
+autoplay = true
+spatial = false
+volume = 0.0
 
 # ── The ocean ────────────────────────────────────────────────────
 
 [entities.ocean]
 [entities.ocean.ocean]
 seed = 7
-num_waves = 12
+# 16 waves across 5-110 m: long-wave headroom for storm swell. At calm
+# winds JONSWAP puts near-zero energy in the long bins (weather.rhai
+# ramps wind_speed/fetch_km to move energy there during storms).
+num_waves = 16
 wavelength_min = 5.0
-wavelength_max = 70.0
+wavelength_max = 110.0
 amplitude = 2.0
 choppiness = 0.8199999928474426
 direction_deg = 155.0
@@ -119,13 +306,18 @@ splash_response = 1.0
 # biolum.rhai — zero except during rare night bloom windows.
 foam_glow_color = [0.35, 0.95, 0.75, 1.0]
 foam_glow = 0.0
+rain_ripple = 0.0       # impact rings; weather.rhai drives it with the rain
+show_probe = false      # parity buoy; toggle in F3 Ocean Debug → Diagnostics
 
 # ── Wave probe: CPU/GPU parity check (bright buoy pinned to
-#    ocean_height; if it detaches from the surface, parity broke) ──
+#    ocean_height; if it detaches from the surface, parity broke).
+#    Off by default — toggled by ocean.show_probe (F3 Ocean Debug →
+#    Diagnostics); spawns parked underwater so it never flashes on
+#    the first frame. ──
 
 [entities.wave_probe]
 [entities.wave_probe.transform]
-position = [4.0, 0.0, 6.0]
+position = [0.0, -60.0, 0.0]
 [entities.wave_probe.model]
 asset = "buoy"
 [entities.wave_probe.script]
@@ -174,7 +366,121 @@ autoplay = true
 spatial = false
 volume = 0.3
 
+# ── Near-field water: wash loops ride the raft edges (positioned every
+#    frame by water_ambience.rhai; volumes follow local water activity).
+#    Two assets × four pitches read as four different runs of water. ──
+
+[entities.wash_front]
+[entities.wash_front.transform]
+position = [0.0, 0.0, 1.15]
+[entities.wash_front.audio_source]
+file = "audio/wash_loop_1.ogg"
+loop = true
+autoplay = true
+spatial = true
+volume = 0.0
+pitch = 1.0
+min_distance = 1.0
+max_distance = 12.0
+
+[entities.wash_back]
+[entities.wash_back.transform]
+position = [0.0, 0.0, -1.15]
+[entities.wash_back.audio_source]
+file = "audio/wash_loop_2.ogg"
+loop = true
+autoplay = true
+spatial = true
+volume = 0.0
+pitch = 1.06
+min_distance = 1.0
+max_distance = 12.0
+
+[entities.wash_right]
+[entities.wash_right.transform]
+position = [1.2, 0.0, 0.0]
+[entities.wash_right.audio_source]
+file = "audio/wash_loop_2.ogg"
+loop = true
+autoplay = true
+spatial = true
+volume = 0.0
+pitch = 0.94
+min_distance = 1.0
+max_distance = 12.0
+
+[entities.wash_left]
+[entities.wash_left.transform]
+position = [-1.2, 0.0, 0.0]
+[entities.wash_left.audio_source]
+file = "audio/wash_loop_1.ogg"
+loop = true
+autoplay = true
+spatial = true
+volume = 0.0
+pitch = 1.12
+min_distance = 1.0
+max_distance = 12.0
+
+[entities.foam_fizz]
+[entities.foam_fizz.transform]
+position = [0.0, 0.0, 0.0]
+[entities.foam_fizz.audio_source]
+file = "audio/foam_fizz_loop.ogg"
+loop = true
+autoplay = true
+spatial = true
+volume = 0.0
+min_distance = 1.0
+max_distance = 12.0
+
+[entities.water_ambience]
+[entities.water_ambience.water_ambience]
+wash_max = 0.5
+wash_v_ref = 1.5
+wash_gap_range = 0.5
+attack_s = 2.0
+release_s = 4.0
+fizz_max = 0.35
+fizz_steep_gain = 10.0
+fizz_glow_boost = 2.0
+bed_ocean_min = 0.35
+bed_ocean_max = 0.7
+bed_wind_min = 0.2
+bed_wind_max = 0.45
+bed_energy_ref = 3.0
+bed_slew_s = 5.0
+lowpass_near_hz = 2500.0
+lowpass_dist = 1.2
+[entities.water_ambience.script]
+source = "water_ambience.rhai"
+
 [entities.raft_audio]
+[entities.raft_audio.raft_audio]
+underside_y = 0.02
+v_min = 0.35
+v_ref = 1.8
+soft_max = 0.35
+med_max = 0.7
+base_vol = 0.22
+vol_gain = 0.55
+refractory_min = 0.15
+refractory_max = 0.35
+max_voices = 4.0
+breach_v_min = 0.3
+breach_vol = 0.14
+breach_vol_gain = 0.4
+breach_refractory = 0.5
+land_window = 1.5
+land_v_min = 0.1
+settle_vol = 0.32
+leg_shin_y = -0.1
+leg_v_min = 0.25
+leg_refractory = 0.5
+creak_threshold = 3.2
+creak_cd_min = 1.5
+creak_cd_max = 4.0
+debug_log = false
 [entities.raft_audio.script]
 source = "raft_audio.rhai"
 
@@ -189,6 +495,7 @@ loop = true
 autoplay = true
 spatial = false
 volume = 0.0
+bus = "music"
 
 [entities.music_dusk]
 [entities.music_dusk.audio_source]
@@ -197,6 +504,7 @@ loop = true
 autoplay = true
 spatial = false
 volume = 0.0
+bus = "music"
 
 [entities.music_night]
 [entities.music_night.audio_source]
@@ -205,6 +513,7 @@ loop = true
 autoplay = true
 spatial = false
 volume = 0.0
+bus = "music"
 
 [entities.music_deep]
 [entities.music_deep.audio_source]
@@ -213,6 +522,7 @@ loop = true
 autoplay = true
 spatial = false
 volume = 0.0
+bus = "music"
 
 [entities.music_controller]
 [entities.music_controller.music]
@@ -222,6 +532,9 @@ fade_seconds = 8.0
 swell_seconds = 210.0
 ebb_seconds = 150.0        # 0 = continuous music
 swell_fade_seconds = 15.0
+intro_sync_day = 1.0       # day bed holds until day 1 @ intro_sync_hour —
+intro_sync_hour = 17.0     #   the first dusk cue lands on the first counted evening
+                           #   (day 0 loops under the title; the hold survives it)
 [entities.music_controller.script]
 source = "music.rhai"
 
@@ -241,7 +554,7 @@ bearing_spread_deg = 30.0
 window_start = 19.2
 window_end = 20.6
 breach_height = 6.0
-breach_duration = 3.4
+breach_duration = 2.1   # airborne seconds — 6 m apex + 2.1 s ≈ real gravity
 encore_chance = 0.35
 [entities.whale.script]
 source = "whale.rhai"
@@ -268,6 +581,7 @@ size_start = 1.2
 size_end = 0.25
 color_start = [0.98, 0.86, 0.82, 0.9]
 color_end = [0.75, 0.62, 0.68, 0.0]
+texture = "textures/rain_drop.png"   # soft round puff (was a bare square)
 shape = "cone"
 shape_radius = 2.5
 shape_angle = 50.0
@@ -291,8 +605,9 @@ strength = 0.5
 [entities.biolum_controller.script]
 source = "biolum.rhai"
 
-# ── Dawn birds (M8): five silhouettes in a loose V cross the sunrise
-#    glow; birds.rhai schedules and flies them, parked deep otherwise ──
+# ── Seabirds (M8): flocks of 3-9 silhouettes in a loose V, any hour
+#    but densest around dawn (real-second attempts, hour-affinity
+#    accept); birds.rhai deals each flock's size and formation ──
 
 [entities.bird_flock]
 [entities.bird_flock.birds]
@@ -300,12 +615,22 @@ enabled = true
 distance = 110.0
 height = 12.0
 speed = 9.0
-bearing_deg = 85.0      # sunrise azimuth — cross the glow
-bearing_spread_deg = 25.0
-window_start = 5.6
-window_end = 7.2
+bearing_deg = 85.0      # sunrise azimuth — dawn flocks cross the glow
+bearing_spread_deg = 25.0   # widens toward any-direction off-peak
+min_interval_s = 40.0   # attempt cadence (real seconds)
+max_interval_s = 90.0
+dawn_center_h = 6.3     # peak activity hour
+dawn_width_h = 3.0      # bump half-width (game hours)
+dawn_chance = 0.85      # accept probability at peak dawn
+offpeak_chance = 0.1    # accept probability far from dawn
 crossing_length = 260.0
-encore_chance = 0.4
+encore_chance = 0.6     # chance a crossing chains a quick encore
+max_crossings = 3       # cap per encore chain
+min_birds = 3
+max_birds = 9
+title_pass = false      # ONE-SHOT: title.rhai cues the opening flyby
+title_distance = 45.0   # title flyby: closer + lower than ambient passes
+title_height = 11.0
 [entities.bird_flock.script]
 source = "birds.rhai"
 
@@ -338,6 +663,70 @@ asset = "bird"
 position = [0.0, -60.0, 0.0]
 [entities.bird_4.model]
 asset = "bird"
+
+[entities.bird_5]
+[entities.bird_5.transform]
+position = [0.0, -60.0, 0.0]
+[entities.bird_5.model]
+asset = "bird"
+
+[entities.bird_6]
+[entities.bird_6.transform]
+position = [0.0, -60.0, 0.0]
+[entities.bird_6.model]
+asset = "bird"
+
+[entities.bird_7]
+[entities.bird_7.transform]
+position = [0.0, -60.0, 0.0]
+[entities.bird_7.model]
+asset = "bird"
+
+[entities.bird_8]
+[entities.bird_8.transform]
+position = [0.0, -60.0, 0.0]
+[entities.bird_8.model]
+asset = "bird"
+
+# ── The Visitor: a weathered twin raft (raft2) drifts up around noon
+#    of day 1 (the first counted day after the title's looping day 0),
+#    holds ~18 m off, then drifts away. Parked deep until
+#    raft_visitor.rhai drives it; rare return visits on later days. ──
+
+[entities.raft2]
+[entities.raft2.transform]
+position = [-80.0, -50.0, -80.0]   # own parking spot: not whale [0,-40,130], not birds y=-60
+[entities.raft2.model]
+asset = "raft2"
+
+[entities.raft_visitor]
+[entities.raft_visitor.raft_visitor]
+enabled = true
+first_day = 1.0         # the first counted day (day 0 loops under the title)
+window_start = 11.5
+window_end = 13.0
+return_chance = 0.15
+bearing_deg = 60.0      # clear of the whale's 278° sunset band
+bearing_spread_deg = 40.0
+spawn_distance = 140.0  # beyond fog_start — it comes out of the haze
+hold_distance = 18.0
+approach_duration_s = 90.0
+hold_duration_s = 150.0
+depart_duration_s = 110.0
+depart_turn_deg = 70.0
+wander_amp_m = 2.0
+draft = 0.10            # a touch lower than the player's 0.08 — waterlogged
+heave_response = 2.6    # lazier than the player raft (3.0/3.5)
+angular_response = 3.0
+lap_volume = 0.25
+lap_min_gap_s = 2.5
+creak_volume = 0.18
+trigger_visit = -1.0    # debug one-shot: set >= 0.5 to fire a visit now
+debug_log = false
+phase = 0.0             # published by the script — F3 Visitor panel status
+day = 0.0               # published by the script — mirrors the tod day counter
+[entities.raft_visitor.script]
+source = "raft_visitor.rhai"
 
 # ── Seated first-person camera (declared after the raft so it reads
 #    this frame's raft transform) ─────────────────────────────────
@@ -390,6 +779,18 @@ joint = "eye"      # seat_camera.rhai follows this joint (eye_follow)
 clip = "idle_deck"     # default variant: propped lean-back matches the camera
 layer_clip = "legs_rock"   # additive: the self-soothing knee rock, always on
 layer_weight = 1.0
+# These four MUST live under [animator] — they sat under [idle_brain] below,
+# where TOML quietly assigned them to the wrong component. animator.playing
+# and .autoplay both default to FALSE, so the base clip's time never advanced
+# (skeletal_sync.rs only ticks state.time inside `if state.playing`). It went
+# unnoticed because the legs_rock additive layer advances regardless, and
+# because the old blend-target bug re-armed the crossfade forever — which
+# replayed the first blend_duration of each clip on a loop and passed for
+# animation. With that bug fixed, a wrong `playing` freezes the pose outright.
+autoplay = true
+loop = true
+playing = true
+speed = 1.0
 [entities.body.idle_brain]
 enabled = true
 dwell_min = 12.0
@@ -398,9 +799,6 @@ fidget_chance = 0.45
 big_chance = 0.08      # the rare big stretch — keep infrequent
 variant_blend = 2.0
 fidget_blend = 0.5
-autoplay = true
-loop = true
-playing = true
-speed = 1.0
 [entities.body.script]
 source = "body.rhai"
+

@@ -1,7 +1,8 @@
 # Baked whale-breach fixture — the dusk snapshot (snap_dusk) plus the
 # whale frozen mid-breach, 130 m out toward the sunset. `flint render`
-# does not run scripts, so the pose here mirrors whale.rhai at u≈0.22:
-# body-center 1.6 m up, nose 55° skyward — the classic rising moment.
+# does not run scripts, so the pose here mirrors whale.rhai just after
+# center-exit (~0.15 s of free flight): body-center 1.6 m up, carried
+# ~3.7 m along its heading, nose ~76° skyward — the missile moment.
 # Render with:
 #   flint render scenes/snap_breach.scene.toml --target -128,3,-18 \
 #     --distance 65 --pitch 3 --no-grid
@@ -79,11 +80,11 @@ grid_scale = 60.0
 fade_start = 90.0
 fade_end = 170.0
 
-# Whale emerging: bearing 278° × 130 m from origin, whale.rhai u≈0.22 —
-# body-center 1.6 m up, nose 55° skyward, the classic rising shot.
+# Whale emerging: bearing 278° × 130 m from origin, whale.rhai just
+# after center-exit — 1.6 m up, carried along yaw 135°, nose 76° skyward.
 [entities.whale]
 [entities.whale.transform]
-position = [-128.7, 1.6, -18.1]
-rotation = [-55.0, 135.0, 0.0]
+position = [-126.1, 1.6, -20.7]
+rotation = [-76.0, 135.0, 0.0]
 [entities.whale.model]
 asset = "whale"

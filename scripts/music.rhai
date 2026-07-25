@@ -12,6 +12,19 @@
 //
 // Config lives on this entity's `music` component (schemas/components/
 // music.toml); tracks + windows are the TRACKS table below.
+//
+// Intro stretch: the day-length ramp compresses the opening days, which
+// would churn all four beds inside the first real minute. The music
+// instead runs on its own stretched clock: its hour lerps from the
+// scene's start hour to intro_sync_hour across days 0..intro_sync_day,
+// so the day bed holds through day 0 and day 1's daytime and the FIRST
+// dusk cue lands on day 1's evening — exactly where the music clock
+// rejoins the world clock (continuous by construction, no drift to
+// unwind). While the title card loops day 0, day progress wraps back
+// below the anchor each cycle, so the stretched hour sawtooths within
+// the day-bed window — the hold survives an arbitrarily long title.
+// Scenes without a day counter, or intro_sync_day <= 0, skip the
+// stretch.
 
 // [entity_name, window_start_hour, window_end_hour] — end > 24 wraps past
 // midnight. Adjacent windows share an edge so they crossfade, not gap.
@@ -27,6 +40,8 @@ let cur_gate = 0.0;                     // slewed swell/ebb gate
 let playing = true;                     // in a swell (music) phase?
 let phase_left = -1.0;                  // seconds left in phase (<0 = init)
 let last_written = [-1.0, -1.0, -1.0, -1.0];
+let anchor_p = -1.0;                    // intro-stretch anchor: day progress
+let anchor_h = 0.0;                     //   and music hour at scene start
 
 fn sstep(t) {
     let c = clamp(t, 0.0, 1.0);
@@ -54,6 +69,24 @@ fn on_update() {
 
     let enabled = get_field(me, "music", "enabled");
     let master = get_field(me, "music", "master_volume");
+    // The score recedes as weather builds past overcast — in a storm the
+    // storm is the music. (state 2.5 → full master, 3.5+ → 20%.)
+    let wxe = get_entity("weather_controller");
+    if wxe >= 0 {
+        let ws = get_field(wxe, "weather", "state");
+        if ws != () {
+            master *= 1.0 - 0.8 * clamp(ws - 2.5, 0.0, 1.0);
+        }
+    }
+    // ...and in a dead calm the silence is the music. The event's own
+    // envelope shapes the fade; the swell/ebb gate smooths the rest.
+    let dce = get_entity("dead_calm_controller");
+    if dce >= 0 {
+        let cf = get_field(dce, "dead_calm", "calm");
+        if cf != () && cf > 0.0 {
+            master *= 1.0 - 0.85 * clamp(cf, 0.0, 1.0);
+        }
+    }
     let fade_s = get_field(me, "music", "fade_seconds");
     let swell_s = get_field(me, "music", "swell_seconds");
     let ebb_s = get_field(me, "music", "ebb_seconds");
@@ -64,6 +97,23 @@ fn on_update() {
     let tod = get_entity("tod");
     if tod < 0 { return; }
     let hours = get_field(tod, "time_of_day", "time_hours");
+    if hours == () { return; }          // set_field is deferred; first frames
+
+    // ── Intro stretch: music hour lerps start → intro_sync_hour over
+    //    the opening days, rejoining the world clock at the sync point ─
+    let mh = hours;
+    let day = get_field(tod, "time_of_day", "day");
+    let sync_day = get_field(me, "music", "intro_sync_day");
+    let sync_hour = get_field(me, "music", "intro_sync_hour");
+    if day != () && sync_day != () && sync_hour != () && sync_day > 0.0 {
+        let p = day + hours / 24.0;               // continuous day progress
+        let p1 = sync_day + sync_hour / 24.0;
+        if anchor_p < 0.0 { anchor_p = p; anchor_h = hours; }
+        if p < p1 && anchor_p < p1 {
+            let t = clamp((p - anchor_p) / (p1 - anchor_p), 0.0, 1.0);
+            mh = anchor_h + (sync_hour - anchor_h) * t;
+        }
+    }
 
     // ── Swell/ebb: music for ~swell_s, ocean alone for ~ebb_s ───────
     if ebb_s <= 0.01 {
@@ -88,7 +138,7 @@ fn on_update() {
     let wstep = dt / fade_s;
     for i in 0..4 {
         let trk = global::TRACKS[i];
-        let w = window_weight(hours, trk[1], trk[2]);
+        let w = window_weight(mh, trk[1], trk[2]);
         cur_w[i] = toward(cur_w[i], w, wstep);
         let vol = master * cur_gate * cur_w[i];
         if abs(vol - last_written[i]) > 0.002 {

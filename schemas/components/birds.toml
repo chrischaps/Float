@@ -1,14 +1,29 @@
 [component.birds]
-description = "Dawn seabird crossing (scripts/birds.rhai): a small trailing-V of silhouettes crosses the sunrise glow once (maybe twice) per dawn window"
+description = "Seabird crossings (scripts/birds.rhai): trailing-V flocks of varying size can pass at any hour, densest around dawn (real-second attempts accepted by hour affinity), chaining encores up to max_crossings"
 
 [component.birds.fields]
 enabled = { type = "bool", description = "Master switch for the crossing event", default = true }
 distance = { type = "float", description = "Closest approach of the flight line to the raft (m)", default = 110.0 }
 height = { type = "float", description = "Flight height above the sea (m)", default = 12.0 }
 speed = { type = "float", description = "Flight speed (m/s)", default = 9.0 }
-bearing_deg = { type = "float", description = "Base world bearing of the crossing — aim at the sunrise azimuth so the flock crosses the glow", default = 85.0 }
-bearing_spread_deg = { type = "float", description = "Random bearing variation (±deg)", default = 25.0 }
-window_start = { type = "float", description = "Dawn window start (game hours)", default = 5.6 }
-window_end = { type = "float", description = "Dawn window end (game hours)", default = 7.2 }
+bearing_deg = { type = "float", description = "Base world bearing of the crossing — aim at the sunrise azimuth so dawn flocks cross the glow", default = 85.0 }
+bearing_spread_deg = { type = "float", description = "Random bearing variation at peak dawn (±deg); widens toward any-direction off-peak", default = 25.0 }
+min_interval_s = { type = "float", description = "Shortest gap between crossing attempts (real seconds)", default = 40.0 }
+max_interval_s = { type = "float", description = "Longest gap between crossing attempts (real seconds)", default = 90.0 }
+dawn_center_h = { type = "float", description = "Hour of peak bird activity (game hours)", default = 6.3 }
+dawn_width_h = { type = "float", description = "Half-width of the dawn activity bump (game hours); <= 0 makes birds hour-blind", default = 3.0 }
+dawn_chance = { type = "float", description = "Chance an attempt launches a flock at peak dawn (0-1)", default = 0.85 }
+offpeak_chance = { type = "float", description = "Chance an attempt launches a flock far from dawn (0-1)", default = 0.1 }
 crossing_length = { type = "float", description = "Total length of the flight line (m)", default = 260.0 }
-encore_chance = { type = "float", description = "Chance of a second crossing if the window has room (0-1)", default = 0.4 }
+encore_chance = { type = "float", description = "Chance a finished crossing chains a quick encore flock (0-1)", default = 0.6 }
+max_crossings = { type = "integer", description = "Maximum crossings per encore chain", default = 3 }
+min_birds = { type = "integer", description = "Smallest flock size (1-9)", default = 3 }
+max_birds = { type = "integer", description = "Largest flock size (1-9, entity pool is bird_0..bird_8)", default = 9 }
+
+# Title-card flyby: title.rhai cues a one-shot flock that crosses the
+# LOCKED opening camera's view screen-left to screen-right (a full
+# max_birds V, closer/lower than ambient passes; crossing length is
+# title_distance * 3.4 so entry and exit stay just off-screen).
+title_pass = { type = "bool", description = "ONE-SHOT: consumed by birds.rhai — fly the title-card crossing now (skipped silently in storm)", default = false }
+title_distance = { type = "float", description = "Title flyby distance from the raft (m)", default = 45.0 }
+title_height = { type = "float", description = "Title flyby height above the sea (m)", default = 11.0 }

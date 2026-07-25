@@ -29,6 +29,7 @@ reference/    Visual reference images (water/, raft/)
 ```
 build.bat                 # cargo build --release in engine/ (flint, flint-player)
 play.bat [scene]          # run scenes/float.scene.toml (default)
+play_sfx_only.bat [scene] # same, music bus muted (--music-volume 0)
 render.bat                # headless PNG snapshots into snapshots/
 python tools/generate_raft.py   # regenerate models/raft.glb
 ```
@@ -55,7 +56,10 @@ Pull updates: `git subtree pull --prefix=engine engine main --squash`.
   sun disc from `directional_lights[0]`, hash stars, FBM clouds; driven by the
   `sky` component. Time-of-day is GAME-side (`scripts/time_of_day.rhai`
   keyframe interpolation writing set_field) — do not bake TOD into the engine.
-- Rhai APIs: `ocean_height(x,z)`, `ocean_normal(x,z)`, `set_cursor_captured`.
+- Rhai APIs: `ocean_height(x,z)`, `ocean_normal(x,z)`, `ocean_velocity_y(x,z)`
+  (analytic ∂h/∂t — the impact-intensity signal), `set_cursor_captured`,
+  `play_sound(name[,vol])`, `play_sound_at(name,x,y,z,vol[,pitch])`,
+  `set_audio_lowpass(hz)`.
 
 ## Gotchas
 
@@ -68,9 +72,38 @@ Pull updates: `git subtree pull --prefix=engine engine main --squash`.
   phase in f32 in the shader.
 - The raft is a plain transform-driven entity (no Rapier body needed); its
   buoyancy is `scripts/raft.rhai` sampling `ocean_height` at 5 points.
-- Music sources (`music_*` entities) must keep `autoplay = true`: there is
-  no play/stop script API for `audio_source` components — `music.rhai`
-  fades volumes, never stops sources.
+- Audio routes through two Kira mixer buses — `music` and `sfx` — both
+  children of the main track (the master lowpass applies to both).
+  `audio_source.bus = "music"` opts a source in (default `sfx`; the four
+  `music_*` beds are tagged in the scene); one-shots are always sfx. Bus
+  gain multiplies UNDER per-sound volumes, so script fades keep working.
+  Initial gains: `flint-player --music-volume X --sfx-volume Y` (also on
+  `flint play`).
+- Looping `audio_source` COMPONENT sources (`music_*`, `wash_*`, beds) must
+  keep `autoplay = true`: components have no play/stop — scripts only fade
+  their volumes. One-shots are different: `play_sound` /
+  `play_sound_at` play cached files fire-and-forget (spatial one-shot
+  tracks are hardcoded to 25 m max distance — distant events like the
+  whale breach must use non-spatial `play_sound` with scaled volume).
+- Every `*.ogg` in `audio/` is auto-preloaded at scene load; a one-shot
+  referencing a file NOT in `audio/` fails silently (a log warn, no sound).
+- `blend_to` writes the animator's `blend_target` field; the engine
+  clears it when the crossfade completes (`skeletal_sync.rs` `write_back`,
+  called from `AnimationSystem::update`). Before that fix the field was
+  never retired, so every clip re-armed its own crossfade forever and
+  played only its first `blend_duration` seconds on loop (~3-4
+  restarts/s at the 0.3 s default). `flint preview` was immune — it
+  plays clips directly, never through the blend path — so a clip that
+  previews fine can still be broken in play. `blend_to` with the clip
+  ALREADY playing is a deliberate restart (body.rhai chains held-key
+  scoot steps that way); both behaviors are pinned by unit tests.
+- Script update order is NOT deterministic: the engine iterates a
+  HashMap (`flint-script` `call_updates`), so "declared after X" does
+  NOT guarantee running after X in the same frame. Cross-script reads
+  may be one frame stale — fine for slow signals, fatal for
+  read-modify-write of fields another script rewrites every frame.
+  Compose via published factors instead (weather → TOD pattern):
+  the per-frame WRITER reads the factors and applies them itself.
 - trimesh GLB export OMITS vertex normals unless you pass
   `scene.export(path, include_normals=True)` — without them the engine
   falls back to flat [0,1,0] normals and shading goes flat/banded. All
@@ -82,7 +115,14 @@ M0 scaffold ✅ → M1 ocean core ✅ → M2 raft buoyancy + first person ✅ �
 M3 sky/time-of-day ✅ → M4 legs + refraction/turbidity ✅ → M5 audio ✅ →
 M7 music wiring ✅ (`scripts/music.rhai` crossfades 4 TOD beds with a
 swell/ebb gate; `audio/music_*.ogg` are placeholders until the ElevenLabs
-tracks from `specs/elevenlabs_audio_prompts.md` are generated) →
+tracks from `specs/elevenlabs_audio_prompts.md` are generated; the
+day-length ramp gets an intro stretch counterweight — the music hour
+lerps from scene start to `intro_sync_hour` of `intro_sync_day`, so the
+day bed holds through the compressed opening (and through the title's
+looping day 0 — day progress wraps below the stretch anchor each cycle,
+sawtoothing the music hour inside the day-bed window) and the first dusk
+cue lands on day 1's evening, where the music clock rejoins the world
+clock continuously — no drift to unwind; `intro_sync_day <= 0` disables) →
 M6 scooting ✅ (A/D or left stick slides the seat around a
 rounded-rectangle perimeter path; `seat_camera.rhai` owns the path math
 and publishes `seat_x`/`seat_z`/`seat_out_deg` through the seat component
@@ -90,34 +130,235 @@ for `legs_idle.rhai` — set_field is deferred, so readers guard against
 unit on the first frames) →
 M8 wildlife ✅: bioluminescent night foam (emissive `foam_glow` on the
 ocean, strength driven by a TOD keyframe channel), the dusk whale breach
-(`whale.rhai`, once per dusk toward the sunset band; fixture:
-`scenes/snap_breach.scene.toml`), dawn birds (`birds.rhai`, a loose V
-crossing the sunrise). All wildlife is lit from TOD-driven sources —
-never a constant color (see `specs/foam_followups.md`). Event scripts
-share the whale's scheduling pattern: window entry schedules, scrubbing
-out cancels, the event runs on real seconds.
+(`whale.rhai`, once per dusk toward the sunset band, sits out the
+title's looping day 0; fixture:
+`scenes/snap_breach.scene.toml`), seabirds (`birds.rhai`, loose-V
+flocks of 3-9 birds dealt fresh per pass, any hour but densest near
+dawn — reality.rhai-style scheduling: real-second attempts accepted by
+an hour-affinity bump, encore chains via `encore_chance`; off-peak
+flocks fly wide of the sunrise bearing; entity pool bird_0..bird_8).
+All wildlife is lit from TOD-driven sources —
+never a constant color (see `specs/foam_followups.md`). Window-bound
+event scripts (whale, visitor) share the whale's scheduling pattern:
+window entry schedules, scrubbing out cancels, the event runs on real
+seconds; anytime events (birds, reality tears) instead attempt on real
+seconds and accept by hour affinity.
 All milestones complete. Skeletal scoot ✅: `models/body.glb`
-(tools/generate_body.py — pygltflib, rigid-skinned 14-joint seated body,
-embedded `idle`/`scoot_right`/`scoot_left` clips; keeps the raised-knee
-framing contract) replaces legs.glb in the main scene. A/D triggers
+(tools/generate_body.py — pygltflib, rigid-skinned 18-joint seated body
+incl. the no-geometry `eye` camera anchor, embedded scoot/idle-variant/
+fidget/`legs_rock` clips; keeps the raised-knee framing contract)
+replaces legs.glb in the main scene. A/D triggers
 discrete steps: seat travel follows the clip's weight-shift phase, the
 eye rides the pelvis lift, `body.rhai` fires `blend_to` off the seat's
 published `step_dir` and creaks on the hand plant. NO skeletal
 on_animation_end exists — `seat.step_time` mirrors the clip length; keep
 them in sync. `animated_scoot = false` restores the continuous slide.
-Snap fixtures still use static legs.glb (skinned mesh needs the
-animation system; `flint render` runs neither).
-Polish backlog: body visual detail pass (geometry + texture), real
-M6/M8 SFX from `specs/elevenlabs_audio_prompts.md`.
+Snap fixtures still use static legs.glb; skinned meshes DO draw in
+`flint render` but at bind pose only (no animation runs headless).
+Body detail pass ✅: individual fingers/toes + kneecaps/malleoli/heel,
+tapered limbs, hem rings — all static geometry rigid-weighted to the
+existing 18 joints (no new joints, no clip renames). Textures:
+`tools/generate_skin_texture.py` generates tiling albedo maps (skin
+mottle/speckle/blush, shorts weave, tee knit) that generate_body.py
+embeds into body.glb (cylindrical UVs with seam-split verts + planar
+group UVs; sRGB-encoded from the linear palette so colors match; names
+must never contain "normal" — the engine would upload them linear).
+`python tools/generate_body.py` is still the single regeneration
+command. Hand/leg intersection fixed: wrists rest ON TOP of the thighs
+(rolled to the outer curve), the scoot arm is an IK-solved CARTESIAN
+waypoint path (euler-lerp between sparse solved poses cuts corners
+through the thigh — keep waypoints dense), and a generation-time
+`check_clearance()` FK-sweeps hands vs thigh+cuff across legs_rock,
+idle sway extremes and both scoots, ASSERTING > −0.5 cm — clip retunes
+that reintroduce clipping fail the generator, not Chris's playtest.
+`flint preview models/body.glb --render x.png --clip <name>
+--anim-time <t>` renders any clip pose headless (edit lacks
+--anim-time).
+Water audio system ✅: layered soundscape driven by the wave field, not
+the smoothed raft. (1) `raft_audio.rhai` — per-edge slap detection: a
+zero-crossing of the water over the log underside, intensity = relative
+approach speed via `ocean_velocity_y`, mapped to lap/soft → med → hard
+asset tiers, per-edge refractories (no global cooldown), drip tails,
+polyphony cap, leg splashes at the seat point. Crest passage is the
+mirror pair: the downward zero-crossing (surface dropping off the logs)
+plays a `runoff_*` breach and ARMS the edge; armed re-contact inside
+`land_window` plays a `settle_*` at the lowered `land_v_min` — needed
+because the smoothed heave lands on the back face nearly at the water's
+own speed and almost never clears `v_min`. Tuning in the
+`raft_audio` component (set `debug_log = true` to print triggers).
+(2) `water_ambience.rhai` — four spatial wash loops pinned to the raft
+edges (volume follows local water activity), a foam-fizz loop following
+steepness (+ `foam_glow` bloom nights), ocean/wind bed volumes scaled by
+sea energy from the ocean component, and a proximity lowpass as swells
+near the eye. (3) Wildlife: `whale.rhai` plays `breach_splash` delayed
+by distance/340 m/s; `birds.rhai` sparse chirps. All assets procedural
+(`tools/generate_audio.py`) — ElevenLabs replacements spec'd in
+`specs/elevenlabs_audio_prompts.md`.
+Weather system ✅: `weather.rhai` + `weather` component
+(`weather_controller` entity) — an autonomous Markov drift over five
+states (clear/scattered/overcast/rain/storm, adjacent steps, real
+seconds, independent of the TOD clock) with a continuous eased `state`.
+Physical lag cascade: state → wind (τ~20 s, gusty) → sea (build ~2 min,
+decay ~4 min = dying swell). Only phase-safe ocean fields are ramped
+(`amplitude`, `choppiness`, `wind_speed`, `fetch_km` — spectrum regen
+keeps phases); `direction_deg`/`speed_scale`/band/seed are load-time
+only (they pop). The scene band is 16 waves / 5–110 m so storm
+wind/fetch can move JONSWAP energy into long swell. Weather OWNS the
+sky fields TOD never writes (cloud coverage/density/scale/drift,
+sun_glow) plus `foam_threshold` and the raft's storm-stiffened
+heave/angular response; it PUBLISHES factors (`sun_scale`, `amb_scale`,
+`star_scale`, `tint_mul`/`tint_alpha`, `ocean_dark`, `fog_mul`,
+`fog_gray`, `flash`) that `time_of_day.rhai` applies at its own write
+sites. Rain = camera-following box `rain_emitter` (gravity field slants
+with gusts, colors dimmed by live sun so night rain doesn't glow),
+drawn as streaks via the engine's velocity-aligned billboard stretch
+(`particle_emitter.stretch`; quad elongates along on-screen motion) with
+the soft-dot `textures/rain_drop.png` (tools/generate_textures.py;
+particle textures load at scene load, resolved scene-dir then game
+root). Rain impact rings are IN THE OCEAN SHADER (`ocean.rain_ripple`
+0..1, weather-driven): a hash-grid of expanding rings scanned over a 3x3
+cell neighborhood (rings clipped to one cell tile into visible squares),
+faded out by ~30 m.
+Lightning: strikes scheduled in-storm, flicker flash = published
+`flash` (TOD whites out sun/clouds) + transient `set_exposure`; thunder
+delayed dist/340, distance-graded crack/mid/far, always non-spatial.
+Beds `rain_loop`/`storm_howl` faded by weather; music ducks 80% in
+storms; whale/birds skip when `state > 2.5`. F3 Weather panel
+(engine `weather_panel.rs`) forces states, snaps, fires strikes, tunes
+taus. Fixture: `scenes/snap_storm.scene.toml`. Set `enabled = false`
+on the weather component to hand-tune the ocean.
+
+Reality tears ✅: rare render-mode world events — the world's skin splits
+and another view bleeds through. Modes: 1 Matrix code (composite branch:
+procedural dot-matrix glyphs per 8x12 px cell, brightness AND density from
+scene luminance so foam reads as bright code, per-column rain heads),
+2 blood ocean (ocean-shader palette remap through locals at the top of
+fs_main — deep/shallow/SSS/foam AND the sky-reflection snapshot — scaled by
+the TOD palette's own luminance so night blood stays dark; viscosity =
+bands→2 + wobble; world-fbm pools spread with mix), 3 drunk (pre-sample UV
+sway warps the whole composite chain + ghost double-tap; script adds FOV
+breathing, radial blur, chromatic aberration, and an audio muffle via the
+published `lowpass_scale` factor water_ambience applies), 4 Tron (depth
+Sobel + luminance edges in cyan over a dimmed scene + world-space grid from
+depth reconstruction that rides the swells). Shared rails: `render_mode`/
+`mode_mix`/`mode_time`/`mode_params` in PostProcessConfig+Uniforms (208 B,
+size-tested) branch AFTER ACES/before vignette; fbm bleed-mask (threshold
+swept across the fbm span so patch coverage tracks mix, pinned full at 1);
+ocean uniforms mirror mode/mix from postprocess_config (832 B test).
+`set_render_mode(mode, mix)` + `set_render_mode_params` are TRANSIENT
+(unlike every other pp override, which is sticky): the player zeroes the
+mode the frame calls stop — dead script = healed world. `reality.rhai`
+(reality_controller entity) schedules tears whale-style on real seconds
+with per-mode hour affinities (Matrix 23h±3, blood dusk 19h±1.5, Tron
+22h±3, drunk hour-blind), storm-shy, helpers kept PURE (scope gotcha).
+F3 Reality panel: trigger/end buttons, pin-mix slider, weights/intervals.
+Headless: `flint render ... --render-mode N --mode-mix X`. Sticky FX the
+drunk mode borrows (fov/blur/CA) are zeroed on heal.
+
+The Visitor ✅: around noon of in-game day 1 (the first counted day
+after the title's looping day 0) a weathered twin raft
+(`models/raft2.glb` — generate_raft.py's `build_raft()` with seed 12,
+grayed palette, 35% of lashings gone/frayed; weathering draws from a
+SEPARATE rng so the seed-7 raft.glb stays byte-identical) drifts up out
+of the haze, holds ~18 m riding the same swells (raft.rhai's 5-point
+buoyancy inlined, deeper draft, lazier response), then departs on a
+different bearing; rare return visits (`return_chance`/day). NO day
+counter exists engine-side — `raft_visitor.rhai` MIRRORS the
+tod-published `day` when present, falling back to deriving one from
+single-frame `time_hours` jumps > 12 h (forward wrap +1, backward scrub
+−1); you can't SCRUB to the visit day — test with the `trigger_visit`
+one-shot (consume-and-reset) or a short `day_length_sec`. Whale-pattern
+scheduling (window entry schedules, scrub-out cancels pending,
+storm-shy `state > 2.5`); an ACTIVE visit always completes on real
+seconds. raft2 is scene-declared parked at (-80,-50,-80) — there's no
+3D-model hide and `spawn_entity` attaches no mesh. Faint spatial
+laps/creaks reuse `lap_*`/`creak_*` inside the 25 m one-shot cap.
+F3 Visitor panel (engine `visitor_panel.rs`, keyed on the
+`raft_visitor` component): phase/day status line + "Visit now" button
+(writes the `trigger_visit` one-shot; the script publishes `phase`/
+`day` back, write-guarded). GOTCHA: schema defaults do NOT materialize
+component fields — every field a script `get_field`s must be listed in
+the scene block or the read returns unit (and f64 math with unit
+throws). Script `log()` lands at tracing target `script` level INFO —
+run with `RUST_LOG=warn,script=info` to see it.
+
+Dead Calm ✅: rare pre-dawn stillness event (`dead_calm.rhai`,
+`dead_calm_controller` entity) — the sea collapses to near-glass (~3% amp)
+over 8 unnatural real seconds, holds 4 GAME hours (integrated from
+`time_hours` with wrap guard; eases are real-seconds — hybrid on purpose),
+then returns over 30 s. Strict published-factor composition: the event
+writes NO weather-owned field — it publishes `calm`/`sea_scale`/
+`wind_scale`/`bed_scale`; weather.rhai multiplies `amp` (only — spectrum
+shape kept, phase-safe) and `wind_mean` (gusts/cloud drift/howl follow),
+water_ambience.rhai multiplies the bed targets (they otherwise FLOOR at
+bed_*_min on a glassy sea). The event directly owns exactly three
+otherwise-unwritten ocean fields with capture-once/restore-exactly
+(reality's base_fov idiom): `splash_baseline`→0 (else a contact-foam ring
+hugs the raft on glass), `splash_strength`, `sky_reflection_strength`→0.85
+(the star mirror). Slaps/washes/crest foam die on their own at flat water —
+never force them. Gates: hour affinity 3h±3, weather state < 1.2 AND
+weather enabled (weather is the applier — no weather, no event), day ≥
+min_day 2, title-day skip; mid-event weather rides through (product amp
+stays glassy, swells back on release). Birds + reality tears sit out
+`calm > 0.1`; music ducks 85%. F3 Dead Calm panel (engine
+`dead_calm_panel.rs`, visitor-pattern): status + "Calm now"/"End now"
+one-shots (`trigger_calm`/`end_now`).
+Title card ✅: `title.rhai` (title_controller entity) draws pre-rendered
+sprites (`tools/generate_title.py` → `sprites/title_adrift.png` +
+`title_presskey.png`; the ASPECT consts in the script must match what the
+generator prints) via `on_draw_ui`/`draw_sprite_ex`. The world runs live
+behind the card — day 0 loops beneath it (see Day-length ramp) and
+only look/scoot INPUT is gated: the script publishes
+`title.locked`, `seat_camera.rhai` reads it (whale-factor pattern). First
+raw input after `min_show_s` unlocks instantly and starts the fade; the
+dismiss uses the engine's `any_input_just_pressed()` Rhai API (raw
+key/mouse/gamepad presses, bypasses action maps — added for this).
+The card also cues a title flyby: `birds.title_pass` one-shot →
+birds.rhai flies the full V across the locked camera's view screen-left
+→ screen-right (`title_distance`/`title_height`, closer + lower than
+ambient passes; length = 3.4 × distance; hour-blind, still storm-shy;
+birds keep flying if the card is dismissed mid-crossing).
+
+Day-length ramp + day-0 title loop ✅: the opening days pass in a blur —
+effective day length is `day_length_sec` × 0.1/0.2/0.4/0.7/1.0 for days
+0-3/4+ (60/120/240/420/600 s at the default). Day 0 is the title day:
+while `title.locked` is up, `time_of_day.rhai` suppresses the midnight
+day-increment, so the compressed opening day LOOPS behind the card for
+as long as the player watches (wildlife stays live, EXCEPT the whale:
+whale.rhai skips scheduling while day < 0.5 — day 0's dusk passes every
+~60 s loop and a breach is invisible from the locked camera, so it
+would just be a confusing audio cue). The first input drops
+the lock; the day-0 cycle in progress completes naturally and its
+midnight starts day 1 — which carries what used to be day 2: 120 s and
+the visitor's guaranteed noon visit (`first_day = 1`).
+`time_of_day.rhai` owns the `day` counter on the `time_of_day`
+component (`last_hours` detects external >12 h jumps, visitor-style:
+forward wrap +1, backward scrub −1, clamped ≥ 0; natural wraps
+increment inside the advance loop). Scenes that don't list
+`day`/`last_hours` skip the ramp and run flat. `raft_visitor.rhai`
+mirrors the tod-published `day` (its own derived counter is only the
+fallback for ramp-less scenes).
+
+Polish backlog: real M6/M8 + weather SFX from
+`specs/elevenlabs_audio_prompts.md`; playtest pass on the body detail
+(finger/toe read in first person, texture contrast under the cel post,
+hand hover vs contact on the thighs).
 Engine changes live on Flint branch `feature/ocean-pipeline` (merge to main
 when ready). Plan: `C:\Users\chris\.claude\plans\please-make-a-plan-fluffy-pearl.md`
 
 ## Debug controls in play
 
-F3 toggles the panels: **Ocean Debug** (waves, colors, foam, water
-clarity/turbidity, grid), **Time of Day** (0-24h scrub slider, natural
-advance toggle, day length, sun path tilt), and **Camera** (vertical FOV
-slider — FOV lives in the seat_camera entity's `camera_tuning` component,
-not in `seat_camera.rhai`). Edits apply live through the
-world's components; "Commit to File" writes them back into the scene TOML.
-Escape releases the mouse (for panel use); click recaptures.
+F3 toggles the panels (grouped into ≤3 scrollable columns, size-balanced
+via `flint_debug_ui::assign_columns`; each panel is a fold-open
+CollapsingHeader — panel `name()` strings are load-bearing dispatch keys,
+don't rename casually): **Ocean Debug** (waves, colors, foam, water
+clarity/turbidity, grid), **Day / Time** (Day N · HH:MM · phase status,
+0-24h scrub slider + preset hour buttons, natural advance toggle, day
+counter display/set — a one-shot override since `time_of_day.rhai` owns
+the counter — day length with effective ramped length readout, sun path
+tilt), and **Camera** (vertical FOV slider — FOV lives in the seat_camera
+entity's `camera_tuning` component, not in `seat_camera.rhai`). Edits
+apply live through the world's components; "Commit to File" writes them
+back into the scene TOML (day/`last_hours` are never committed — day 0 is
+the title day). Escape releases the mouse (for panel use); click
+recaptures.
