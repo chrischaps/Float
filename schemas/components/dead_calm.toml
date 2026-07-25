@@ -1,0 +1,30 @@
+[component.dead_calm]
+description = "Dead Calm: the ocean goes unnaturally still for ~4 game hours (scripts/dead_calm.rhai). The script publishes factors; weather.rhai applies sea_scale/wind_scale and water_ambience.rhai applies bed_scale at their own write sites. The script directly owns ocean splash_baseline/splash_strength/sky_reflection_strength (capture/restore) — set enabled = false before hand-tuning those in F3."
+
+[component.dead_calm.fields]
+enabled = { type = "bool", description = "false = no autonomous calms (F3 trigger still works)", default = true }
+min_interval_s = { type = "float", description = "Minimum real seconds between autonomous attempts", default = 900.0 }
+max_interval_s = { type = "float", description = "Maximum real seconds between autonomous attempts", default = 1800.0 }
+retry_s = { type = "float", description = "Retry delay when an attempt fails (wrong hour / weather / day)", default = 60.0 }
+hour_center = { type = "float", description = "Game hour where a calm is most likely (pre-dawn)", default = 3.0 }
+hour_width = { type = "float", description = "Affinity half-width in hours (<= 0 = any hour)", default = 3.0 }
+max_weather_state = { type = "float", description = "Weather state must be below this to start (near-clear)", default = 1.2 }
+min_day = { type = "float", description = "Earliest day a calm may fire (title day 0 always skipped)", default = 2.0 }
+ease_in_s = { type = "float", description = "Real seconds for the sea to fall still (fast = the eeriness)", default = 8.0 }
+hold_hours = { type = "float", description = "Game hours the dead calm holds", default = 4.0 }
+ease_out_s = { type = "float", description = "Real seconds for life to return", default = 30.0 }
+trough_amp_frac = { type = "float", description = "Ocean amplitude fraction at full calm (near-glass, faint breath)", default = 0.03 }
+trough_wind_frac = { type = "float", description = "Weather wind fraction at full calm (gusts, cloud drift, howl)", default = 0.15 }
+trough_bed = { type = "float", description = "Ocean/wind ambience bed fraction at full calm (not zero)", default = 0.06 }
+calm_splash_baseline = { type = "float", description = "ocean.splash_baseline at full calm (0 = no foam ring on glass)", default = 0.0 }
+calm_splash_strength = { type = "float", description = "ocean.splash_strength at full calm", default = 0.15 }
+calm_sky_reflection = { type = "float", description = "ocean.sky_reflection_strength at full calm (the mirror reads)", default = 0.85 }
+trigger_calm = { type = "float", description = "One-shot: set >= 0.5 to start a calm now, bypassing all gates (panel sets; script clears to -1)", default = -1.0 }
+end_now = { type = "bool", description = "One-shot: ease the active calm out immediately (panel sets; script clears)", default = false }
+calm = { type = "float", description = "PUBLISHED calm envelope 0..1 (script-owned) — read by birds/reality/music", default = 0.0 }
+sea_scale = { type = "float", description = "PUBLISHED ocean amplitude factor 0..1 — applied by weather.rhai", default = 1.0 }
+wind_scale = { type = "float", description = "PUBLISHED wind factor 0..1 — applied by weather.rhai to wind_mean", default = 1.0 }
+bed_scale = { type = "float", description = "PUBLISHED ambience-bed factor 0..1 — applied by water_ambience.rhai", default = 1.0 }
+phase = { type = "float", description = "PUBLISHED 0 idle / 1 falling calm / 2 dead calm / 3 life returning (script-owned)", default = 0.0 }
+next_in_s = { type = "float", description = "PUBLISHED real seconds until the next scheduled attempt (-1 = none)", default = -1.0 }
+debug_log = { type = "bool", description = "Print scheduling and envelope transitions", default = false }
