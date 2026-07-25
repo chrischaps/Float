@@ -19,6 +19,11 @@
 // stretch. After a scoot, the body lands in the variant whose hand is
 // already planted (the arm that pushed stays propped).
 //
+// Scoots: a step always plays to completion. The seat chains held keys
+// without dropping step_dir to 0 (which would yank the body into an idle
+// variant mid-hold), so the clip is re-triggered off the seat's step_seq
+// counter instead of the rising edge alone.
+//
 // The engine has NO skeletal on_animation_end: fidget durations are
 // mirrored from tools/generate_body.py (FIDGET_DURS) — keep in sync.
 // Blend-back starts slightly before a one-shot's end to mask the loop
@@ -36,6 +41,7 @@ const BIG_KINDS = ["stretch"];
 const BIG_DURS  = [3.6];
 
 let prev_dir = 0.0;
+let prev_seq = -1.0;    // seat's step counter: a change = a new step start
 let step_clock = -1.0;  // seconds since scoot step start (-1 = not stepping)
 let creak_done = false;
 let layer_w = 1.0;      // slewed legs_rock layer weight (ducked in scoots)
@@ -87,16 +93,24 @@ fn on_update() {
     // ── Scoot clip driver ───────────────────────────────────────────
     let dir = get_field(seat, "seat", "step_dir");
     if dir == () { dir = 0.0; }
+    let seq = get_field(seat, "seat", "step_seq");
+    if seq == () { seq = prev_seq; }
 
-    if dir != 0.0 && prev_dir == 0.0 {
-        // Step began. step_dir +1 = scoot-left (+s, toward +X when
-        // facing out); the LEFT-moving clip mirrors the right one.
+    // A step starts on the rising edge OR on a step_seq tick — the seat
+    // chains held keys without passing through 0, so the counter is the
+    // only signal that the clip should play again from the top. The clip
+    // starts and ends on the neutral pose, so the short blend is invisible.
+    if dir != 0.0 && (prev_dir == 0.0 || seq != prev_seq) {
+        // step_dir +1 = scoot-left (+s, toward +X when facing out); the
+        // LEFT-moving clip mirrors the right one.
         let clip = if dir > 0.0 { "scoot_left" } else { "scoot_right" };
-        blend_to(me, clip, 0.12);
+        let bl = if prev_dir == 0.0 { 0.12 } else { 0.06 };
+        blend_to(me, clip, bl);
         step_clock = 0.0;
         creak_done = false;
         mode = 0;
     }
+    prev_seq = seq;
     if dir == 0.0 && prev_dir != 0.0 {
         // Step ended: land in the variant whose hand is already planted
         // (scoot_right pushed with the LEFT arm, and vice versa).

@@ -13,7 +13,7 @@ scoot_ease = { type = "float", description = "Scoot velocity slew rate (1/s); lo
 animated_scoot = { type = "bool", description = "true = discrete scoot steps synced to the body's scoot clips; false = the old continuous slide", default = true }
 step_time = { type = "float", description = "One scoot step duration (s) — MUST match the scoot clip length in tools/generate_body.py", default = 1.4 }
 step_distance = { type = "float", description = "Seat travel per scoot step (m along the perimeter)", default = 0.35 }
-step_pause = { type = "float", description = "Rest between chained steps while the key is held (s)", default = 0.18 }
+step_pause = { type = "float", description = "Rest after a step whose key was RELEASED (s); held keys chain with no rest so the clip repeats seamlessly", default = 0.18 }
 step_bob = { type = "float", description = "Eye lift at the push-up peak of a step (m) — matches the clip's pelvis lift", default = 0.06 }
 eye_height = { type = "float", description = "Eye height above the deck top (m) — legacy fixed-offset path", default = 0.55 }
 eye_inboard = { type = "float", description = "Eye pulled inboard of the scoot path (m); lean-back posture that also flattens the eye-to-knee angle so the legs reach the frame — legacy fixed-offset path", default = 0.1 }
@@ -29,4 +29,5 @@ mouse_sens = { type = "float", description = "Mouse look sensitivity (rad per co
 seat_x = { type = "float", description = "RUNTIME: raft-local seat X on the scoot path", default = 0.0 }
 seat_z = { type = "float", description = "RUNTIME: raft-local seat Z on the scoot path", default = 1.05 }
 step_dir = { type = "float", description = "RUNTIME: -1/0/+1 — scoot step in progress and its direction (body.rhai fires clips off transitions)", default = 0.0 }
+step_seq = { type = "float", description = "RUNTIME: increments on every scoot step start; body.rhai restarts the clip on a change so held keys repeat the step without dropping to idle", default = 0.0 }
 seat_out_deg = { type = "float", description = "RUNTIME: seat-outward heading (deg, 0 = raft +Z)", default = 0.0 }
