@@ -1,0 +1,97 @@
+# Baked full-storm fixture — noon TOD (KEYS row 4) with the weather
+# system's STORM factors applied by hand, since `flint render` runs no
+# scripts. Mirrors weather.rhai state 4 fully converged: sea amplitude
+# 5.5 over the widened 5-110 m band (wind 24 m/s / fetch 300 km pushes
+# the JONSWAP peak into the long bins), whitecaps at foam_threshold
+# 0.70, sun dimmed ×0.18, ambient ×0.45, near-black cloud deck at
+# coverage 0.98, fog ×3.5 pulled toward storm gray, ocean palette ×0.55.
+# Render with:
+#   flint render scenes/snap_storm.scene.toml --schemas engine\schemas \
+#     --schemas schemas --output snapshots/storm.png --no-grid \
+#     --distance 10 --pitch 18 --yaw 35 --target 0,0.5,0
+
+[scene]
+name = "Float — storm fixture"
+version = "0.1"
+description = "Baked noon lighting under the weather system's full storm"
+
+[post_process]
+enabled = true
+bloom_enabled = true
+bloom_intensity = 0.06
+bloom_threshold = 1.0
+vignette_enabled = true
+vignette = 0.18
+fog_enabled = true
+fog_color = [0.386, 0.432, 0.472]
+fog_density = 0.00455
+fog_start = 60.0
+
+[entities.sun]
+[entities.sun.light]
+type = "directional"
+direction = [0.0, 0.7796, 0.4695]
+color = [1.0, 0.96, 0.86]
+intensity = 0.279
+
+[entities.sky_dome]
+[entities.sky_dome.sky]
+zenith_color = [0.10, 0.30, 0.72, 1.0]
+horizon_color = [0.52, 0.74, 0.92, 1.0]
+haze_color = [0.404, 0.437, 0.466, 0.5]
+cloud_tint = [0.10, 0.10, 0.10, 1.0]
+sun_disc_size = 0.035
+sun_glow = 0.15
+star_opacity = 0.0
+cloud_coverage = 0.98
+cloud_density = 0.62
+cloud_scale = 0.7
+cloud_drift_x = 0.024
+cloud_drift_y = 0.009
+ambient_sky = [0.054, 0.0585, 0.081, 1.0]
+ambient_ground = [0.027, 0.0225, 0.018, 1.0]
+
+[entities.ocean]
+[entities.ocean.ocean]
+seed = 7
+num_waves = 16
+wavelength_min = 5.0
+wavelength_max = 110.0
+amplitude = 5.5
+choppiness = 0.97
+direction_deg = 155.0
+spread_deg = 40.0
+speed_scale = 1.0
+wind_speed = 24.0
+fetch_km = 300.0
+peak_enhancement = 3.3
+# Storm palette = noon TOD colors desaturated toward luminance (0.35)
+# then dimmed x0.35 — slate gray-blue, not a dim vivid blue.
+deep_color = [0.022, 0.050, 0.132, 1.0]
+shallow_color = [0.071, 0.153, 0.242, 1.0]
+foam_color = [0.97, 0.99, 1.0, 1.0]
+sss_color = [0.050, 0.141, 0.153, 1.0]
+foam_threshold = 0.70
+foam_noise_scale = 0.58
+ramp_steps = 6.0
+specular_strength = 1.0
+band_wobble = 0.6
+band_dither = 0.11
+band_dither_scale = 16.0
+turbidity = 0.8
+refraction_strength = 0.6
+absorption_color = [0.9, 0.35, 0.22]
+sky_reflection_strength = 0.45
+grid_scale = 60.0
+fade_start = 90.0
+fade_end = 170.0
+foam_glow_color = [0.35, 0.95, 0.75, 1.0]
+foam_glow = 0.0
+rain_ripple = 1.0       # full-storm rain lashing the surface
+
+# Scale reference: the 2.4 m raft against the storm swell.
+[entities.raft]
+[entities.raft.transform]
+position = [0.0, 0.05, 0.0]
+[entities.raft.model]
+asset = "raft"

@@ -1,0 +1,32 @@
+[component.weather]
+description = "Autonomous weather brain: drifting sky states, wind, and the sea's slow answer (scripts/weather.rhai)"
+
+[component.weather.fields]
+enabled = { type = "bool", description = "false = weather stands down (hand-tune the ocean freely)", default = true }
+forced_state = { type = "float", description = "-1 = autonomous drift; 0..4 forces Clear/Scattered/Overcast/Rain/Storm (eased)", default = -1.0 }
+snap = { type = "bool", description = "One-shot: jump state, wind, and sea to the target instantly (panel sets; script clears)", default = false }
+strike_now = { type = "bool", description = "One-shot: fire a lightning strike immediately (panel sets; script clears)", default = false }
+state = { type = "float", description = "PUBLISHED continuous weather state 0..4 (script-owned; read-only elsewhere)", default = 1.0 }
+wind = { type = "float", description = "PUBLISHED current wind incl. gusts, m/s (script-owned)", default = 4.0 }
+sea = { type = "float", description = "PUBLISHED normalized sea energy 0..1 — the slow swell state (script-owned)", default = 0.25 }
+fog_mul = { type = "float", description = "PUBLISHED fog density multiplier — applied by time_of_day.rhai", default = 1.0 }
+fog_gray = { type = "float", description = "PUBLISHED 0..1 fog desaturation toward storm gray — applied by time_of_day.rhai", default = 0.0 }
+sun_scale = { type = "float", description = "PUBLISHED sun intensity multiplier (overcast dimming) — applied by time_of_day.rhai", default = 1.0 }
+amb_scale = { type = "float", description = "PUBLISHED hemisphere ambient multiplier — applied by time_of_day.rhai", default = 1.0 }
+star_scale = { type = "float", description = "PUBLISHED star opacity multiplier (clouds hide stars) — applied by time_of_day.rhai", default = 1.0 }
+tint_mul = { type = "float", description = "PUBLISHED cloud_tint rgb multiplier (storm-dark clouds) — applied by time_of_day.rhai", default = 1.0 }
+tint_alpha = { type = "float", description = "PUBLISHED cloud_tint alpha floor 0..1 — applied by time_of_day.rhai", default = 0.0 }
+ocean_dark = { type = "float", description = "PUBLISHED ocean palette multiplier (gray-green storm sea) — applied by time_of_day.rhai", default = 1.0 }
+flash = { type = "float", description = "PUBLISHED lightning flash 0..1 this frame — applied by time_of_day.rhai (sun/cloud whiteout)", default = 0.0 }
+transition_s = { type = "float", description = "Seconds for the sky to cross one whole state step", default = 60.0 }
+wind_tau_s = { type = "float", description = "Wind response time constant (s) — wind chases the sky", default = 20.0 }
+sea_build_tau_s = { type = "float", description = "Sea build time constant (s) — the swell chases the wind, slowly", default = 120.0 }
+sea_decay_tau_s = { type = "float", description = "Sea decay time constant (s) — the dying swell outlives the storm", default = 240.0 }
+gust_strength = { type = "float", description = "Gust depth as a fraction of mean wind (scales with state)", default = 0.15 }
+amp_storm = { type = "float", description = "Storm amplitude ceiling (m, total crest budget) — the single drama dial", default = 5.5 }
+rain_rate_max = { type = "float", description = "Rain emitter particles/sec at full storm", default = 4000.0 }
+strike_min_s = { type = "float", description = "Minimum seconds between lightning strikes in a storm", default = 6.0 }
+strike_max_s = { type = "float", description = "Maximum seconds between lightning strikes in a storm", default = 25.0 }
+near_strike_chance = { type = "float", description = "Chance a strike rolls near (150-400 m) instead of far (500-3000 m)", default = 0.2 }
+raft_assist = { type = "float", description = "Scales the storm boost to raft heave/angular response (0 = raw calm-sea inertia)", default = 1.0 }
+debug_log = { type = "bool", description = "Print the cascade (state/wind/sea → amplitude) once a second", default = false }
