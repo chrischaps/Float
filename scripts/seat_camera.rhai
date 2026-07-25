@@ -16,12 +16,14 @@
 // With animated_scoot (default), A/D triggers discrete scoot STEPS
 // synced to the body's skeletal clips: travel follows the clip's
 // weight-shift phase, the eye inherits the pelvis lift (step_bob), and
-// held keys chain steps with a rest between — a shuffle, not a slide.
+// a step ALWAYS plays to completion. A key still held at the end chains
+// the next step immediately (step_dir stays non-zero, step_seq ticks);
+// step_pause only rests a step that follows a release.
 // animated_scoot = false restores the original continuous slide.
 //
 // The raft-local seat point + outward heading + step state are written
 // back to this entity's seat component (seat_x / seat_z / seat_out_deg /
-// step_dir) so body.rhai places the body and fires the clips from the
+// step_dir / step_seq) so body.rhai places the body and fires the clips from the
 // SAME state — the eye and the body can never drift apart. (body is
 // declared after seat_camera in the scene so it reads this frame's
 // values.)
@@ -40,7 +42,8 @@ let scoot_s = 0.0;      // arc length along the perimeter (m, 0 = +Z mid)
 let scoot_vel = 0.0;    // scoot velocity (m/s; slewed in continuous mode)
 let step_dir = 0.0;     // -1/0/+1: scoot step in progress (animated mode)
 let step_t = 0.0;       // seconds into the current step
-let pause_left = 0.0;   // rest before the next chained step
+let step_seq = 0.0;     // increments on every step START (chained or not)
+let pause_left = 0.0;   // rest before a step that follows a released key
 
 const STICK_SPEED = 2.4;   // rad/s at full deflection
 const PITCH_MIN = -1.3;    // ~-75 deg (down at your legs)
@@ -153,6 +156,18 @@ fn on_update() {
         captured_once = true;
     }
 
+    // Title card (title.rhai): while its published `locked` factor is up,
+    // look and scoot INPUT are ignored — but everything below still runs,
+    // so the raft's heave keeps moving the eye and the world drifts
+    // behind the card. One-frame-stale cross-script read is fine for a
+    // signal this slow.
+    let ui_locked = false;
+    let tc = get_entity("title_controller");
+    if tc >= 0 {
+        let lk = get_field(tc, "title", "locked");
+        if lk != () && lk > 0.5 { ui_locked = true; }
+    }
+
     // ── Scoot along the deck edge ───────────────────────────────────
     // Animated mode (default): A/D triggers a discrete scoot STEP.
     // body.rhai plays the matching scoot clip (it watches step_dir);
@@ -166,15 +181,17 @@ fn on_update() {
     if animated {
         let step_time = get_field(me, "seat", "step_time");
         let step_dist = get_field(me, "seat", "step_distance");
-        let input = action_value("scoot");
+        let input = if ui_locked { 0.0 } else { action_value("scoot") };
         pause_left -= dt;
         if step_dir == 0.0 && pause_left <= 0.0 {
             if input > 0.35 {
                 step_dir = 1.0;
                 step_t = 0.0;
+                step_seq += 1.0;
             } else if input < -0.35 {
                 step_dir = -1.0;
                 step_t = 0.0;
+                step_seq += 1.0;
             }
         }
         scoot_vel = 0.0;
@@ -193,13 +210,27 @@ fn on_update() {
             eye_bob = get_field(me, "seat", "step_bob")
                 * sstep((u - 0.21) / 0.25) * (1.0 - sstep((u - 0.55) / 0.35));
             if step_t >= step_time {
-                step_dir = 0.0;
-                pause_left = get_field(me, "seat", "step_pause");
+                // The clip always plays to completion. If the key is
+                // still held the same way, roll STRAIGHT into the next
+                // step: step_dir never touches 0, so body.rhai never
+                // drops to an idle variant between chained steps (that
+                // dropout is what read as the clip "restarting"). The
+                // scoot clip starts and ends on the neutral pose, so the
+                // repeat is seamless. Only a released key rests.
+                let held = if step_dir > 0.0 { input > 0.35 }
+                           else { input < -0.35 };
+                if held {
+                    step_t -= step_time;   // carry the overshoot, no drift
+                    step_seq += 1.0;
+                } else {
+                    step_dir = 0.0;
+                    pause_left = get_field(me, "seat", "step_pause");
+                }
             }
         }
     } else {
         // Continuous fallback: the original M6 slide.
-        let want = action_value("scoot") * scoot_speed;
+        let want = if ui_locked { 0.0 } else { action_value("scoot") * scoot_speed };
         scoot_vel += (want - scoot_vel) * clamp(scoot_ease * dt, 0.0, 1.0);
         scoot_s += scoot_vel * dt;
     }
@@ -222,8 +253,10 @@ fn on_update() {
     // character.rs): with dir = (sin(yaw), _, cos(yaw)), increasing yaw
     // turns toward +X = screen-LEFT, so mouse-right must decrease yaw.
     // Mouse-forward (negative dy) must increase pitch (look up).
-    look_yaw -= mouse_delta_x() * sens + action_value("look_x") * STICK_SPEED * dt;
-    look_pitch -= mouse_delta_y() * sens + action_value("look_y") * STICK_SPEED * dt;
+    if !ui_locked {
+        look_yaw -= mouse_delta_x() * sens + action_value("look_x") * STICK_SPEED * dt;
+        look_pitch -= mouse_delta_y() * sens + action_value("look_y") * STICK_SPEED * dt;
+    }
     look_yaw = clamp(look_yaw, -YAW_LIMIT, YAW_LIMIT);
     look_pitch = clamp(look_pitch, PITCH_MIN, PITCH_MAX);
 
@@ -327,4 +360,5 @@ fn on_update() {
     set_field(me, "seat", "seat_z", seat_pt.z);
     set_field(me, "seat", "seat_out_deg", rad_to_deg(out_yaw));
     set_field(me, "seat", "step_dir", step_dir);
+    set_field(me, "seat", "step_seq", step_seq);
 }

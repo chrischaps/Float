@@ -1,0 +1,16 @@
+[component.title]
+description = "Opening title card (scripts/title.rhai): ADRIFT + Press Any Key over the drifting world; camera stays locked until any input"
+
+[component.title.fields]
+enabled = { type = "bool", description = "false skips the card entirely (camera unlocked from frame 1)", default = true }
+min_show_s = { type = "float", description = "Input is ignored for this long after load — a buffered launch keystroke shouldn't skip the card unseen", default = 0.75 }
+fade_in_s = { type = "float", description = "Title fade-in duration (s)", default = 2.5 }
+sub_delay_s = { type = "float", description = "Press Any Key starts fading in this long after the title (s)", default = 1.6 }
+fade_out_s = { type = "float", description = "Fade-out after the dismissing keypress (s)", default = 2.2 }
+title_frac = { type = "float", description = "Title width as a fraction of screen width", default = 0.44 }
+
+# PUBLISHED by title.rhai (whale/seat factor pattern): 1 while the card is
+# up, 0 the moment a key lands. seat_camera.rhai ignores look/scoot input
+# while > 0.5. Listed in the scene block so the first-frame read is never
+# unit (schema defaults do not materialize fields).
+locked = { type = "float", description = "RUNTIME: 1 = camera input locked (card showing), 0 = released", default = 1.0 }

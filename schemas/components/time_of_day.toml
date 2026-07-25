@@ -6,3 +6,5 @@ time_hours = { type = "float", description = "Current time of day, 0-24 (0 = mid
 day_length_sec = { type = "float", description = "Real seconds per full 24h cycle", default = 600.0 }
 auto_advance = { type = "boolean", description = "Advance time naturally; off = frozen at time_hours", default = true }
 sun_path_tilt_deg = { type = "float", description = "Tilt of the sun arc from vertical (higher = lower sun all day)", default = 28.0 }
+day = { type = "float", description = "Current day number; day 0 is the title day (loops while title.locked is up) and drives the first-days day-length ramp", default = 0.0 }
+last_hours = { type = "float", description = "time_hours seen last frame (wrap/scrub detection for the day counter)", default = 10.5 }
