@@ -1,0 +1,28 @@
+[component.raft_visitor]
+description = "The Visitor (scripts/raft_visitor.rhai): a weathered twin raft drifts up out of the haze around noon of day 1 (the first counted day after the title's looping day 0), holds a companionable distance, then drifts away. Rare return visits on later days."
+
+[component.raft_visitor.fields]
+enabled = { type = "bool", description = "Master switch for the visit event", default = true }
+first_day = { type = "float", description = "In-game day of the guaranteed first visit (day 0 = the looping title day, day 1 = the first counted day)", default = 1.0 }
+window_start = { type = "float", description = "Visit window start (game hours) — around noon", default = 11.5 }
+window_end = { type = "float", description = "Visit window end (game hours)", default = 13.0 }
+return_chance = { type = "float", description = "Chance of a return visit, rolled once per day after the first visit (0-1)", default = 0.15 }
+bearing_deg = { type = "float", description = "Base approach bearing from the player's raft (deg; clear of the whale's 278° sunset band)", default = 60.0 }
+bearing_spread_deg = { type = "float", description = "Random bearing variation (±deg)", default = 40.0 }
+spawn_distance = { type = "float", description = "Distance it materializes at (m) — beyond fog_start so it comes out of the haze", default = 140.0 }
+hold_distance = { type = "float", description = "Companionable holding range (m)", default = 18.0 }
+approach_duration_s = { type = "float", description = "Approach length (real seconds)", default = 90.0 }
+hold_duration_s = { type = "float", description = "How long it stays alongside (real seconds)", default = 150.0 }
+depart_duration_s = { type = "float", description = "Departure length (real seconds)", default = 110.0 }
+depart_turn_deg = { type = "float", description = "Departure bearing offset from the approach bearing (±, random sign) — it leaves on a different line than it came", default = 70.0 }
+wander_amp_m = { type = "float", description = "Slow radial wander amplitude during hold (m) — never anchored", default = 2.0 }
+draft = { type = "float", description = "How deep the logs sit below the sampled surface (m); a touch lower than the player's raft — waterlogged", default = 0.10 }
+heave_response = { type = "float", description = "Vertical follow rate (1/s); lower = heavier, lazier than the player's raft", default = 2.6 }
+angular_response = { type = "float", description = "Pitch/roll follow rate (1/s)", default = 3.0 }
+lap_volume = { type = "float", description = "Volume of its faint spatial log-lap one-shots", default = 0.25 }
+lap_min_gap_s = { type = "float", description = "Minimum gap between lap attempts (real seconds)", default = 2.5 }
+creak_volume = { type = "float", description = "Volume of its occasional spatial creaks", default = 0.18 }
+trigger_visit = { type = "float", description = "Debug one-shot: set >= 0.5 to fire a visit immediately (bypasses day/window/storm); the script consumes and resets it", default = -1.0 }
+debug_log = { type = "bool", description = "Log day ticks, phase transitions, and fired audio", default = false }
+phase = { type = "float", description = "PUBLISHED by the script (read-only): 0 away, 1 approaching, 2 holding, 3 departing — shown in the F3 Visitor panel", default = 0.0 }
+day = { type = "float", description = "PUBLISHED by the script (read-only): mirrors the tod day counter (falls back to its own derived count in scenes without one) — shown in the F3 Visitor panel", default = 0.0 }
