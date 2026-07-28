@@ -306,6 +306,24 @@ extra voice, so it can be dramatic.
 > soft long roll with slow swells of low frequency, no crack, barely
 > more than a vibration, fading into the sound of the sea.
 
+### dunk_in_1/2.ogg — head under (~0.9 s one-shot, peak ~0.8)
+
+Played by `water_ambience.rhai` the instant a swell buries the eye
+(render mode 5). Heard from the WET side — the script's lowpass takes
+over immediately after, so the asset itself should already sound half
+underwater.
+
+> A head plunging under the ocean surface, heard from underwater: a
+> soft muffled whomp of entry, a deep sub thump, bubbles streaming past
+> the ears, everything dark and pressure-muffled, no bright splash, no
+> voice. Very short.
+
+### dunk_out_1/2.ogg — head clear (~1.2 s one-shot, peak ~0.7)
+
+> Surfacing from underwater: water sheeting and draining off a head as
+> it breaks the surface, bright close droplet spray, a single high
+> plip, the open air rushing back in, no gasp, no voice. Very short.
+
 ## Future milestones (generate later, no hooks yet)
 
 - **M6 scooting:** "Hands and fabric shuffling slowly across rough

@@ -44,6 +44,9 @@ let step_dir = 0.0;     // -1/0/+1: scoot step in progress (animated mode)
 let step_t = 0.0;       // seconds into the current step
 let step_seq = 0.0;     // increments on every step START (chained or not)
 let pause_left = 0.0;   // rest before a step that follows a released key
+let uw_active = false;  // underwater hysteresis gate (see block below)
+let uw_mix = 0.0;       // eased mode-5 mix: ~1-frame attack, short release
+let last_sub = -1.0;    // write guard for the published submerged factor
 
 const STICK_SPEED = 2.4;   // rad/s at full deflection
 const PITCH_MIN = -1.3;    // ~-75 deg (down at your legs)
@@ -354,6 +357,68 @@ fn on_update() {
 
     set_camera_position(eye_x, eye_y, eye_z);
     set_camera_target(eye_x + dir_x, eye_y + dir_y, eye_z + dir_z);
+
+    // ── Underwater moments: a swell buries the eye (render mode 5) ──
+    // Detection lives HERE, not in its own script: this is the only place
+    // the eye position exists THIS frame (set_field publishes are a frame
+    // stale — fine for the audio muffle, too late for the attack frame).
+    // set_render_mode is transient: called only while active; the player
+    // heals the frame the calls stop. reality.rhai yields the slot by
+    // watching the published `submerged` factor.
+    let d = ocean_height(eye_x, eye_z) - eye_y;   // + = eye under water
+    let force = get_field(me, "seat", "force_submerge_s");
+    if force != () && force > 0.0 {
+        d = 0.4;
+        set_field(me, "seat", "force_submerge_s", force - dt);
+    }
+    // Hysteresis: arm while the waterline can reach the frame (the near
+    // plane sees ~±0.08 m around the eye, plus wave slope), disarm well
+    // below — chop modulates the on-screen LINE, never this gate.
+    if uw_active {
+        if d < -0.25 { uw_active = false; }
+    } else if d > -0.15 {
+        uw_active = true;
+    }
+    if uw_active {
+        uw_mix += (1.0 - uw_mix) * clamp(dt / 0.03, 0.0, 1.0);
+    } else if uw_mix > 0.0 {
+        let rel = get_field(me, "seat", "submerge_release_s");
+        uw_mix -= uw_mix * clamp(dt / rel, 0.0, 1.0);
+        if uw_mix < 0.005 { uw_mix = 0.0; }
+    }
+    if uw_mix > 0.001 {
+        // Context for the shader: sea energy (murk turbidity), daylight
+        // (shaft/murk brightness), biolum (night specks) — all TOD/
+        // weather-driven upstream, never constants (wildlife light rule).
+        let oent = get_entity("ocean");
+        let energy = 0.3;
+        let glow = 0.0;
+        if oent >= 0 {
+            let amp = get_field(oent, "ocean", "amplitude");
+            let chop = get_field(oent, "ocean", "choppiness");
+            if amp != () && chop != () {
+                energy = clamp(amp * (0.5 + 0.5 * chop) / 3.5, 0.0, 1.0);
+            }
+            let fg = get_field(oent, "ocean", "foam_glow");
+            if fg != () { glow = clamp(fg, 0.0, 1.0); }
+        }
+        let daylight = 1.0;
+        let sun = get_entity("sun");
+        if sun >= 0 {
+            let si = get_field(sun, "light", "intensity");
+            if si != () { daylight = clamp(si / 2.0, 0.0, 1.0); }
+        }
+        set_render_mode(5, uw_mix);
+        set_render_mode_params(d, energy, daylight, glow);
+    }
+    // Published factor for water_ambience (muffle/duck) and reality
+    // (slot yield). One-frame stale is fine for both readers.
+    let full_m = get_field(me, "seat", "submerge_full_m");
+    let sub_now = clamp(d / full_m, 0.0, 1.0);
+    if abs(sub_now - last_sub) > 0.005 || (sub_now <= 0.0 && last_sub > 0.0) {
+        set_field(me, "seat", "submerged", sub_now);
+        last_sub = sub_now;
+    }
 
     // ── Publish scoot state for body.rhai ───────────────────────────
     set_field(me, "seat", "seat_x", seat_pt.x);

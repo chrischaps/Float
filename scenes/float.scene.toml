@@ -191,7 +191,7 @@ debug_log = false
 [entities.dead_calm_controller.script]
 source = "dead_calm.rhai"
 
-# ── Opening title card (title.rhai): ADRIFT + Press Any Key over the
+# ── Opening title card (title.rhai): SET + DRIFT / PRESS ANY KEY over the
 #    living world. Look/scoot input stays locked (seat_camera.rhai reads
 #    the published `locked` factor) until the first keypress fades the
 #    card out. Sprites regenerate via tools/generate_title.py. ───────────
@@ -203,7 +203,7 @@ min_show_s = 0.75
 fade_in_s = 2.5
 sub_delay_s = 1.6
 fade_out_s = 2.2
-title_frac = 0.44
+title_frac = 0.60      # 11 glyphs vs ADRIFT's 6 — wider card, same weight
 locked = 1.0           # PUBLISHED (script-owned): 0 the moment a key lands
 [entities.title_controller.script]
 source = "title.rhai"
@@ -752,6 +752,12 @@ body_seat_y = 0.28     # shared with body.rhai — body origin above raft origin
 deck_top = 0.26
 roll_transfer = 0.45
 mouse_sens = 0.0028
+# Underwater moments (render mode 5) — every field the script reads must
+# be listed here (schema defaults do NOT materialize; unit-read throws).
+submerge_full_m = 0.15    # eye depth (m) where the published factor saturates
+submerge_release_s = 0.12 # effect release after the swell clears the eye
+force_submerge_s = 0.0    # DEBUG one-shot: >0 forces N seconds submerged
+submerged = 0.0           # RUNTIME published factor (water_ambience, reality)
 [entities.seat_camera.camera_tuning]
 fov_deg = 75.0         # F3 Camera panel tunes this live. 75° + the ~10°-down
                        # resting gaze puts the raised knees just inside the

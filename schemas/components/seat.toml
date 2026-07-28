@@ -24,6 +24,13 @@ deck_top = { type = "float", description = "Deck surface height above the raft o
 roll_transfer = { type = "float", description = "Fraction of raft roll transferred to the camera (0-1)", default = 0.3 }
 mouse_sens = { type = "float", description = "Mouse look sensitivity (rad per count)", default = 0.0028 }
 
+# Underwater moments (render mode 5): seat_camera.rhai detects the eye
+# dipping under a swell and drives the transient underwater effect.
+submerge_full_m = { type = "float", description = "Eye depth below the local surface (m) at which the published submerged factor saturates to 1", default = 0.15 }
+submerge_release_s = { type = "float", description = "Underwater effect release ease (s) after the eye clears the hysteresis band", default = 0.12 }
+force_submerge_s = { type = "float", description = "DEBUG one-shot: seconds of forced submersion (eye treated as 0.4 m deep); the script decrements it", default = 0.0 }
+submerged = { type = "float", description = "RUNTIME: published 0..1 eye-submersion factor — water_ambience.rhai muffles/ducks off it, reality.rhai yields the render-mode slot", default = 0.0 }
+
 # Written by seat_camera.rhai every frame; read by body.rhai so the
 # body is placed from the SAME scoot state as the eye. Not hand-tuned.
 seat_x = { type = "float", description = "RUNTIME: raft-local seat X on the scoot path", default = 0.0 }

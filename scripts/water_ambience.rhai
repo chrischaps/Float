@@ -29,6 +29,9 @@ let cur_ocean = -1.0;   // <0 = adopt current scene value on first frame
 let cur_wind = -1.0;
 let last_ocean = -1.0;
 let last_wind = -1.0;
+let last_sub_lvl = 0.0; // plunge/emerge edge detection (seat.submerged)
+let dunk_cd = 0.0;      // shared one-shot refractory: chop can't machine-gun
+let drip_t = -1.0;      // pending drip tail after an emerge
 
 fn sstep(t) {
     let c = clamp(t, 0.0, 1.0);
@@ -49,6 +52,17 @@ fn on_update() {
     let raft = get_entity("raft");
     let ocean = get_entity("ocean");
     if raft < 0 || ocean < 0 { return; }
+
+    // ── Submersion factor: seat_camera publishes seat.submerged while a
+    // swell buries the eye (one-frame stale — fine for audio). Everything
+    // below composes it at THIS script's own write sites (the published-
+    // factor pattern); no second writer for the lowpass or bed volumes.
+    let sub = 0.0;
+    let sce = get_entity("seat_camera");
+    if sce >= 0 {
+        let sb = get_field(sce, "seat", "submerged");
+        if sb != () && sb > 0.0 { sub = clamp(sb, 0.0, 1.0); }
+    }
 
     let wash_max = get_field(me, "water_ambience", "wash_max");
     let wash_v_ref = get_field(me, "water_ambience", "wash_v_ref");
@@ -112,7 +126,9 @@ fn on_update() {
         let went = get_entity(global::WASHES[e]);
         if went >= 0 {
             set_position(went, ex[e], h, ez[e]);
-            let vol = cur_wash[e] * wash_max;
+            // Half-duck underwater: the washes are AT the surface, so a
+            // buried ear still hears them, just through the water.
+            let vol = cur_wash[e] * wash_max * (1.0 - 0.5 * sub);
             if abs(vol - last_wash[e]) > 0.002 {
                 set_field(went, "audio_source", "volume", vol);
                 last_wash[e] = vol;
@@ -132,7 +148,8 @@ fn on_update() {
     let fent = get_entity("foam_fizz");
     if fent >= 0 {
         set_position(fent, rp["x"], ocean_height(rp["x"], rp["z"]), rp["z"]);
-        let vol = clamp(cur_fizz, 0.0, 1.5) * fizz_max;
+        // Fizz is an air-side sound — it nearly vanishes underwater.
+        let vol = clamp(cur_fizz, 0.0, 1.5) * fizz_max * (1.0 - 0.8 * sub);
         if abs(vol - last_fizz) > 0.002 {
             set_field(fent, "audio_source", "volume", vol);
             last_fizz = vol;
@@ -162,10 +179,14 @@ fn on_update() {
         set_field(oent, "audio_source", "volume", cur_ocean);
         last_ocean = cur_ocean;
     }
+    // Wind dies with the ears under the surface (ducked at the write, not
+    // through the slow bed slew — a sub-second dunk must be heard). The
+    // ocean bed stays: it reads as body-conducted rumble.
     let went2 = get_entity("wind_ambience");
-    if went2 >= 0 && abs(cur_wind - last_wind) > 0.002 {
-        set_field(went2, "audio_source", "volume", cur_wind);
-        last_wind = cur_wind;
+    let wind_out = cur_wind * (1.0 - 0.8 * sub);
+    if went2 >= 0 && abs(wind_out - last_wind) > 0.002 {
+        set_field(went2, "audio_source", "volume", wind_out);
+        last_wind = wind_out;
     }
 
     // ── Proximity lowpass: the mix darkens as the water nears the eye.
@@ -181,5 +202,34 @@ fn on_update() {
     let cam = get_camera_position();
     let clearance = cam["y"] - ocean_height(cam["x"], cam["z"]);
     let open = sstep(clearance / lp_dist);
-    set_audio_lowpass((lp_hz + (20000.0 - lp_hz) * open) * lp_scale);
+    let prox_hz = (lp_hz + (20000.0 - lp_hz) * open) * lp_scale;
+    // Underwater muffle: min() against the proximity result so a drunk
+    // tear's lowpass_scale and a dunk never multiply into sub-audible mud.
+    let uw_hz = 20000.0 + (400.0 - 20000.0) * sstep(sub);
+    set_audio_lowpass(if uw_hz < prox_hz { uw_hz } else { prox_hz });
+
+    // ── Plunge / emerge one-shots. Thresholds sit inside the visual
+    // hysteresis band on purpose (independent — the picture can flicker
+    // a waterline while the sound stays put), and a shared refractory
+    // keeps chop from machine-gunning the pair.
+    dunk_cd -= dt;
+    if sub > 0.65 && last_sub_lvl <= 0.65 && dunk_cd <= 0.0 {
+        let n = if random_range(0.0, 1.0) < 0.5 { 1 } else { 2 };
+        play_sound(`dunk_in_${n}`, 0.85);
+        dunk_cd = 0.8;
+    }
+    if sub < 0.35 && last_sub_lvl >= 0.35 && dunk_cd <= 0.0 {
+        let n = if random_range(0.0, 1.0) < 0.5 { 1 } else { 2 };
+        play_sound(`dunk_out_${n}`, 0.8);
+        drip_t = 0.35;             // the drip tail lands just after the sheet
+        dunk_cd = 0.8;
+    }
+    if drip_t >= 0.0 {
+        drip_t -= dt;
+        if drip_t < 0.0 {
+            let n = 1 + random_range(0.0, 3.999).to_int();
+            play_sound(`drip_${n}`, 0.5);
+        }
+    }
+    last_sub_lvl = sub;
 }

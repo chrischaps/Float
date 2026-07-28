@@ -304,9 +304,15 @@ stays glassy, swells back on release). Birds + reality tears sit out
 `dead_calm_panel.rs`, visitor-pattern): status + "Calm now"/"End now"
 one-shots (`trigger_calm`/`end_now`).
 Title card ✅: `title.rhai` (title_controller entity) draws pre-rendered
-sprites (`tools/generate_title.py` → `sprites/title_adrift.png` +
-`title_presskey.png`; the ASPECT consts in the script must match what the
-generator prints) via `on_draw_ui`/`draw_sprite_ex`. The world runs live
+sprites (`tools/generate_title.py` → `sprites/title_setdrift.png` +
+`title_presskey.png`; the ASPECT/SUB_REL_W consts in the script must match
+what the generator prints) via `on_draw_ui`/`draw_sprite_ex`. The title is
+**SET + DRIFT** — the navigator's pair for the direction a current carries
+you and how fast (it was ADRIFT through the first milestones; grep that
+name if something looks stale). 11 glyphs vs 6 means tighter tracking
+(0.42 em) and a wider card (`title_frac` 0.60) to hold the same optical
+weight; the `+` gets a 0.05 em lift (`RISE_EM`) because the font's math
+axis sits low against caps. The world runs live
 behind the card — day 0 loops beneath it (see Day-length ramp) and
 only look/scoot INPUT is gated: the script publishes
 `title.locked`, `seat_camera.rhai` reads it (whale-factor pattern). First
@@ -338,6 +344,44 @@ increment inside the advance loop). Scenes that don't list
 `day`/`last_hours` skip the ramp and run flat. `raft_visitor.rhai`
 mirrors the tod-published `day` (its own derived counter is only the
 fallback for ramp-less scenes).
+
+Underwater moments ✅: when a swell buries the eye (the raft's smoothed
+heave can't chase a steep face) the frame goes truly underwater instead
+of no-clip — **render mode 5** on the reality-tear rails, but NOT a tear:
+no tear_mask; the composite masks per pixel by a WATERLINE tested against
+the plane `camera_y + mode_params.x` (near-plane world reconstruction),
+with a wobbled hard white foam lip on the line, 3-step banded murk
+absorption (cel, not exponential), two-step light shafts, Snell-window
+brightening, biolum specks when `foam_glow` is up, and a mode-5 UV sway
+(hook A) that only engages once genuinely submerged so a straddle frame's
+air half stays steady. Param contract: x = signed eye depth m
+(+ = under), y = sea energy 0..1, z = daylight (from live
+`sun.light.intensity`), w = biolum. Ocean shader: `front_facing` now
+feeds an ALWAYS-ON underside fix (flip N for ndv/fresnel, kill sky
+reflection + specular on back faces — the old opaque sky-mirror was the
+no-clip look; script-less renders benefit too) plus a mode-5 back-face
+palette remap (murk blues, luminous white foam panes, 2 bands).
+DETECTION LIVES IN seat_camera.rhai — the only place the eye position
+exists this frame (published fields are a frame stale = too late for the
+attack frame): `d = ocean_height(eye) - eye_y`, hysteresis −0.15/−0.25 m
+(the near plane sees the line before the eye is wet; chop moves the LINE,
+never the gate), ~1-frame attack / `submerge_release_s` release, calls
+`set_render_mode(5, mix)` ONLY while active (transient — dead script =
+healed), publishes `seat.submerged` 0..1. reality.rhai yields: skips its
+set_render_mode calls AND scheduling while `submerged > 0.01` (envelope
+keeps ticking; sticky drunk FX ride through). water_ambience.rhai owns
+the audio: lowpass = `min(proximity·lp_scale, 400 Hz muffle)` (min, not
+multiply — a drunk tear and a dunk must not stack sub-audible), wind/fizz
+duck 80% / washes 50% at their write sites (ocean bed stays — bodily
+rumble), `dunk_in_*`/`dunk_out_*` one-shots on 0.65↑/0.35↓ crossings with
+a shared 0.8 s refractory + drip tail (thresholds independent of the
+visual hysteresis). Debug: `seat.force_submerge_s` one-shot fakes 0.4 m
+for N seconds; headless `--render-mode 5 --mode-mix 1 --mode-params
+0.7,0.5,1,0` + `scenes/snap_underwater.scene.toml` (render runs no
+scripts — the CLI flags ARE the fixture; camera targets under the
+surface are hit-or-miss vs the t=0 wave phase, check the no-mode render
+first). New fields must be LISTED in the scene seat block (schema
+defaults don't materialize).
 
 Polish backlog: real M6/M8 + weather SFX from
 `specs/elevenlabs_audio_prompts.md`; playtest pass on the body detail

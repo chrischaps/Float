@@ -1,0 +1,102 @@
+# Underwater-moment fixture — bright noon over a heavy (but not storm-
+# gray) sea, for eyeballing render mode 5: the composite murk/waterline/
+# shafts and the ocean shader's underside "ceiling". `flint render` runs
+# no scripts, so the CLI flags ARE the fixture — the orbit camera is
+# placed under the surface and the mode params are passed by hand
+# (x = signed eye depth m, y = sea energy, z = daylight, w = biolum).
+#
+# Fully submerged (murk + ceiling + shafts):
+#   flint render scenes/snap_underwater.scene.toml --schemas engine\schemas \
+#     --schemas schemas --output snapshots/underwater.png --no-grid \
+#     --distance 0.4 --pitch 5 --yaw 35 --target 0,-1.2,0 \
+#     --render-mode 5 --mode-mix 1.0 --mode-params 0.7,0.5,1,0
+#
+# Straddling the line (waterline + foam lip across the frame):
+#   ... --target 0,0.3,0 --pitch 2 --mode-params -0.05,0.5,1,0
+#
+# Back-face fix alone (no mode flags): same camera, no --render-mode —
+# the surface from below must read as a dim ceiling, never a sky mirror.
+
+[scene]
+name = "Float — underwater fixture"
+version = "0.1"
+description = "Noon heavy sea for render-mode-5 underwater snapshots"
+
+[post_process]
+enabled = true
+bloom_enabled = true
+bloom_intensity = 0.06
+bloom_threshold = 1.0
+vignette_enabled = true
+vignette = 0.18
+fog_enabled = true
+fog_color = [0.70, 0.82, 0.92]
+fog_density = 0.0015
+fog_start = 60.0
+
+[entities.sun]
+[entities.sun.light]
+type = "directional"
+direction = [0.35, 0.75, -0.45]
+color = [1.0, 0.96, 0.86]
+intensity = 1.5
+
+[entities.sky_dome]
+[entities.sky_dome.sky]
+zenith_color = [0.10, 0.32, 0.70, 1.0]
+horizon_color = [0.55, 0.75, 0.90, 1.0]
+haze_color = [0.80, 0.88, 0.95, 0.55]
+cloud_tint = [1.0, 1.0, 1.0, 0.85]
+sun_disc_size = 0.035
+sun_glow = 1.0
+star_opacity = 0.0
+cloud_coverage = 0.38
+cloud_density = 0.22
+cloud_scale = 0.9
+cloud_drift_x = 0.004
+cloud_drift_y = 0.0015
+
+# Day palette from float.scene.toml, sea pumped to a burying swell
+# (amplitude 4.0 with storm-band wind/fetch so the long bins carry it).
+[entities.ocean]
+[entities.ocean.ocean]
+seed = 7
+num_waves = 16
+wavelength_min = 5.0
+wavelength_max = 110.0
+amplitude = 4.0
+choppiness = 0.9
+direction_deg = 155.0
+spread_deg = 40.0
+speed_scale = 1.0
+wind_speed = 18.0
+fetch_km = 220.0
+peak_enhancement = 3.3
+deep_color = [0.016, 0.14, 0.5, 1.0]
+shallow_color = [0.10, 0.46, 0.85, 1.0]
+foam_color = [0.97, 0.99, 1.0, 1.0]
+sss_color = [0.05, 0.45, 0.5, 1.0]
+foam_threshold = 0.78
+foam_noise_scale = 0.58
+ramp_steps = 6.0
+specular_strength = 1.0
+band_wobble = 0.6
+band_dither = 0.11
+band_dither_scale = 16.0
+turbidity = 0.8
+refraction_strength = 0.6
+absorption_color = [0.9, 0.35, 0.22]
+sky_reflection_strength = 0.45
+grid_scale = 60.0
+fade_start = 90.0
+fade_end = 170.0
+foam_glow_color = [0.35, 0.95, 0.75, 1.0]
+foam_glow = 0.0
+rain_ripple = 0.0
+
+# Scale reference: the raft riding overhead when the camera is under.
+[entities.raft]
+[entities.raft.transform]
+position = [0.0, 0.05, 0.0]
+[entities.raft.model]
+asset = "raft"

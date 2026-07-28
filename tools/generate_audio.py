@@ -298,6 +298,46 @@ def gen_settle():
         write(f"settle_{i}.ogg", normalize(x, 0.5))
 
 
+# ── Dunks: the PLAYER's head going under / coming up (water_ambience) ───
+# The eye-submersion moments (render mode 5). dunk_in is heard from the
+# wet side of the surface: a soft entry whomp, a sub thump, and a body
+# that is ALREADY muffled — the script's lowpass takes over from there.
+# dunk_out is the air side snapping back: a sheet draining off the face,
+# bright spray, one high plip.
+def gen_dunk():
+    for i in range(1, 3):
+        dur = rng.uniform(0.8, 1.0)
+        n = int(SR * dur)
+        t = np.arange(n) / SR
+        entry_n = int(SR * rng.uniform(0.012, 0.020))
+        entry = np.zeros(n)
+        entry[:entry_n] = rng.standard_normal(entry_n) * np.linspace(1, 0, entry_n)
+        entry = lowpass(entry, 2400)          # the ear is IN the splash
+        thump = np.sin(2 * np.pi * rng.uniform(55, 70) * t) * np.exp(-t * 5) * 0.6
+        body = lowpass(swept_body(n, dur, rng.uniform(400, 600), fall=0.6,
+                                  lo_mul=0.4, hi_mul=1.5), 900) \
+            * np.exp(-t * rng.uniform(3.0, 4.0)) * 0.8
+        x = entry * 0.8 + thump + body
+        for _ in range(rng.integers(2, 5)):
+            x += bubble_chirp(n, rng.uniform(0.05, dur * 0.6),
+                              rng.uniform(300, 500), rng.uniform(100, 180),
+                              rng.uniform(0.08, 0.14), 0.12)
+        write(f"dunk_in_{i}.ogg", normalize(x, 0.8))
+
+    for i in range(1, 3):
+        dur = rng.uniform(1.0, 1.4)
+        n = int(SR * dur)
+        t = np.arange(n) / SR
+        env = np.sin(np.pi * np.clip(t / 0.09, 0, 1)) * (t < 0.09) \
+            + np.exp(-(t - 0.09) * rng.uniform(3.2, 4.2)) * (t >= 0.09)
+        sheet = swept_body(n, dur, rng.uniform(900, 1300), fall=0.6,
+                           lo_mul=0.4, hi_mul=2.0) * env * 0.9
+        x = sheet + droplet_grains(n, rng.uniform(200, 280),
+                                   rng.uniform(3.0, 4.0), hp_hz=3200) * 0.30
+        x += bubble_chirp(n, rng.uniform(0.0, 0.04), 900, 350, 0.05, 0.18)
+        write(f"dunk_out_{i}.ogg", normalize(x, 0.7))
+
+
 # ── Breach splash: the whale coming down, AS HEARD FROM ~130 m ──────────
 # The distance is rendered into the asset (it plays non-spatial — see
 # whale.rhai): across open water, air absorption strips everything
@@ -480,6 +520,7 @@ GENERATORS = {
     "drips": gen_drips,
     "runoff": gen_runoff,
     "settle": gen_settle,
+    "dunk": gen_dunk,
     "breach": gen_breach_splash,
     "wash": gen_wash_loops,
     "fizz": gen_foam_fizz,

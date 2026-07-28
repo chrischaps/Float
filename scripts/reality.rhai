@@ -109,6 +109,18 @@ fn on_update() {
         if phase != 0 && phase != 3 { phase = 3; t = 0.0; }
     }
 
+    // Underwater moments own the render-mode slot while a swell buries the
+    // eye (seat_camera.rhai drives mode 5 with zero latency; script order
+    // is a HashMap, so BOTH of us calling set_render_mode would be a
+    // coin-flip race every frame). One-frame-stale read is fine — worst
+    // case is a single contested frame at the dip boundary.
+    let dunked = false;
+    let sce = get_entity("seat_camera");
+    if sce >= 0 {
+        let sb = get_field(sce, "seat", "submerged");
+        if sb != () && sb > 0.01 { dunked = true; }
+    }
+
     // ── Autonomous scheduling (real seconds, storm-shy like the whale) ──
     if phase == 0 && start_mode == 0 && enabled == true {
         if next_timer < 0.0 {
@@ -132,9 +144,9 @@ fn on_update() {
                 let cf = get_field(dce, "dead_calm", "calm");
                 if cf != () && cf > 0.1 { becalmed = true; }
             }
-            if !stormy && !becalmed { start_mode = pick_mode(me, hours); }
+            if !stormy && !becalmed && !dunked { start_mode = pick_mode(me, hours); }
             if start_mode == 0 {
-                next_timer = 60.0; // storm, calm, or wrong hour — retry soon
+                next_timer = 60.0; // storm, calm, dunk, or wrong hour — retry soon
             }
         }
     } else if phase == 0 && enabled != true {
@@ -204,12 +216,17 @@ fn on_update() {
     // ── Drive the renderer + per-mode side effects ──────────────────────
     let lp_scale = 1.0;
     if phase != 0 {
-        set_render_mode(mode, mix);
-        let rate = if mode == 1 { 6.0 } else { 0.0 };
-        set_render_mode_params(
-            get_field(me, "reality", "mask_scale"),
-            get_field(me, "reality", "mask_style"),
-            rate, 0.0);
+        // Yield the transient slot to the underwater moment; the tear's
+        // envelope keeps ticking and its calls resume when the eye clears
+        // (sticky side effects below stay live either way).
+        if !dunked {
+            set_render_mode(mode, mix);
+            let rate = if mode == 1 { 6.0 } else { 0.0 };
+            set_render_mode_params(
+                get_field(me, "reality", "mask_scale"),
+                get_field(me, "reality", "mask_style"),
+                rate, 0.0);
+        }
 
         if mode == 3 {
             // Drunk: the world leans. FOV breathing on top of the shader's

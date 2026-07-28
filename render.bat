@@ -13,4 +13,7 @@ echo Rendering seated view (approximate player eye, looking down at raft edge)..
 echo Rendering raft overview...
 %FLINT% render %SCENE% %SCHEMAS% --output snapshots\overview.png --width 1280 --height 720 --no-grid --distance 8 --pitch 25 --yaw 35 --target 0,0.3,0
 
+echo Rendering underwater moment (render mode 5, fixture scene)...
+%FLINT% render scenes\snap_underwater.scene.toml %SCHEMAS% --output snapshots\underwater.png --width 1280 --height 720 --no-grid --distance 3 --pitch=-35 --yaw 35 --target 0,0.5,0 --render-mode 5 --mode-mix 1.0 --mode-params 1.2,0.5,1,0
+
 echo Done. Output in snapshots\
