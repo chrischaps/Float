@@ -8,3 +8,7 @@ auto_advance = { type = "boolean", description = "Advance time naturally; off = 
 sun_path_tilt_deg = { type = "float", description = "Tilt of the sun arc from vertical (higher = lower sun all day)", default = 28.0 }
 day = { type = "float", description = "Current day number; day 0 is the title day (loops while title.locked is up) and drives the first-days day-length ramp", default = 0.0 }
 last_hours = { type = "float", description = "time_hours seen last frame (wrap/scrub detection for the day counter)", default = 10.5 }
+# Declares the first-days ramp to the engine's Day / Time panel so it can
+# report the real length of the current day. time_of_day.rhai applies the
+# same curve — keep the two in sync (the script is the one that runs).
+day_length_ramp = { type = "array", description = "Per-day multipliers on day_length_sec, indexed by day; the last entry repeats for every later day. Omit for a flat rate.", default = [0.1, 0.2, 0.4, 0.7, 1.0] }

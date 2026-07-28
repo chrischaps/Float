@@ -74,6 +74,10 @@ auto_advance = true
 sun_path_tilt_deg = 28.0
 day = 0.0               # day 0 = the title day: loops (no midnight advance)
 last_hours = 10.5       #   while title.locked is up, then completes into day 1
+# The opening days pass in a blur. Declared here so the F3 Day / Time panel
+# reports the real length of the current day; time_of_day.rhai applies the
+# same curve (keep them in sync — the script is the one that runs).
+day_length_ramp = [0.1, 0.2, 0.4, 0.7, 1.0]   # 60/120/240/420/600 s at 600
 [entities.tod.script]
 source = "time_of_day.rhai"
 
