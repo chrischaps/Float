@@ -1,0 +1,128 @@
+# ================================================================
+#  FLOAT — snapshot fixture: DEAD CALM
+# ================================================================
+#
+#  `flint render` runs no scripts, so a script-driven event has to be
+#  baked. This is the pre-dawn dead calm (scripts/dead_calm.rhai) held
+#  at its deepest point: the sea collapsed to near-glass and the sky
+#  reflection turned up until the stars come back off the water.
+#
+#  Values here mirror what dead_calm.rhai composes at calm = 1:
+#    amplitude       ~3% of the normal sea (the event's sea_scale floor)
+#    splash_baseline 0     — on glass, a contact ring hugging the raft
+#                            reads as a bug; the event zeroes it
+#    splash_strength 0     — nothing is striking the hull
+#    sky_reflection  0.85  — the star mirror, the whole point of the event
+#
+#  Render:
+#    flint render scenes/snap_calm.scene.toml --schemas engine/schemas \
+#      --schemas schemas --width 2560 --height 1440 --no-grid \
+#      --distance 8 --pitch 6 --yaw 35 --target 0,0.3,0
+# ================================================================
+
+[scene]
+name = "Float — dead calm"
+version = "0.1"
+description = "Pre-dawn stillness: the sea goes to glass and the stars come back"
+input_config = "config/input.toml"
+
+[post_process]
+enabled = true
+bloom_enabled = true
+bloom_intensity = 0.08
+bloom_threshold = 0.9
+vignette_enabled = true
+vignette = 0.20
+fog_enabled = true
+fog_color = [0.014, 0.020, 0.042]
+fog_density = 0.0010
+fog_start = 60.0
+
+# ── Light: pre-dawn, no sun above the horizon yet ────────────────
+
+[entities.sun]
+[entities.sun.light]
+type = "directional"
+direction = [0.2, -0.5, -0.84]
+color = [0.05, 0.07, 0.14]
+intensity = 0.06
+
+# ── Sky: night holding, with the first cold suggestion of dawn low
+#    on the eastern horizon. Stars at full — they are the subject. ──
+
+[entities.sky_dome]
+[entities.sky_dome.sky]
+zenith_color = [0.006, 0.012, 0.038]
+horizon_color = [0.20, 0.17, 0.24]
+haze_color = [0.26, 0.20, 0.24, 0.65]
+cloud_tint = [0.04, 0.05, 0.09, 0.5]
+sun_disc_size = 0.035
+sun_glow = 0.5
+star_opacity = 1.0
+cloud_coverage = 0.08
+cloud_density = 0.14
+cloud_scale = 1.1
+cloud_drift_x = 0.001
+cloud_drift_y = 0.0004
+ambient_sky = [0.05, 0.07, 0.15]
+ambient_ground = [0.020, 0.022, 0.045]
+
+[entities.tod]
+[entities.tod.time_of_day]
+time_hours = 3.4
+day_length_sec = 600.0
+auto_advance = false
+sun_path_tilt_deg = 28.0
+
+# ── The ocean, collapsed to glass ────────────────────────────────
+#    The spectrum SHAPE is untouched (same seed, same band, same
+#    wind/fetch) — dead_calm.rhai only multiplies amplitude, so the
+#    swells return exactly as they were when the event releases.
+
+[entities.ocean]
+[entities.ocean.ocean]
+seed = 7
+num_waves = 12
+wavelength_min = 5.0
+wavelength_max = 70.0
+amplitude = 0.035
+choppiness = 0.30
+direction_deg = 25.0
+spread_deg = 40.0
+speed_scale = 1.0
+wind_speed = 7.0
+fetch_km = 60.0
+peak_enhancement = 3.3
+deep_color = [0.004, 0.014, 0.048]
+shallow_color = [0.010, 0.038, 0.095]
+foam_color = [0.97, 0.99, 1.0, 1.0]
+sss_color = [0.01, 0.05, 0.07, 1.0]
+foam_threshold = 0.62
+foam_noise_scale = 0.35
+ramp_steps = 3.0
+specular_strength = 1.0
+# Event-owned, capture-once/restore-exactly (see dead_calm.rhai):
+splash_baseline = 0.0
+splash_strength = 0.0
+sky_reflection_strength = 0.85
+grid_scale = 60.0
+fade_start = 90.0
+fade_end = 170.0
+
+# ── The raft ─────────────────────────────────────────────────────
+#    On glass the surface sits at ~0, so the static transform lands
+#    the hull on the water without raft.rhai's buoyancy running.
+
+[entities.raft]
+[entities.raft.ocean_contact]
+half_x = 1.2
+half_z = 1.15
+[entities.raft.transform]
+position = [0.0, 0.02, 0.0]
+rotation = [0.0, 0.0, 0.0]
+[entities.raft.model]
+asset = "raft"
+
+# No body in this fixture: body.rhai seats it from the live scoot
+# state, and a hand-placed bind pose floats through the deck. The
+# stillness is the subject anyway.

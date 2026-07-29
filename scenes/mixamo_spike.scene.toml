@@ -1,5 +1,5 @@
 # ================================================================
-#  FLOAT — adrift
+#  FLOAT — set + drift
 # ================================================================
 #
 #  You sit on a hand-lashed raft on an endless ocean. That's it.
@@ -16,7 +16,7 @@
 # ================================================================
 
 [scene]
-name = "Float — adrift"
+name = "Float — set + drift"
 version = "0.1"
 description = "First-person raft on an endless stylized ocean"
 input_config = "config/input.toml"

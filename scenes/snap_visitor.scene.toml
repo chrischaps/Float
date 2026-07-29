@@ -1,0 +1,110 @@
+# ================================================================
+#  FLOAT — snapshot fixture: THE VISITOR
+# ================================================================
+#
+#  `flint render` runs no scripts, so raft_visitor.rhai's approach is
+#  baked here at its holding distance: a weathered twin raft
+#  (models/raft2.glb — same builder, seed 12, grayed palette, a third
+#  of the lashings gone) sitting ~18 m off in a midday haze.
+#
+#  In play this happens around noon of day 1 and lasts a few minutes.
+#  You cannot scrub to it — use the visitor panel's "Visit now".
+#
+#  Render:
+#    flint render scenes/snap_visitor.scene.toml --schemas engine/schemas \
+#      --schemas schemas --width 2560 --height 1440 --no-grid \
+#      --distance 11 --pitch 8 --yaw 60 --target 5,0.5,9
+# ================================================================
+
+[scene]
+name = "Float — the visitor"
+version = "0.1"
+description = "A weathered twin raft holding station out of the haze"
+
+[post_process]
+enabled = true
+bloom_enabled = true
+bloom_intensity = 0.05
+bloom_threshold = 1.0
+vignette_enabled = true
+vignette = 0.16
+fog_enabled = true
+# Heavier than the game default: the haze is what he comes out of.
+fog_color = [0.55, 0.70, 0.84]
+fog_density = 0.0016
+fog_start = 26.0
+
+[entities.sun]
+[entities.sun.light]
+type = "directional"
+direction = [0.15, 0.92, 0.36]
+color = [1.0, 0.97, 0.90]
+intensity = 2.1
+
+[entities.sky_dome]
+[entities.sky_dome.sky]
+zenith_color = [0.24, 0.45, 0.78, 1.0]
+horizon_color = [0.68, 0.80, 0.90, 1.0]
+haze_color = [0.80, 0.86, 0.92, 0.75]
+cloud_tint = [0.95, 0.96, 0.98, 0.8]
+sun_disc_size = 0.030
+sun_glow = 0.8
+star_opacity = 0.0
+cloud_coverage = 0.30
+cloud_density = 0.18
+cloud_scale = 0.9
+cloud_drift_x = 0.004
+cloud_drift_y = 0.0015
+ambient_sky = [0.42, 0.52, 0.68, 1.0]
+ambient_ground = [0.20, 0.22, 0.24, 1.0]
+
+[entities.ocean]
+[entities.ocean.ocean]
+seed = 7
+num_waves = 12
+wavelength_min = 5.0
+wavelength_max = 70.0
+amplitude = 0.85
+choppiness = 0.70
+direction_deg = 25.0
+spread_deg = 40.0
+speed_scale = 1.0
+wind_speed = 7.0
+fetch_km = 60.0
+peak_enhancement = 3.3
+deep_color = [0.055, 0.22, 0.53, 1.0]
+shallow_color = [0.16, 0.51, 0.83, 1.0]
+foam_color = [0.96, 0.99, 1.0, 1.0]
+sss_color = [0.10, 0.75, 0.75, 1.0]
+foam_threshold = 0.62
+foam_noise_scale = 0.35
+ramp_steps = 3.0
+specular_strength = 1.0
+splash_baseline = 0.25
+sky_reflection_strength = 0.8
+grid_scale = 60.0
+fade_start = 90.0
+fade_end = 170.0
+
+# ── Your raft ────────────────────────────────────────────────────
+
+[entities.raft]
+[entities.raft.ocean_contact]
+half_x = 1.2
+half_z = 1.15
+[entities.raft.transform]
+position = [0.0, 0.05, 0.0]
+rotation = [0.0, 0.0, 0.0]
+[entities.raft.model]
+asset = "raft"
+
+# ── His. Bearing 60°, holding ~18 m out, riding a touch lower
+#    (the visitor's deeper draft) and yawed off your heading so it
+#    reads as a separate drift, not a mirror. ──────────────────────
+
+[entities.raft2]
+[entities.raft2.transform]
+position = [15.6, -0.06, 9.0]
+rotation = [0.0, 34.0, 0.0]
+[entities.raft2.model]
+asset = "raft2"
