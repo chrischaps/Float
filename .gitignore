@@ -18,3 +18,8 @@ Thumbs.db
 anim/raw/
 models/raw/
 models/mixamo_body.glb
+
+# Visual/text reference material — third-party stock previews and video
+# transcripts gathered while designing the water and raft. Kept locally,
+# never distributed: see specs/ for the design notes drawn from them.
+reference/
