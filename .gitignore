@@ -26,3 +26,6 @@ models/mixamo_body.glb
 # transcripts gathered while designing the water and raft. Kept locally,
 # never distributed: see specs/ for the design notes drawn from them.
 reference/
+
+# Headless render evidence (flint-render skill)
+renders/
