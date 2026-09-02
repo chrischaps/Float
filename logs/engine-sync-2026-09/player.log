@@ -1,0 +1,249 @@
+Loaded scene: Float — set + drift
+Entities: 44
+
+Controls:
+  WASD     - Move
+  Mouse    - Look
+  Space    - Jump
+  Shift    - Sprint
+  Escape   - Release cursor / Exit
+  F2       - Rendering stats overlay
+  F3       - Scene debug panels
+  F4       - Rendering & Effects menu
+  F11      - Toggle fullscreen
+2026-09-02T14:17:25.837734Z  WARN wgpu_hal::vulkan::conv: Unrecognized present mode 1000361000
+Loaded model: bird (5 meshes, 6 nodes, bounds: 2.47 x 0.28 x 0.98 (min [-1.23, -0.09, -0.52], max [1.23, 0.19, 0.46]))
+  Expanded node: bird_6__world (animated, local TRS)
+  Expanded node: bird_6__world__bird_part_0 (animated, local TRS)
+  Expanded node: bird_6__world__bird_part_1 (animated, local TRS)
+  Expanded node: bird_6__world__bird_part_2 (animated, local TRS)
+  Expanded node: bird_6__world__bird_part_3 (animated, local TRS)
+  Expanded node: bird_6__world__bird_part_4 (animated, local TRS)
+  Expanded node: bird_5__world (animated, local TRS)
+  Expanded node: bird_5__world__bird_part_0 (animated, local TRS)
+  Expanded node: bird_5__world__bird_part_1 (animated, local TRS)
+  Expanded node: bird_5__world__bird_part_2 (animated, local TRS)
+  Expanded node: bird_5__world__bird_part_3 (animated, local TRS)
+  Expanded node: bird_5__world__bird_part_4 (animated, local TRS)
+Loaded model: raft2 (16 meshes, 17 nodes, bounds: 2.65 x 0.41 x 2.51 (min [-1.33, -0.11, -1.25], max [1.33, 0.30, 1.26]))
+  Expanded node: raft2__world (animated, local TRS)
+  Expanded node: raft2__world__part_0 (animated, local TRS)
+  Expanded node: raft2__world__part_1 (animated, local TRS)
+  Expanded node: raft2__world__part_2 (animated, local TRS)
+  Expanded node: raft2__world__part_3 (animated, local TRS)
+  Expanded node: raft2__world__part_4 (animated, local TRS)
+  Expanded node: raft2__world__part_5 (animated, local TRS)
+  Expanded node: raft2__world__part_6 (animated, local TRS)
+  Expanded node: raft2__world__part_7 (animated, local TRS)
+  Expanded node: raft2__world__part_8 (animated, local TRS)
+  Expanded node: raft2__world__part_9 (animated, local TRS)
+  Expanded node: raft2__world__part_10 (animated, local TRS)
+  Expanded node: raft2__world__part_11 (animated, local TRS)
+  Expanded node: raft2__world__part_12 (animated, local TRS)
+  Expanded node: raft2__world__part_13 (animated, local TRS)
+  Expanded node: raft2__world__part_14 (animated, local TRS)
+  Expanded node: raft2__world__part_15 (animated, local TRS)
+  Expanded node: bird_7__world (animated, local TRS)
+  Expanded node: bird_7__world__bird_part_0 (animated, local TRS)
+  Expanded node: bird_7__world__bird_part_1 (animated, local TRS)
+  Expanded node: bird_7__world__bird_part_2 (animated, local TRS)
+  Expanded node: bird_7__world__bird_part_3 (animated, local TRS)
+  Expanded node: bird_7__world__bird_part_4 (animated, local TRS)
+  Expanded node: bird_2__world (animated, local TRS)
+  Expanded node: bird_2__world__bird_part_0 (animated, local TRS)
+  Expanded node: bird_2__world__bird_part_1 (animated, local TRS)
+  Expanded node: bird_2__world__bird_part_2 (animated, local TRS)
+  Expanded node: bird_2__world__bird_part_3 (animated, local TRS)
+  Expanded node: bird_2__world__bird_part_4 (animated, local TRS)
+Loaded model: body (71 meshes, 19 nodes, 1 skins, 38 skeletal clips, bounds: 0.56 x 0.85 x 0.90 (min [-0.28, -0.45, -0.29], max [0.28, 0.40, 0.61]))
+  Expanded node: bird_3__world (animated, local TRS)
+  Expanded node: bird_3__world__bird_part_0 (animated, local TRS)
+  Expanded node: bird_3__world__bird_part_1 (animated, local TRS)
+  Expanded node: bird_3__world__bird_part_2 (animated, local TRS)
+  Expanded node: bird_3__world__bird_part_3 (animated, local TRS)
+  Expanded node: bird_3__world__bird_part_4 (animated, local TRS)
+  Expanded node: bird_0__world (animated, local TRS)
+  Expanded node: bird_0__world__bird_part_0 (animated, local TRS)
+  Expanded node: bird_0__world__bird_part_1 (animated, local TRS)
+  Expanded node: bird_0__world__bird_part_2 (animated, local TRS)
+  Expanded node: bird_0__world__bird_part_3 (animated, local TRS)
+  Expanded node: bird_0__world__bird_part_4 (animated, local TRS)
+Loaded model: whale (17 meshes, 18 nodes, bounds: 8.34 x 3.44 x 14.79 (min [-4.17, -1.72, -7.54], max [4.17, 1.72, 7.25]))
+  Expanded node: whale__world (animated, local TRS)
+  Expanded node: whale__world__whale_part_0 (animated, local TRS)
+  Expanded node: whale__world__whale_part_1 (animated, local TRS)
+  Expanded node: whale__world__whale_part_2 (animated, local TRS)
+  Expanded node: whale__world__whale_part_3 (animated, local TRS)
+  Expanded node: whale__world__whale_part_4 (animated, local TRS)
+  Expanded node: whale__world__whale_part_5 (animated, local TRS)
+  Expanded node: whale__world__whale_part_6 (animated, local TRS)
+  Expanded node: whale__world__whale_part_7 (animated, local TRS)
+  Expanded node: whale__world__whale_part_8 (animated, local TRS)
+  Expanded node: whale__world__whale_part_9 (animated, local TRS)
+  Expanded node: whale__world__whale_part_10 (animated, local TRS)
+  Expanded node: whale__world__whale_part_11 (animated, local TRS)
+  Expanded node: whale__world__whale_part_12 (animated, local TRS)
+  Expanded node: whale__world__whale_part_13 (animated, local TRS)
+  Expanded node: whale__world__whale_part_14 (animated, local TRS)
+  Expanded node: whale__world__whale_part_15 (animated, local TRS)
+  Expanded node: whale__world__whale_part_16 (animated, local TRS)
+  Expanded node: bird_8__world (animated, local TRS)
+  Expanded node: bird_8__world__bird_part_0 (animated, local TRS)
+  Expanded node: bird_8__world__bird_part_1 (animated, local TRS)
+  Expanded node: bird_8__world__bird_part_2 (animated, local TRS)
+  Expanded node: bird_8__world__bird_part_3 (animated, local TRS)
+  Expanded node: bird_8__world__bird_part_4 (animated, local TRS)
+Loaded model: raft (21 meshes, 22 nodes, bounds: 2.65 x 0.41 x 2.48 (min [-1.33, -0.11, -1.24], max [1.33, 0.29, 1.24]))
+  Expanded node: raft__world (animated, local TRS)
+  Expanded node: raft__world__part_0 (animated, local TRS)
+  Expanded node: raft__world__part_1 (animated, local TRS)
+  Expanded node: raft__world__part_2 (animated, local TRS)
+  Expanded node: raft__world__part_3 (animated, local TRS)
+  Expanded node: raft__world__part_4 (animated, local TRS)
+  Expanded node: raft__world__part_5 (animated, local TRS)
+  Expanded node: raft__world__part_6 (animated, local TRS)
+  Expanded node: raft__world__part_7 (animated, local TRS)
+  Expanded node: raft__world__part_8 (animated, local TRS)
+  Expanded node: raft__world__part_9 (animated, local TRS)
+  Expanded node: raft__world__part_10 (animated, local TRS)
+  Expanded node: raft__world__part_11 (animated, local TRS)
+  Expanded node: raft__world__part_12 (animated, local TRS)
+  Expanded node: raft__world__part_13 (animated, local TRS)
+  Expanded node: raft__world__part_14 (animated, local TRS)
+  Expanded node: raft__world__part_15 (animated, local TRS)
+  Expanded node: raft__world__part_16 (animated, local TRS)
+  Expanded node: raft__world__part_17 (animated, local TRS)
+  Expanded node: raft__world__part_18 (animated, local TRS)
+  Expanded node: raft__world__part_19 (animated, local TRS)
+  Expanded node: raft__world__part_20 (animated, local TRS)
+Loaded model: buoy (1 meshes, 2 nodes, bounds: 0.36 x 0.36 x 0.36 (min [-0.18, -0.18, -0.18], max [0.18, 0.18, 0.18]))
+  Expanded node: bird_4__world (animated, local TRS)
+  Expanded node: bird_4__world__bird_part_0 (animated, local TRS)
+  Expanded node: bird_4__world__bird_part_1 (animated, local TRS)
+  Expanded node: bird_4__world__bird_part_2 (animated, local TRS)
+  Expanded node: bird_4__world__bird_part_3 (animated, local TRS)
+  Expanded node: bird_4__world__bird_part_4 (animated, local TRS)
+  Expanded node: bird_1__world (animated, local TRS)
+  Expanded node: bird_1__world__bird_part_0 (animated, local TRS)
+  Expanded node: bird_1__world__bird_part_1 (animated, local TRS)
+  Expanded node: bird_1__world__bird_part_2 (animated, local TRS)
+  Expanded node: bird_1__world__bird_part_3 (animated, local TRS)
+  Expanded node: bird_1__world__bird_part_4 (animated, local TRS)
+  Skeletal clip: scoot_right (1.4s, 9 tracks)
+  Skeletal clip: scoot_left (1.4s, 9 tracks)
+  Skeletal clip: legs_rock (21.0s, 6 tracks)
+  Skeletal clip: idle_deck (8.6s, 9 tracks)
+  Skeletal clip: fid_kick_idle_deck (2.4s, 8 tracks)
+  Skeletal clip: fid_drum_idle_deck (2.0s, 6 tracks)
+  Skeletal clip: fid_shift_idle_deck (2.6s, 8 tracks)
+  Skeletal clip: fid_sigh_idle_deck (3.0s, 10 tracks)
+  Skeletal clip: fid_stretch_idle_deck (3.6s, 11 tracks)
+  Skeletal clip: idle_thighs (9.4s, 9 tracks)
+  Skeletal clip: fid_kick_idle_thighs (2.4s, 8 tracks)
+  Skeletal clip: fid_shift_idle_thighs (2.6s, 8 tracks)
+  Skeletal clip: fid_sigh_idle_thighs (3.0s, 10 tracks)
+  Skeletal clip: fid_stretch_idle_thighs (3.6s, 11 tracks)
+  Skeletal clip: idle_left_deck (8.9s, 9 tracks)
+  Skeletal clip: fid_kick_idle_left_deck (2.4s, 8 tracks)
+  Skeletal clip: fid_drum_idle_left_deck (2.0s, 6 tracks)
+  Skeletal clip: fid_shift_idle_left_deck (2.6s, 8 tracks)
+  Skeletal clip: fid_sigh_idle_left_deck (3.0s, 10 tracks)
+  Skeletal clip: fid_stretch_idle_left_deck (3.6s, 11 tracks)
+  Skeletal clip: idle_right_deck (9.1s, 9 tracks)
+  Skeletal clip: fid_kick_idle_right_deck (2.4s, 8 tracks)
+  Skeletal clip: fid_drum_idle_right_deck (2.0s, 6 tracks)
+  Skeletal clip: fid_shift_idle_right_deck (2.6s, 8 tracks)
+  Skeletal clip: fid_sigh_idle_right_deck (3.0s, 10 tracks)
+  Skeletal clip: fid_stretch_idle_right_deck (3.6s, 11 tracks)
+  Skeletal clip: idle_water_l (10.2s, 9 tracks)
+  Skeletal clip: fid_kick_idle_water_l (2.4s, 10 tracks)
+  Skeletal clip: fid_drum_idle_water_l (2.0s, 8 tracks)
+  Skeletal clip: fid_shift_idle_water_l (2.6s, 9 tracks)
+  Skeletal clip: fid_sigh_idle_water_l (3.0s, 10 tracks)
+  Skeletal clip: fid_stretch_idle_water_l (3.6s, 11 tracks)
+  Skeletal clip: idle_water_r (10.0s, 9 tracks)
+  Skeletal clip: fid_kick_idle_water_r (2.4s, 10 tracks)
+  Skeletal clip: fid_drum_idle_water_r (2.0s, 8 tracks)
+  Skeletal clip: fid_shift_idle_water_r (2.6s, 9 tracks)
+  Skeletal clip: fid_sigh_idle_water_r (3.0s, 10 tracks)
+  Skeletal clip: fid_stretch_idle_water_r (3.6s, 11 tracks)
+2026-09-02T14:17:26.445855Z  WARN gilrs::gamepad: No mapping found for UUID 00000000-0000-0000-0000-000000000000
+	Default mapping will be used.
+2026-09-02T14:17:26.446136Z  WARN gilrs::gamepad: No mapping found for UUID 00000000-0000-0000-0000-000000000000
+	Default mapping will be used.
+2026-09-02T14:17:26.446271Z  WARN gilrs::gamepad: No mapping found for UUID 00000000-0000-0000-0000-000000000000
+	Default mapping will be used.
+2026-09-02T14:17:26.446362Z  WARN gilrs::gamepad: No mapping found for UUID 00000000-0000-0000-0000-000000000000
+	Default mapping will be used.
+2026-09-02T14:17:26.447343Z  WARN egui_wgpu::renderer: Detected a linear (sRGBA aware) framebuffer Bgra8UnormSrgb. egui prefers Rgba8Unorm or Bgra8Unorm
+Loaded audio: audio/storm_howl.ogg
+Loaded audio: audio/wash_loop_1.ogg
+Loaded audio: audio/music_dusk.ogg
+Loaded audio: audio/foam_fizz_loop.ogg
+Loaded audio: audio/wind_light.ogg
+Loaded audio: audio/music_night.ogg
+Loaded audio: audio/ocean_loop.ogg
+Loaded audio: audio/rain_loop.ogg
+Loaded audio: audio/music_day.ogg
+Loaded audio: audio/music_deep.ogg
+Loaded audio: audio/wash_loop_2.ogg
+Preloaded audio: audio/bird_chirp_1.ogg
+Preloaded audio: audio/bird_chirp_2.ogg
+Preloaded audio: audio/breach_splash.ogg
+Preloaded audio: audio/creak_1.ogg
+Preloaded audio: audio/creak_2.ogg
+Preloaded audio: audio/creak_3.ogg
+Preloaded audio: audio/drip_1.ogg
+Preloaded audio: audio/drip_2.ogg
+Preloaded audio: audio/drip_3.ogg
+Preloaded audio: audio/drip_4.ogg
+Preloaded audio: audio/dunk_in_1.ogg
+Preloaded audio: audio/dunk_in_2.ogg
+Preloaded audio: audio/dunk_out_1.ogg
+Preloaded audio: audio/dunk_out_2.ogg
+Preloaded audio: audio/lap_1.ogg
+Preloaded audio: audio/lap_2.ogg
+Preloaded audio: audio/lap_3.ogg
+Preloaded audio: audio/lap_4.ogg
+Preloaded audio: audio/leg_splash_1.ogg
+Preloaded audio: audio/leg_splash_2.ogg
+Preloaded audio: audio/leg_splash_3.ogg
+Preloaded audio: audio/runoff_1.ogg
+Preloaded audio: audio/runoff_2.ogg
+Preloaded audio: audio/runoff_3.ogg
+Preloaded audio: audio/settle_1.ogg
+Preloaded audio: audio/settle_2.ogg
+Preloaded audio: audio/settle_3.ogg
+Preloaded audio: audio/splash_hard_1.ogg
+Preloaded audio: audio/splash_hard_2.ogg
+Preloaded audio: audio/splash_med_1.ogg
+Preloaded audio: audio/splash_med_2.ogg
+Preloaded audio: audio/splash_med_3.ogg
+Preloaded audio: audio/splash_soft_1.ogg
+Preloaded audio: audio/splash_soft_2.ogg
+Preloaded audio: audio/splash_soft_3.ogg
+Preloaded audio: audio/thunder_crack.ogg
+Preloaded audio: audio/thunder_far.ogg
+Preloaded audio: audio/thunder_mid.ogg
+Animation system initialized (0 property clips, 38 skeletal clips, 0 node clips, 0 sprite clips, 0 property entities, 1 skeletal entities, 0 node entities, 0 sprite entities)
+[particles] Discovered 2 emitter(s)
+Loaded particle texture: textures/rain_drop.png
+[script] Loaded: seat_camera → seat_camera.rhai
+[script] Loaded: tod → time_of_day.rhai
+[script] Loaded: weather_controller → weather.rhai
+[script] Loaded: body → body.rhai
+[script] Loaded: raft → raft.rhai
+[script] Loaded: raft_visitor → raft_visitor.rhai
+[script] Loaded: raft_audio → raft_audio.rhai
+[script] Loaded: whale → whale.rhai
+[script] Loaded: bird_flock → birds.rhai
+[script] Loaded: water_ambience → water_ambience.rhai
+[script] Loaded: title_controller → title.rhai
+[script] Loaded: reality_controller → reality.rhai
+[script] Loaded: biolum_controller → biolum.rhai
+[script] Loaded: dead_calm_controller → dead_calm.rhai
+[script] Loaded: wave_probe → wave_probe.rhai
+[script] Loaded: music_controller → music.rhai
+Script system initialized (16 scripts)
+Loaded UI sprite: title_setdrift.png
+Loaded UI sprite: title_presskey.png
