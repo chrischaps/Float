@@ -38,11 +38,23 @@ pub struct EmitterConfig {
     pub color_start: [f32; 4],
     pub color_end: [f32; 4],
     pub texture: String,
+    /// Velocity-aligned billboard stretch (s): quad half-length grows by
+    /// |velocity| * stretch / 2 along the screen-projected velocity.
+    /// 0 disables (normal camera-facing quads). Rain streaks: ~0.03.
+    pub stretch: f32,
     pub frames_x: u32,
     pub frames_y: u32,
     pub animate_frames: bool,
     pub blend_mode: ParticleBlendMode,
     pub shape: EmissionShape,
+    /// Spawn-region translation relative to the emitter position (ADR 0061:
+    /// lets a script park the region on one side of a body). Default zero.
+    pub shape_offset: [f32; 3],
+    /// Optional orientation for the box shape: extents.x runs along `u`,
+    /// extents.y along `v`, extents.z along `u × v`. Both zero (default)
+    /// keeps the legacy axis-aligned box verbatim.
+    pub shape_axis_u: [f32; 3],
+    pub shape_axis_v: [f32; 3],
     pub world_space: bool,
     pub duration: f32,
     pub looping: bool,
@@ -69,11 +81,15 @@ impl Default for EmitterConfig {
             color_start: [1.0, 1.0, 1.0, 1.0],
             color_end: [1.0, 1.0, 1.0, 0.0],
             texture: String::new(),
+            stretch: 0.0,
             frames_x: 1,
             frames_y: 1,
             animate_frames: false,
             blend_mode: ParticleBlendMode::Alpha,
             shape: EmissionShape::Point,
+            shape_offset: [0.0; 3],
+            shape_axis_u: [0.0; 3],
+            shape_axis_v: [0.0; 3],
             world_space: true,
             duration: 0.0,
             looping: true,
@@ -139,6 +155,9 @@ impl EmitterConfig {
                 config.texture = s.to_string();
             }
         }
+        if let Some(v) = table.get("stretch") {
+            config.stretch = toml_f32(v).unwrap_or(config.stretch).max(0.0);
+        }
         if let Some(v) = table.get("frames_x") {
             config.frames_x = v.as_integer().unwrap_or(1).max(1) as u32;
         }
@@ -186,6 +205,16 @@ impl EmitterConfig {
             },
             _ => EmissionShape::Point,
         };
+
+        if let Some(v) = table.get("shape_offset") {
+            config.shape_offset = toml_vec3(v).unwrap_or(config.shape_offset);
+        }
+        if let Some(v) = table.get("shape_axis_u") {
+            config.shape_axis_u = toml_vec3(v).unwrap_or(config.shape_axis_u);
+        }
+        if let Some(v) = table.get("shape_axis_v") {
+            config.shape_axis_v = toml_vec3(v).unwrap_or(config.shape_axis_v);
+        }
 
         if let Some(v) = table.get("world_space") {
             config.world_space = v.as_bool().unwrap_or(true);

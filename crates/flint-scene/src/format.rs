@@ -67,6 +67,11 @@ pub struct PostProcessDef {
     pub ssao_radius: f32,
     #[serde(default = "default_ssao_intensity")]
     pub ssao_intensity: f32,
+    /// SSAO hemisphere samples per pixel, 1-64 (default 64 = full quality).
+    /// The heaviest per-pixel cost in the post stack; 16 is usually
+    /// indistinguishable on soft/matte scenes and ~4x cheaper.
+    #[serde(default = "default_ssao_samples")]
+    pub ssao_samples: u32,
     #[serde(default)]
     pub fog_enabled: bool,
     #[serde(default = "default_fog_color")]
@@ -98,6 +103,18 @@ pub struct PostProcessDef {
     #[serde(default = "default_volumetric_decay")]
     pub volumetric_decay: f32,
     #[serde(default)]
+    pub chromatic_aberration: f32,
+    #[serde(default)]
+    pub radial_blur: f32,
+    #[serde(default)]
+    pub desaturate: f32,
+    #[serde(default)]
+    pub dof_strength: f32,
+    #[serde(default = "default_dof_focus_distance")]
+    pub dof_focus_distance: f32,
+    #[serde(default = "default_dof_focus_range")]
+    pub dof_focus_range: f32,
+    #[serde(default)]
     pub kuwahara_enabled: bool,
     #[serde(default = "default_kuwahara_radius")]
     pub kuwahara_radius: u32,
@@ -107,6 +124,26 @@ pub struct PostProcessDef {
     pub kuwahara_hardness: f32,
     #[serde(default = "default_kuwahara_anisotropy")]
     pub kuwahara_anisotropy: f32,
+    /// Animated film grain intensity (0 = off; ~0.02-0.05 is subtle).
+    #[serde(default)]
+    pub film_grain: f32,
+    /// Color grade lift (per-channel add after ACES). Neutral = [0,0,0].
+    #[serde(default)]
+    pub grade_lift: [f32; 3],
+    /// Color grade gamma (per-channel midtone curve). Neutral = [1,1,1].
+    #[serde(default = "default_grade_one")]
+    pub grade_gamma: [f32; 3],
+    /// Color grade gain (per-channel multiply). Neutral = [1,1,1].
+    #[serde(default = "default_grade_one")]
+    pub grade_gain: [f32; 3],
+    /// FXAA anti-aliasing pass on the final composite (default off — the
+    /// headless pixel-diff gates run without it; ADR 0050).
+    #[serde(default)]
+    pub fxaa: bool,
+}
+
+fn default_grade_one() -> [f32; 3] {
+    [1.0, 1.0, 1.0]
 }
 
 fn default_true() -> bool {
@@ -141,6 +178,10 @@ fn default_ssao_intensity() -> f32 {
     1.0
 }
 
+fn default_ssao_samples() -> u32 {
+    64
+}
+
 fn default_fog_color() -> [f32; 3] {
     [0.7, 0.75, 0.82]
 }
@@ -159,6 +200,14 @@ fn default_fog_end() -> f32 {
 
 fn default_fog_height_falloff() -> f32 {
     0.1
+}
+
+fn default_dof_focus_distance() -> f32 {
+    10.0
+}
+
+fn default_dof_focus_range() -> f32 {
+    5.0
 }
 
 fn default_dither_intensity() -> f32 {
@@ -233,6 +282,32 @@ pub struct EnvironmentDef {
     /// Path to equirectangular panorama image for the skybox
     #[serde(default)]
     pub skybox: Option<String>,
+    /// Hemisphere ambient sky color [r, g, b] (linear). Absent keeps the
+    /// renderer's built-in default.
+    #[serde(default)]
+    pub ambient_sky: Option<[f32; 3]>,
+    /// Hemisphere ambient ground color [r, g, b] (linear). Absent keeps the
+    /// renderer's built-in default.
+    #[serde(default)]
+    pub ambient_ground: Option<[f32; 3]>,
+    /// Diffuse terminator wrap (0 = physically sharp, ~0.2-0.5 = soft matte /
+    /// subsurface-ish). Absent = 0 = exact legacy shading.
+    #[serde(default)]
+    pub diffuse_wrap: Option<f32>,
+    /// Blend from Lambert diffuse toward the Fujii Oren-Nayar approximation
+    /// (0..1; sigma comes from material roughness — this only blends).
+    /// Rough matte surfaces get a flatter, chalkier falloff. Absent = 0 =
+    /// exact legacy shading (ADR 0048).
+    #[serde(default)]
+    pub oren_nayar: Option<f32>,
+    /// Charlie-sheen rim tint [r, g, b] (linear). Only meaningful with a
+    /// non-zero `sheen_strength`. Absent = white.
+    #[serde(default)]
+    pub sheen_color: Option<[f32; 3]>,
+    /// Charlie-sheen rim strength (0..~0.3 — no energy compensation, high
+    /// values over-brighten). Absent = 0 = exact legacy shading (ADR 0048).
+    #[serde(default)]
+    pub sheen_strength: Option<f32>,
 }
 
 /// Scene metadata

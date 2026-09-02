@@ -35,11 +35,25 @@ Flint uses an **edit -> validate -> play** loop:
    #   --no-shadows           --shadow-resolution 2048
    #   --no-postprocess       --bloom-intensity 0.08  --bloom-threshold 1.0
    #   --exposure 1.5         --ssao-radius 0.5       --ssao-intensity 1.0
+   #   --ssao-samples 64      (1-64; SSAO is the heaviest per-pixel pass — 16 is ~4x cheaper)
    #   --fog-density 0.02     --fog-color 0.7,0.75,0.82  --fog-height-falloff 0.1
-   #   --dither-intensity 0.03
+   #   --dither-intensity 0.03   --desaturate 0.85
+   #   --dof 0.6  --dof-focus 10  --dof-range 5
    #   --volumetric-density 1.0  --volumetric-samples 32
    #   --kuwahara-radius 4       --kuwahara-sharpness 8.0
    #   --kuwahara-hardness 8.0   --kuwahara-anisotropy 1.0
+   #   --oren-nayar 0.7          --sheen-strength 0.15  --sheen-color 1,0.9,0.8
+   #   --grade-lift 0.03,0.02,0.015  --grade-gamma 1,1,1  --grade-gain 1.04,1,0.94
+   #   --film-grain 0.03         --grain-time 0  --fxaa
+   #   --msaa 4               (1|4; default 1 keeps pixel gates single-sample.
+   #                           Also on flint-player. ADR 0058)
+   # Note: --shadow-resolution defaults to 2048 (the renderer's construction
+   # default) and is a real control since the texel-size upload (ADR 0049).
+   #   --render-mode 1 --mode-mix 1.0 --mode-params 3,0,6,0
+   #     (modes: 1=matrix 2=blood 3=drunk 4=tron [reality tears; params =
+   #      mask scale, mask style 0 fbm/1 iris, rate, spare] 5=underwater
+   #      [params = signed eye depth m, sea energy 0-1, daylight 0-1,
+   #      biolum 0-1; masks by per-pixel waterline, not the tear mask])
    ```
 
 2. **`flint edit <file>`** -- Unified interactive editor. Auto-detects file type and opens the right tool:
@@ -54,6 +68,7 @@ Flint uses an **edit -> validate -> play** loop:
    ```
    Supported extensions: `.scene.toml`, `.chunk.toml`, `.procgen.toml`, `.terrain.toml`, `.glb`, `.gltf`.
    Common flags: `--width`, `--height`, `--no-grid`, `--watch`, `--seed`, `--no-inspector`, `--auto-orbit`.
+   Scene viewer applies the scene's `[post_process]` block on load. **F4 opens the Rendering & Effects menu** (ADR 0053) — every render/post toggle plus its non-binary parameters (SSAO radius/samples, DoF, bloom, fog, grade/grain/FXAA, kuwahara, render modes, shadows + resolution, lighting levers, FOV, debug shading mode), an authored-vs-viewer-default post toggle, and DoF-follow (focus plane tracks the last selected entity; values are plain view distances since the ADR 0055 depth fix). WASD orbit, Q/E zoom — while an entity is selected, W/E/R switch gizmo mode instead of orbiting. It also seeds the orbit camera from the scene's authored `[camera]` block (Space returns to that framing; ADR 0051 in game repos using this pattern), and supports `--auto-orbit` turntable with O toggle and [ / ] speed like the model previewer.
    Model flags: `--clip <name>`, `--anim-speed <f32>`, `--render <path.png>`, `--no-animate`, `--distance`, `--yaw`, `--pitch`, `--target`, `--fov`.
    Scene flags: `--spline` (opens spline/track editor).
    Old commands (`serve`, `preview`, `gen-preview`, `tex-edit`, `terrain-edit`) still work as hidden aliases.
@@ -110,7 +125,7 @@ flint-player        Standalone player (game loop, physics, audio, animation, scr
 - **All game UI is script-driven** -- no hardcoded HUD; `hud_controller` entity + `hud.rhai` pattern; engine provides draw primitives (`draw_text/rect/circle/line/sprite`), scripts compose UI
 - **Game project pattern** -- games in own repos with engine as git subtree at `engine/`; `--schemas engine/schemas --schemas schemas` for layered overrides
 - **Fixed-timestep physics** (1/60s) via accumulator; animation/particles run at variable rate
-- **Post-processing** -- HDR pipeline (`Rgba16Float`) with bloom, SSAO, fog, volumetric (god rays), Kuwahara (anisotropic painterly filter), vignette; `[post_process]` TOML block; F5-F9 runtime toggles, F10 volumetric, F12 Kuwahara; when active, PBR shaders output linear HDR
+- **Post-processing** -- HDR pipeline (`Rgba16Float`) with bloom, SSAO, fog, volumetric (god rays), Kuwahara (anisotropic painterly filter), vignette; `[post_process]` TOML block; F4 opens the Rendering & Effects debug menu in the player and viewer (all toggles + parameters, ADR 0053); when active, PBR shaders output linear HDR
 - **Scene transitions** -- `TransitionPhase` lifecycle with script-driven visuals; `PersistentStore` survives transitions; `GameStateMachine` pushdown automaton with per-system `SystemPolicy`
 - **Input system** -- TOML-based `InputConfig` with layered loading (built-in -> game -> user overrides -> CLI); keyboard/mouse/gamepad/touch unified via `Binding` enum
 
@@ -133,6 +148,7 @@ flint-player        Standalone player (game loop, physics, audio, animation, scr
 - Particles: no depth write; storage buffer (not uniform); skip draw for 0 alive; `bytemuck::cast_slice` for zero-copy
 - `flint-terrain` does NOT depend on `flint-render`; uses standard `Vertex` format so reuses shadow pipeline
 - `flint-android` excluded from `default-members` -- use `cargo ndk -p flint-android`; min API 26
+- Windows links a 1 MB main-thread stack; debug builds of flint-cli's clap parser overflow it -- `.cargo/config.toml` links with `/STACK:8388608`. Don't remove it, and don't grow `Commands` assuming stack is free.
 - Scene entity `merge_component()` does field-level merge INTO archetype defaults, not full replacement
 - `flint_core::toml_util` -- use `toml_f64`/`toml_f32`/`toml_vec3`/etc. instead of inline coercion patterns
 - Never use `archetype = "furniture"` on non-visual entities -- furniture includes `bounds`, renders teal boxes

@@ -189,6 +189,14 @@ pub struct ImportedJoint {
     pub index: usize,
     pub parent: Option<usize>,
     pub inverse_bind_matrix: [[f32; 4]; 4],
+    /// Rest (bind) LOCAL transform from the glTF joint node's TRS. Runtime
+    /// pose buffers must start from this, not identity: a clip that only
+    /// animates some joints/properties leaves the rest untouched, and an
+    /// identity local translation collapses a joint onto its parent.
+    pub rest_translation: [f32; 3],
+    /// Quaternion xyzw
+    pub rest_rotation: [f32; 4],
+    pub rest_scale: [f32; 3],
 }
 
 /// A complete skeleton extracted from a glTF skin
@@ -204,6 +212,10 @@ pub struct ImportedKeyframe {
     pub time: f32,
     /// 3 floats for translation/scale, 4 for rotation (quaternion xyzw)
     pub value: Vec<f32>,
+    /// Incoming tangent (CUBICSPLINE only; empty otherwise). Same arity as `value`.
+    pub in_tangent: Vec<f32>,
+    /// Outgoing tangent (CUBICSPLINE only; empty otherwise). Same arity as `value`.
+    pub out_tangent: Vec<f32>,
 }
 
 /// An animation channel targeting a specific joint property
