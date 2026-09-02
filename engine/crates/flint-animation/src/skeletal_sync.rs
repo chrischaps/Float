@@ -439,6 +439,11 @@ impl SkeletalSync {
         self.skeletons.get(entity_id)?.joint_position(joint)
     }
 
+    /// The skeleton driving an entity (joint hierarchy + last computed globals)
+    pub fn skeleton(&self, entity_id: &EntityId) -> Option<&Skeleton> {
+        self.skeletons.get(entity_id)
+    }
+
     /// Get bone matrices for a given entity (for GPU upload)
     pub fn bone_matrices(&self, entity_id: &EntityId) -> Option<&[[[f32; 4]; 4]]> {
         self.skeletons
@@ -541,10 +546,14 @@ mod tests {
                     JointKeyframe {
                         time: 0.0,
                         value: vec![0.0, 0.0, 0.0],
+                        in_tangent: vec![],
+                        out_tangent: vec![],
                     },
                     JointKeyframe {
                         time: duration,
                         value: vec![duration as f32, 0.0, 0.0],
+                        in_tangent: vec![],
+                        out_tangent: vec![],
                     },
                 ],
             }],

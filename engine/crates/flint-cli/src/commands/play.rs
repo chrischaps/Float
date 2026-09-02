@@ -6,12 +6,29 @@ use flint_schema::SchemaRegistry;
 use std::path::Path;
 use winit::event_loop::{ControlFlow, EventLoop};
 
+#[derive(clap::Args)]
 pub struct PlayArgs {
+    /// Path to scene file
     pub scene: String,
+
+    /// Paths to schemas directories (can specify multiple)
+    #[arg(long, default_value = "schemas", action = clap::ArgAction::Append)]
     pub schemas: Vec<String>,
+
+    /// Launch in fullscreen mode
+    #[arg(long)]
     pub fullscreen: bool,
+
+    /// Optional input config overlay path
+    #[arg(long)]
     pub input_config: Option<String>,
+
+    /// Initial music bus volume (linear, 0.0 = muted, 1.0 = full)
+    #[arg(long, default_value_t = 1.0)]
     pub music_volume: f64,
+
+    /// Initial SFX bus volume (linear, 0.0 = muted, 1.0 = full)
+    #[arg(long, default_value_t = 1.0)]
     pub sfx_volume: f64,
 }
 
@@ -50,8 +67,9 @@ pub fn run(args: PlayArgs) -> Result<()> {
     println!("  Space    - Jump");
     println!("  Shift    - Sprint");
     println!("  Escape   - Release cursor / Exit");
-    println!("  F1       - Cycle debug mode");
-    println!("  F4       - Toggle shadows");
+    println!("  F2       - Rendering stats overlay");
+    println!("  F3       - Scene debug panels");
+    println!("  F4       - Rendering & Effects menu");
     println!("  F11      - Toggle fullscreen");
 
     // Create and run the event loop

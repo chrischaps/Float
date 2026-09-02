@@ -1,9 +1,10 @@
 // Composite post-processing shader
 //
 // Fullscreen triangle that reads from the HDR scene buffer, applies
-// radial blur, chromatic aberration, bloom, fog, exposure, ACES tonemapping,
-// and vignette. Outputs LINEAR values — the sRGB render target handles
-// gamma encoding automatically via hardware conversion.
+// radial blur, depth of field, chromatic aberration, bloom, fog, exposure,
+// ACES tonemapping, desaturation, and vignette. Outputs LINEAR values — the
+// sRGB render target handles gamma encoding automatically via hardware
+// conversion.
 
 struct PostProcessUniforms {
     exposure: f32,
@@ -15,7 +16,9 @@ struct PostProcessUniforms {
     texel_size: vec2<f32>,
     chromatic_aberration: f32,
     radial_blur: f32,
-    _pad: vec2<f32>,
+    desaturate: f32,
+    // Film grain intensity (rides the former _pad slot; 0 = off)
+    grain_intensity: f32,
     // Fog parameters
     fog_color: vec3<f32>,
     fog_density: f32,
@@ -30,6 +33,11 @@ struct PostProcessUniforms {
     fog_height_enabled: f32,
     dither_intensity: f32,
     inv_view_proj: mat4x4<f32>,
+    // Depth of field (trailing row appended after the mat4 — see PostProcessUniforms)
+    dof_strength: f32,
+    dof_focus_distance: f32,
+    dof_focus_range: f32,
+    _pad2: f32,
     // Render mode: 0 none, 1 Matrix, 2 blood, 3 drunk, 4 Tron (reality
     // tears), 5 underwater (submerged-eye moments; not a tear — no mask).
     render_mode: u32,
@@ -41,6 +49,15 @@ struct PostProcessUniforms {
     // depth in meters (+ = submerged; waterline Y = camera_pos.y + x),
     // y = sea energy/turbidity 0..1, z = daylight 0..1, w = biolum 0..1.
     mode_params: vec4<f32>,
+    // Color grade (ADR 0050): pow(max(color * gain + lift, 0), 1/gamma),
+    // applied right after ACES. grade_enabled is CPU-computed so the
+    // neutral path is the original code verbatim.
+    grade_lift: vec3<f32>,
+    grade_enabled: f32,
+    grade_gamma: vec3<f32>,
+    _pad3: f32,
+    grade_gain: vec3<f32>,
+    _pad4: f32,
 };
 
 @group(0) @binding(0)
@@ -111,6 +128,26 @@ fn world_pos_from_depth(uv: vec2<f32>, depth: f32) -> vec3<f32> {
     let clip_y_flip = vec4<f32>(clip.x, -clip.y, clip.z, 1.0);
     let world = params.inv_view_proj * clip_y_flip;
     return world.xyz / world.w;
+}
+
+// Linearize a [0,1] depth-buffer value to world-space view depth.
+// Matches the wgpu-convention projection since ADR 0055.
+fn linear_depth(depth: f32) -> f32 {
+    return params.near * params.far / (params.far - depth * (params.far - params.near));
+}
+
+// Circle-of-confusion at a UV: 0 = in focus, 1 = fully defocused.
+// Sky (depth at/near the far plane) is treated as at the far plane so it
+// defocuses naturally when the focus plane is near. textureSampleLevel —
+// this is called from non-uniform control flow inside the DoF gather loop.
+fn coc_at(uv: vec2<f32>) -> f32 {
+    let depth = textureSampleLevel(depth_texture, depth_sampler_nn, uv, 0.0).r;
+    var z = params.far;
+    if (depth < 0.9999) {
+        z = linear_depth(depth);
+    }
+    return clamp(abs(z - params.dof_focus_distance) / params.dof_focus_range, 0.0, 1.0)
+        * params.dof_strength;
 }
 
 // Compute fog factor from depth buffer
@@ -288,6 +325,7 @@ fn blood_grade(mapped: vec3<f32>, mask: f32) -> vec3<f32> {
 }
 
 // Linearize a conventional (0 = near, 1 = far) depth value.
+// Matches the wgpu-convention projection since ADR 0055.
 fn linearize_depth(d: f32) -> f32 {
     return params.near * params.far / (params.far - d * (params.far - params.near));
 }
@@ -470,6 +508,28 @@ fn fs_composite(in: VsOut) -> @location(0) vec4<f32> {
         color = textureSample(hdr_texture, hdr_sampler, uv).rgb;
     }
 
+    // ── Depth of Field (single-pass CoC-weighted disc gather) ──
+    // Gathers from the raw HDR source (same as radial blur) so the two blurs
+    // stay order-stable; taps are weighted by their own CoC as a cheap guard
+    // against in-focus foreground bleeding into defocused regions.
+    if (params.dof_strength > 0.001) {
+        let center_coc = coc_at(uv);
+        let radius_px = center_coc * 10.0;
+        if (radius_px > 0.5) {
+            var acc = textureSampleLevel(hdr_texture, hdr_sampler, uv, 0.0).rgb;
+            var wsum = 1.0;
+            for (var i = 0u; i < 12u; i = i + 1u) {
+                let ang = f32(i) * 2.39996323; // golden angle
+                let r = radius_px * sqrt((f32(i) + 0.5) / 12.0);
+                let tuv = uv + vec2<f32>(cos(ang), sin(ang)) * r * params.texel_size;
+                let w = coc_at(tuv);
+                acc = acc + textureSampleLevel(hdr_texture, hdr_sampler, tuv, 0.0).rgb * w;
+                wsum = wsum + w;
+            }
+            color = mix(color, acc / wsum, center_coc);
+        }
+    }
+
     // ── Reality tear: drunk double vision (ghost image drifts sideways) ──
     if (params.render_mode == 3u && params.mode_mix > 0.001) {
         let ghost_off = vec2<f32>(0.012 + 0.010 * sin(params.mode_time * 0.5), 0.0)
@@ -509,6 +569,22 @@ fn fs_composite(in: VsOut) -> @location(0) vec4<f32> {
     color = color * params.exposure;
     var mapped = aces_filmic(color);
 
+    // ── Color grade (ADR 0050): ASC-CDL-shaped lift/gamma/gain, right after
+    // tonemapping so it grades the display-referred image. Gated by the
+    // CPU-computed enable flag — never trust pow(x, 1.0) float identity.
+    if (params.grade_enabled > 0.5) {
+        let graded = max(mapped * params.grade_gain + params.grade_lift, vec3<f32>(0.0));
+        mapped = pow(graded, vec3<f32>(1.0) / max(params.grade_gamma, vec3<f32>(0.01)));
+    }
+
+    // ── Desaturation (mix toward darkened ash-grey, never neutral) ──
+    // Rec.601 luma and the 0.62 grey target match the ladder stage of the
+    // play-chart window harness so the disintegration language reads the same.
+    if (params.desaturate > 0.0) {
+        let luma = dot(mapped, vec3<f32>(0.299, 0.587, 0.114));
+        mapped = mix(mapped, vec3<f32>(luma * 0.62), clamp(params.desaturate, 0.0, 1.0));
+    }
+
     // ── Hook B: stylization owns the display-referred color. After ACES so
     // phosphor greens / duotones aren't compressed; before vignette + dither
     // so those still apply on top (CRT cohesion). Underwater (5) is not a
@@ -531,6 +607,21 @@ fn fs_composite(in: VsOut) -> @location(0) vec4<f32> {
         let vdist = dist * 1.41421356;
         let vignette = 1.0 - pow(vdist, params.vignette_smoothness) * params.vignette_intensity;
         mapped = mapped * max(vignette, 0.0);
+    }
+
+    // ── Film grain (ADR 0050): hash noise on pixel coords, time-quantized
+    // to 24 Hz (film cadence; the Tier-3 "on twos" tie-in is this one
+    // constant), luma-weighted so highlights stay clean. Before dither —
+    // grain is signal, dither is a quantization aid and stays last. Uses
+    // the shared post time (mode_time), which headless render fixes at 0
+    // so PNG gates stay deterministic.
+    if (params.grain_intensity > 0.0) {
+        let grain_frame = floor(params.mode_time * 24.0);
+        let n = hash2(in.position.xy + vec2<f32>(grain_frame * 17.0, grain_frame * 61.0)) - 0.5;
+        let g_luma = dot(mapped, vec3<f32>(0.299, 0.587, 0.114));
+        let weight = 0.3 + 0.7 * (1.0 - saturate(g_luma));
+        mapped = mapped + vec3<f32>(n * params.grain_intensity * weight);
+        mapped = max(mapped, vec3<f32>(0.0));
     }
 
     // ── Ordered (Bayer) Dither ──

@@ -89,6 +89,10 @@ struct SkinnedDrawCall {
     material_buffer: wgpu::Buffer,
     material_bind_group: wgpu::BindGroup,
     bone_bind_group: wgpu::BindGroup,
+    /// Unique-edge index buffer for wireframe debug modes (shares the
+    /// skinned vertex buffer, so the lines follow the animated pose).
+    wire_index_buffer: Option<wgpu::Buffer>,
+    wire_index_count: u32,
     model: [[f32; 4]; 4],
     model_inv_transpose: [[f32; 4]; 4],
     entity_id: Option<flint_core::EntityId>,
@@ -100,12 +104,39 @@ struct SkinnedDrawCall {
 pub struct RendererConfig {
     /// Show the ground-plane grid (useful for debug/inspection modes)
     pub show_grid: bool,
+    /// MSAA sample count for the scene passes: 1 (off, the default) or 4
+    /// (ADR 0058). Anything else is clamped to 1 with a warning. Post/
+    /// shadow/blit passes stay single-sample; depth consumers read a
+    /// sample-0 resolve.
+    pub sample_count: u32,
 }
 
 impl Default for RendererConfig {
     fn default() -> Self {
-        Self { show_grid: false }
+        Self {
+            show_grid: false,
+            sample_count: 1,
+        }
     }
+}
+
+/// Snapshot of the runtime lighting levers (ambient hemisphere, diffuse
+/// wrap, Oren-Nayar blend, sheen). Values are the active overrides when set,
+/// else the built-in neutral defaults — suitable for seeding UI controls.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LightingLevers {
+    /// Hemisphere ambient, sky half (linear RGB)
+    pub ambient_sky: [f32; 3],
+    /// Hemisphere ambient, ground half (linear RGB)
+    pub ambient_ground: [f32; 3],
+    /// Diffuse terminator wrap (0 = physically sharp / legacy)
+    pub diffuse_wrap: f32,
+    /// Lambert → Oren-Nayar blend (0 = exact legacy shading)
+    pub oren_nayar: f32,
+    /// Charlie-sheen rim tint (linear RGB)
+    pub sheen_color: [f32; 3],
+    /// Sheen strength, 0..~0.3 (0 = exact legacy shading)
+    pub sheen_strength: f32,
 }
 
 /// Renders a FlintWorld to the screen
@@ -129,6 +160,15 @@ pub struct SceneRenderer {
     light_buffer: wgpu::Buffer,
     light_bind_group: wgpu::BindGroup,
     light_uniforms: LightUniforms,
+    /// Scene-authored hemisphere ambient override (sky, ground). None keeps
+    /// the built-in default; stored so the zero-light fallback in
+    /// `extract_lights_from_world` cannot stomp it.
+    ambient_override: Option<([f32; 3], [f32; 3])>,
+    /// Scene-authored diffuse terminator wrap. Rides ambient_sky.w encoded as
+    /// (1 + wrap) so legacy writes of 1.0 decode to wrap = 0 in the shader.
+    diffuse_wrap_override: Option<f32>,
+    oren_nayar_override: Option<f32>,
+    sheen_override: Option<([f32; 3], f32)>,
     texture_cache: Option<TextureCache>,
     shadow_pass: Option<ShadowPass>,
     selected_entity: Option<flint_core::EntityId>,
@@ -206,6 +246,15 @@ pub struct SceneRenderer {
     // 2D sprites
     sprite2d_pipeline: Option<Sprite2dPipeline>,
     sprite2d_batches: Vec<crate::sprite2d_pipeline::Sprite2dBatch>,
+    // MSAA (ADR 0058): 1 = off (default), 4 = on. Scene passes render into
+    // the MSAA color/depth targets and resolve color into the HDR buffer;
+    // depth resolves (sample 0) into the caller's depth view so every
+    // depth consumer stays single-sample and unchanged.
+    sample_count: u32,
+    msaa_color: Option<(wgpu::Texture, wgpu::TextureView, u32, u32)>,
+    msaa_depth: Option<(wgpu::Texture, wgpu::TextureView)>,
+    depth_resolve_pipeline: Option<wgpu::RenderPipeline>,
+    depth_resolve_layout: Option<wgpu::BindGroupLayout>,
     // Post-processing
     postprocess_pipeline: Option<PostProcessPipeline>,
     postprocess_resources: Option<PostProcessResources>,
@@ -224,6 +273,10 @@ pub struct SceneRenderer {
     pub grass_time: f32,
     /// Set when GPU device is lost (e.g. driver crash); skips all rendering
     device_lost: bool,
+    /// Per-entity bone matrix buffers. The `GpuSkinnedMesh` bone buffer is
+    /// shared by every entity that instances the asset, so entities playing
+    /// different clips need their own storage or the last upload wins.
+    entity_bone_buffers: HashMap<flint_core::EntityId, wgpu::Buffer>,
 }
 
 impl SceneRenderer {
@@ -231,8 +284,9 @@ impl SceneRenderer {
         let surface_format = context.config.format;
         // Scene geometry renders to HDR; the composite pass tonemaps to the surface.
         let scene_format = HDR_FORMAT;
+        let sample_count = Self::resolve_sample_count(config.sample_count);
 
-        let pipeline = RenderPipeline::new(&context.device, scene_format);
+        let pipeline = RenderPipeline::new(&context.device, scene_format, sample_count);
         let archetype_visuals = Self::default_archetype_visuals();
         let texture_cache = TextureCache::new(&context.device, &context.queue);
 
@@ -264,22 +318,26 @@ impl SceneRenderer {
             &pipeline.transform_bind_group_layout,
             &pipeline.material_bind_group_layout,
             &pipeline.light_bind_group_layout,
+            sample_count,
         );
 
-        let billboard_pipeline = BillboardPipeline::new(&context.device, scene_format);
+        let billboard_pipeline =
+            BillboardPipeline::new(&context.device, scene_format, sample_count);
         let terrain_pipeline = TerrainPipeline::new(
             &context.device,
             scene_format,
             &pipeline.transform_bind_group_layout,
             &pipeline.light_bind_group_layout,
+            sample_count,
         );
         let ocean_resources = Self::create_ocean_resources(
             &context.device,
             scene_format,
             &pipeline.transform_bind_group_layout,
             &pipeline.light_bind_group_layout,
+            sample_count,
         );
-        let sky_resources = Self::create_sky_resources(&context.device, scene_format);
+        let sky_resources = Self::create_sky_resources(&context.device, scene_format, sample_count);
 
         // Graceful degradation: wrap in catch_unwind like the Kuwahara pipeline.
         // If compute shaders aren't supported, grass is silently disabled.
@@ -289,6 +347,7 @@ impl SceneRenderer {
                 scene_format,
                 &pipeline.transform_bind_group_layout,
                 &pipeline.light_bind_group_layout,
+                sample_count,
             )
         }))
         .unwrap_or_else(|_| {
@@ -296,9 +355,9 @@ impl SceneRenderer {
             None
         });
 
-        let particle_pipeline = ParticlePipeline::new(&context.device, scene_format);
-        let sprite2d_pipeline = Sprite2dPipeline::new(&context.device, scene_format);
-        let skybox_pipeline = SkyboxPipeline::new(&context.device, scene_format);
+        let particle_pipeline = ParticlePipeline::new(&context.device, scene_format, sample_count);
+        let sprite2d_pipeline = Sprite2dPipeline::new(&context.device, scene_format, sample_count);
+        let skybox_pipeline = SkyboxPipeline::new(&context.device, scene_format, sample_count);
 
         // Create post-processing pipeline and resources
         let postprocess_config = PostProcessConfig::default();
@@ -321,6 +380,7 @@ impl SceneRenderer {
             billboard_pipeline: Some(billboard_pipeline),
             archetype_visuals,
             mesh_cache: MeshCache::new(),
+            entity_bone_buffers: HashMap::new(),
             grid_draw,
             entity_draws: Vec::new(),
             skinned_entity_draws: Vec::new(),
@@ -335,6 +395,10 @@ impl SceneRenderer {
             light_buffer,
             light_bind_group,
             light_uniforms,
+            ambient_override: None,
+            diffuse_wrap_override: None,
+            oren_nayar_override: None,
+            sheen_override: None,
             texture_cache: Some(texture_cache),
             shadow_pass: Some(shadow_pass),
             selected_entity: None,
@@ -397,6 +461,11 @@ impl SceneRenderer {
             particle_draws: Vec::new(),
             sprite2d_pipeline: Some(sprite2d_pipeline),
             sprite2d_batches: Vec::new(),
+            sample_count,
+            msaa_color: None,
+            msaa_depth: None,
+            depth_resolve_pipeline: None,
+            depth_resolve_layout: None,
             postprocess_pipeline: Some(postprocess_pipeline),
             postprocess_resources: Some(postprocess_resources),
             postprocess_config,
@@ -416,13 +485,14 @@ impl SceneRenderer {
     fn create_sky_resources(
         device: &wgpu::Device,
         scene_format: wgpu::TextureFormat,
+        sample_count: u32,
     ) -> (
         Option<crate::sky_pipeline::SkyPipeline>,
         Option<wgpu::Buffer>,
         Option<wgpu::BindGroup>,
     ) {
         let pipeline = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            crate::sky_pipeline::SkyPipeline::new(device, scene_format)
+            crate::sky_pipeline::SkyPipeline::new(device, scene_format, sample_count)
         }));
         let pipeline = match pipeline {
             Ok(p) => p,
@@ -457,6 +527,7 @@ impl SceneRenderer {
         scene_format: wgpu::TextureFormat,
         transform_layout: &wgpu::BindGroupLayout,
         light_layout: &wgpu::BindGroupLayout,
+        sample_count: u32,
     ) -> (
         Option<crate::ocean_pipeline::OceanPipeline>,
         Option<wgpu::Buffer>,
@@ -470,6 +541,7 @@ impl SceneRenderer {
                 scene_format,
                 transform_layout,
                 light_layout,
+                sample_count,
             )
         }));
         let pipeline = match pipeline {
@@ -525,7 +597,9 @@ impl SceneRenderer {
         if self.ocean_grab_dummy_bind_group.is_some() {
             return;
         }
-        let Some(op) = &self.ocean_pipeline else { return };
+        let Some(op) = &self.ocean_pipeline else {
+            return;
+        };
         let dummy_color = crate::ocean_pipeline::create_dummy_grab_texture(
             device,
             HDR_FORMAT,
@@ -559,7 +633,9 @@ impl SceneRenderer {
     /// Called only on the ocean+postprocess path; cheap when size unchanged.
     fn ensure_ocean_grab_resources(&mut self, device: &wgpu::Device, width: u32, height: u32) {
         self.ensure_ocean_grab_dummy(device);
-        let Some(op) = &self.ocean_pipeline else { return };
+        let Some(op) = &self.ocean_pipeline else {
+            return;
+        };
 
         if self.ocean_grab_size == (width, height) && self.ocean_grab_bind_group.is_some() {
             return;
@@ -587,21 +663,20 @@ impl SceneRenderer {
         let color = make(HDR_FORMAT, "Ocean Grab Color");
         let depth = make(wgpu::TextureFormat::R32Float, "Ocean Grab Depth");
 
-        self.ocean_grab_bind_group =
-            Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
-                layout: &op.grab_bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&color.1),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::TextureView(&depth.1),
-                    },
-                ],
-                label: Some("Ocean Grab Bind Group"),
-            }));
+        self.ocean_grab_bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
+            layout: &op.grab_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&color.1),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&depth.1),
+                },
+            ],
+            label: Some("Ocean Grab Bind Group"),
+        }));
         self.ocean_grab_color = Some(color);
         self.ocean_grab_depth = Some(depth);
         self.ocean_grab_size = (width, height);
@@ -889,8 +964,16 @@ impl SceneRenderer {
                 transform_bind_group,
                 model,
                 model_inv_transpose,
-                aabb_min: [chunk.aabb_min[0] + tx, chunk.aabb_min[1] + ty, chunk.aabb_min[2] + tz],
-                aabb_max: [chunk.aabb_max[0] + tx, chunk.aabb_max[1] + ty, chunk.aabb_max[2] + tz],
+                aabb_min: [
+                    chunk.aabb_min[0] + tx,
+                    chunk.aabb_min[1] + ty,
+                    chunk.aabb_min[2] + tz,
+                ],
+                aabb_max: [
+                    chunk.aabb_max[0] + tx,
+                    chunk.aabb_max[1] + ty,
+                    chunk.aabb_max[2] + tz,
+                ],
             });
         }
 
@@ -972,8 +1055,16 @@ impl SceneRenderer {
                 transform_bind_group,
                 model,
                 model_inv_transpose,
-                aabb_min: [chunk.aabb_min[0] + tx, chunk.aabb_min[1] + ty, chunk.aabb_min[2] + tz],
-                aabb_max: [chunk.aabb_max[0] + tx, chunk.aabb_max[1] + ty, chunk.aabb_max[2] + tz],
+                aabb_min: [
+                    chunk.aabb_min[0] + tx,
+                    chunk.aabb_min[1] + ty,
+                    chunk.aabb_min[2] + tz,
+                ],
+                aabb_max: [
+                    chunk.aabb_max[0] + tx,
+                    chunk.aabb_max[1] + ty,
+                    chunk.aabb_max[2] + tz,
+                ],
             });
         }
     }
@@ -1423,7 +1514,8 @@ impl SceneRenderer {
             None => return,
         };
 
-        let max_instances = config.max_instances(self.grass_terrain_width, self.grass_terrain_depth);
+        let max_instances =
+            config.max_instances(self.grass_terrain_width, self.grass_terrain_depth);
         let instance_buffer_size =
             (max_instances as u64) * std::mem::size_of::<GrassInstanceGpu>() as u64;
 
@@ -1454,39 +1546,40 @@ impl SceneRenderer {
         });
 
         // Recreate compute storage bind group (binds instance buffer at binding 0)
-        let compute_storage_bind_group =
-            device.create_bind_group(&wgpu::BindGroupDescriptor {
-                layout: &grass_pipeline.compute_storage_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: instance_buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: counter_buffer.as_entire_binding(),
-                    },
-                ],
-                label: Some("Grass Compute Storage Bind Group"),
-            });
+        let compute_storage_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            layout: &grass_pipeline.compute_storage_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: instance_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: counter_buffer.as_entire_binding(),
+                },
+            ],
+            label: Some("Grass Compute Storage Bind Group"),
+        });
 
         // Recreate render instance bind group (binds instance buffer at binding 0)
-        let entity_buffer = self.grass_entity_buffer.as_ref().expect("grass entity buffer");
-        let render_instance_bind_group =
-            device.create_bind_group(&wgpu::BindGroupDescriptor {
-                layout: &grass_pipeline.render_instance_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: instance_buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: entity_buffer.as_entire_binding(),
-                    },
-                ],
-                label: Some("Grass Render Instance Bind Group"),
-            });
+        let entity_buffer = self
+            .grass_entity_buffer
+            .as_ref()
+            .expect("grass entity buffer");
+        let render_instance_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            layout: &grass_pipeline.render_instance_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: instance_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: entity_buffer.as_entire_binding(),
+                },
+            ],
+            label: Some("Grass Render Instance Bind Group"),
+        });
 
         // Update stored state
         // Note: grass_compute_texture_bind_group, compute_uniform_bind_group,
@@ -1567,8 +1660,9 @@ impl SceneRenderer {
         let surface_format = format;
         // Scene geometry renders to HDR; composite tonemaps to the readback surface.
         let scene_format = HDR_FORMAT;
+        let sample_count = Self::resolve_sample_count(config.sample_count);
 
-        let pipeline = RenderPipeline::new(device, scene_format);
+        let pipeline = RenderPipeline::new(device, scene_format, sample_count);
         let archetype_visuals = Self::default_archetype_visuals();
         let texture_cache = TextureCache::new(device, queue);
 
@@ -1600,6 +1694,7 @@ impl SceneRenderer {
             &pipeline.transform_bind_group_layout,
             &pipeline.material_bind_group_layout,
             &pipeline.light_bind_group_layout,
+            sample_count,
         );
 
         let terrain_pipeline = TerrainPipeline::new(
@@ -1607,6 +1702,7 @@ impl SceneRenderer {
             scene_format,
             &pipeline.transform_bind_group_layout,
             &pipeline.light_bind_group_layout,
+            sample_count,
         );
 
         let grass_pipeline = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -1615,6 +1711,7 @@ impl SceneRenderer {
                 scene_format,
                 &pipeline.transform_bind_group_layout,
                 &pipeline.light_bind_group_layout,
+                sample_count,
             )
         }))
         .unwrap_or_else(|_| {
@@ -1622,17 +1719,18 @@ impl SceneRenderer {
             None
         });
 
-        let billboard_pipeline = BillboardPipeline::new(device, scene_format);
-        let sprite2d_pipeline = Sprite2dPipeline::new(device, scene_format);
-        let skybox_pipeline = SkyboxPipeline::new(device, scene_format);
+        let billboard_pipeline = BillboardPipeline::new(device, scene_format, sample_count);
+        let sprite2d_pipeline = Sprite2dPipeline::new(device, scene_format, sample_count);
+        let skybox_pipeline = SkyboxPipeline::new(device, scene_format, sample_count);
 
         let ocean_resources = Self::create_ocean_resources(
             device,
             scene_format,
             &pipeline.transform_bind_group_layout,
             &pipeline.light_bind_group_layout,
+            sample_count,
         );
-        let sky_resources = Self::create_sky_resources(device, scene_format);
+        let sky_resources = Self::create_sky_resources(device, scene_format, sample_count);
 
         // Create post-processing pipeline and resources for headless
         let postprocess_config = PostProcessConfig::default();
@@ -1651,6 +1749,7 @@ impl SceneRenderer {
             billboard_pipeline: Some(billboard_pipeline),
             archetype_visuals,
             mesh_cache: MeshCache::new(),
+            entity_bone_buffers: HashMap::new(),
             grid_draw,
             entity_draws: Vec::new(),
             skinned_entity_draws: Vec::new(),
@@ -1665,6 +1764,10 @@ impl SceneRenderer {
             light_buffer,
             light_bind_group,
             light_uniforms,
+            ambient_override: None,
+            diffuse_wrap_override: None,
+            oren_nayar_override: None,
+            sheen_override: None,
             texture_cache: Some(texture_cache),
             shadow_pass: Some(shadow_pass),
             selected_entity: None,
@@ -1727,6 +1830,11 @@ impl SceneRenderer {
             particle_draws: Vec::new(),
             sprite2d_pipeline: Some(sprite2d_pipeline),
             sprite2d_batches: Vec::new(),
+            sample_count,
+            msaa_color: None,
+            msaa_depth: None,
+            depth_resolve_pipeline: None,
+            depth_resolve_layout: None,
             postprocess_pipeline: Some(postprocess_pipeline),
             postprocess_resources: Some(postprocess_resources),
             postprocess_config,
@@ -1830,21 +1938,50 @@ impl SceneRenderer {
         }
     }
 
-    /// Update bone matrices for a skinned mesh asset on the GPU
+    /// Upload an entity's bone matrices to the GPU.
+    ///
+    /// Each skinned entity gets its own storage buffer (created on first use),
+    /// so several entities instancing the same asset can play different clips.
+    /// The asset's shared buffer is also written so code paths that draw the
+    /// asset without an entity (previews) keep animating.
     pub fn update_bone_matrices(
         &mut self,
+        device: &wgpu::Device,
         queue: &wgpu::Queue,
+        entity_id: flint_core::EntityId,
         asset_name: &str,
         matrices: &[[[f32; 4]; 4]],
     ) {
         if self.device_lost {
             return;
         }
+        let bytes: &[u8] = bytemuck::cast_slice(matrices);
+        let capacity = crate::skinned_pipeline::MAX_BONES * std::mem::size_of::<[[f32; 4]; 4]>();
+        let buffer = self
+            .entity_bone_buffers
+            .entry(entity_id)
+            .or_insert_with(|| {
+                device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some(&format!(
+                        "{} Bone Buffer (entity {:?})",
+                        asset_name, entity_id
+                    )),
+                    size: capacity as u64,
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                })
+            });
+        queue.write_buffer(buffer, 0, &bytes[..bytes.len().min(capacity)]);
         if let Some(skinned_meshes) = self.mesh_cache.get_skinned_mut(asset_name) {
             for mesh in skinned_meshes.iter_mut() {
-                queue.write_buffer(&mesh.bone_buffer, 0, bytemuck::cast_slice(matrices));
+                queue.write_buffer(&mesh.bone_buffer, 0, bytes);
             }
         }
+    }
+
+    /// Drop per-entity bone buffers (call when a scene is unloaded).
+    pub fn clear_entity_bone_buffers(&mut self) {
+        self.entity_bone_buffers.clear();
     }
 
     /// Load a texture from an image file into the texture cache
@@ -1935,7 +2072,11 @@ impl SceneRenderer {
         let billboard_draws = self.billboard_draws.len() as u32;
         let particle_draws = self.particle_draws.len() as u32;
         let sprite_batches = self.sprite2d_batches.len() as u32;
-        let grass_draw_calls = if self.grass_instance_count > 0 { 1u32 } else { 0 };
+        let grass_draw_calls = if self.grass_instance_count > 0 {
+            1u32
+        } else {
+            0
+        };
 
         let draw_calls = entity_draws
             + skinned_draws
@@ -1969,8 +2110,7 @@ impl SceneRenderer {
         let particle_instances: u32 = self.particle_draws.iter().map(|d| d.instance_count).sum();
         triangles += particle_instances * 2;
         // Sprites: instanced quads (2 triangles per instance)
-        let sprite_instances: u32 =
-            self.sprite2d_batches.iter().map(|b| b.instance_count).sum();
+        let sprite_instances: u32 = self.sprite2d_batches.iter().map(|b| b.instance_count).sum();
         triangles += sprite_instances * 2;
         // Grass: BLADE_INDEX_COUNT indices per instance
         triangles += self.grass_instance_count * BLADE_INDEX_COUNT / 3;
@@ -2223,6 +2363,18 @@ impl SceneRenderer {
         }
     }
 
+    /// Whether shadow rendering is currently enabled
+    pub fn shadows_enabled(&self) -> bool {
+        self.shadow_pass.as_ref().is_some_and(|sp| sp.enabled)
+    }
+
+    /// Current shadow map resolution per cascade
+    pub fn shadow_resolution(&self) -> u32 {
+        self.shadow_pass
+            .as_ref()
+            .map_or(crate::shadow::DEFAULT_SHADOW_RESOLUTION, |sp| sp.resolution)
+    }
+
     fn default_archetype_visuals() -> HashMap<String, ArchetypeVisual> {
         let mut archetype_visuals = HashMap::new();
 
@@ -2337,8 +2489,8 @@ impl SceneRenderer {
         // Extract procedural sky params (+ optional ambient override)
         self.extract_sky_from_world(world);
 
-        let need_overlay =
-            self.debug_state.mode == DebugMode::WireframeOverlay || self.debug_state.mode == DebugMode::WireframeOnly;
+        let need_overlay = self.debug_state.mode == DebugMode::WireframeOverlay
+            || self.debug_state.mode == DebugMode::WireframeOnly;
         let need_normals = self.debug_state.show_normals;
         let arrow_length = self.debug_state.normal_arrow_length;
 
@@ -2385,6 +2537,7 @@ impl SceneRenderer {
                     entity.id,
                     asset_name,
                     model_matrix,
+                    need_overlay,
                 ) {
                     continue;
                 }
@@ -2771,7 +2924,9 @@ impl SceneRenderer {
             let ocean_comp = world
                 .get_components(entity_id)
                 .and_then(|components| components.get(comp::OCEAN).cloned());
-            let Some(ocean_comp) = ocean_comp else { continue };
+            let Some(ocean_comp) = ocean_comp else {
+                continue;
+            };
 
             let params = flint_core::ocean::OceanParams::from_component(&ocean_comp);
             let needs_regen = self
@@ -2782,8 +2937,7 @@ impl SceneRenderer {
             if needs_regen {
                 self.ocean_spectrum = Some(flint_core::ocean::WaveSpectrum::generate(&params));
             }
-            self.ocean_visuals =
-                crate::ocean_pipeline::OceanVisuals::from_component(&ocean_comp);
+            self.ocean_visuals = crate::ocean_pipeline::OceanVisuals::from_component(&ocean_comp);
             self.ocean_active = self.ocean_pipeline.is_some();
             break; // one ocean per scene
         }
@@ -2798,9 +2952,15 @@ impl SceneRenderer {
         use flint_core::toml_util::{toml_f32, toml_vec3};
         self.ocean_contact = None;
         for &entity_id in world.entities_with_component(comp::OCEAN_CONTACT) {
-            let Some(components) = world.get_components(entity_id) else { continue };
-            let Some(contact) = components.get(comp::OCEAN_CONTACT) else { continue };
-            let Some(tf) = components.get(comp::TRANSFORM) else { continue };
+            let Some(components) = world.get_components(entity_id) else {
+                continue;
+            };
+            let Some(contact) = components.get(comp::OCEAN_CONTACT) else {
+                continue;
+            };
+            let Some(tf) = components.get(comp::TRANSFORM) else {
+                continue;
+            };
 
             let pos = tf.get("position").and_then(toml_vec3).unwrap_or([0.0; 3]);
             let rot = tf.get("rotation").and_then(toml_vec3).unwrap_or([0.0; 3]);
@@ -2863,6 +3023,89 @@ impl SceneRenderer {
     // ── Light extraction ──
 
     /// Extract light entities from the world and update the light uniform buffer
+    /// Override the hemisphere ambient colors (linear RGB). Scenes set this
+    /// via `[environment] ambient_sky / ambient_ground`; when never called,
+    /// the built-in default ambient is byte-identical to prior behavior.
+    pub fn set_ambient(&mut self, sky: [f32; 3], ground: [f32; 3]) {
+        self.ambient_override = Some((sky, ground));
+        self.apply_ambient_override();
+    }
+
+    /// Clear any scene-authored ambient override, restoring the built-in
+    /// default (needed on scene transitions so an old scene's ambient never
+    /// leaks into a scene that doesn't author one).
+    pub fn reset_ambient(&mut self) {
+        self.ambient_override = None;
+        self.diffuse_wrap_override = None;
+        self.oren_nayar_override = None;
+        self.sheen_override = None;
+        let [sr, sg, sb] = LightUniforms::DEFAULT_AMBIENT_SKY;
+        let [gr, gg, gb] = LightUniforms::DEFAULT_AMBIENT_GROUND;
+        self.light_uniforms.ambient_sky = [sr, sg, sb, 1.0];
+        self.light_uniforms.ambient_ground = [gr, gg, gb, 1.0];
+        self.light_uniforms.sheen_color_strength = [0.0; 4];
+    }
+
+    /// Soften the diffuse terminator (0 = physically sharp / legacy shading).
+    /// Scenes set this via `[environment] diffuse_wrap`.
+    pub fn set_diffuse_wrap(&mut self, wrap: f32) {
+        self.diffuse_wrap_override = Some(wrap.max(0.0));
+        self.apply_ambient_override();
+    }
+
+    /// Blend the diffuse term from Lambert toward the Fujii Oren-Nayar
+    /// approximation (0 = exact legacy shading, 1 = full Oren-Nayar; sigma
+    /// comes from material roughness). Scenes set this via
+    /// `[environment] oren_nayar` (ADR 0048).
+    pub fn set_oren_nayar(&mut self, blend: f32) {
+        self.oren_nayar_override = Some(blend.max(0.0));
+        self.apply_ambient_override();
+    }
+
+    /// Tinted Charlie-sheen rim: `color` is a linear RGB tint, `strength`
+    /// 0..~0.3 (0 = exact legacy shading). Scenes set this via
+    /// `[environment] sheen_color / sheen_strength` (ADR 0048).
+    pub fn set_sheen(&mut self, color: [f32; 3], strength: f32) {
+        self.sheen_override = Some((color, strength.max(0.0)));
+        self.apply_ambient_override();
+    }
+
+    /// Snapshot of the current lighting-lever state (overrides if set, else
+    /// the built-in neutral defaults). Read by the render debug panel.
+    pub fn lighting_levers(&self) -> LightingLevers {
+        let (ambient_sky, ambient_ground) = self.ambient_override.unwrap_or((
+            LightUniforms::DEFAULT_AMBIENT_SKY,
+            LightUniforms::DEFAULT_AMBIENT_GROUND,
+        ));
+        let (sheen_color, sheen_strength) = self.sheen_override.unwrap_or(([0.0; 3], 0.0));
+        LightingLevers {
+            ambient_sky,
+            ambient_ground,
+            diffuse_wrap: self.diffuse_wrap_override.unwrap_or(0.0),
+            oren_nayar: self.oren_nayar_override.unwrap_or(0.0),
+            sheen_color,
+            sheen_strength,
+        }
+    }
+
+    fn apply_ambient_override(&mut self) {
+        if let Some((sky, ground)) = self.ambient_override {
+            self.light_uniforms.ambient_sky = [sky[0], sky[1], sky[2], 1.0];
+            self.light_uniforms.ambient_ground = [ground[0], ground[1], ground[2], 1.0];
+        }
+        if let Some(wrap) = self.diffuse_wrap_override {
+            // Shader decodes wrap = ambient_sky.w - 1.0
+            self.light_uniforms.ambient_sky[3] = 1.0 + wrap;
+        }
+        if let Some(oren) = self.oren_nayar_override {
+            // Shader decodes oren = ambient_ground.w - 1.0
+            self.light_uniforms.ambient_ground[3] = 1.0 + oren;
+        }
+        if let Some((color, strength)) = self.sheen_override {
+            self.light_uniforms.sheen_color_strength = [color[0], color[1], color[2], strength];
+        }
+    }
+
     fn extract_lights_from_world(&mut self, world: &FlintWorld) {
         let mut dir_count = 0u32;
         let mut point_count = 0u32;
@@ -2871,7 +3114,24 @@ impl SceneRenderer {
         let mut points = [PointLight::default(); MAX_POINT_LIGHTS];
         let mut spots = [SpotLight::default(); MAX_SPOT_LIGHTS];
 
-        for &entity_id in world.entities_with_component(comp::LIGHT) {
+        // Deterministic iteration: the component index is a HashSet whose
+        // order changes per process, which silently reassigned the one
+        // shadow-casting directional slot (index 0) between runs. Sort by
+        // entity name (then id) so light order is stable and authored.
+        let mut light_entities: Vec<_> = world
+            .entities_with_component(comp::LIGHT)
+            .iter()
+            .copied()
+            .collect();
+        light_entities.sort_by(|a, b| {
+            world
+                .get_name(*a)
+                .unwrap_or("")
+                .cmp(world.get_name(*b).unwrap_or(""))
+                .then(a.cmp(b))
+        });
+
+        for entity_id in light_entities {
             let light_component = world
                 .get_components(entity_id)
                 .and_then(|components| components.get(comp::LIGHT).cloned());
@@ -2897,13 +3157,21 @@ impl SceneRenderer {
                             let volumetric_color =
                                 Self::extract_light_vec3(&light, "volumetric_color")
                                     .unwrap_or(color);
+                            // Apparent source angular size, authored in
+                            // degrees (sun ~0.5, softbox 2-5); drives PCSS
+                            // penumbra (ADR 0056). Stored in radians.
+                            let angular_size = light
+                                .get("angular_size")
+                                .and_then(toml_f32)
+                                .unwrap_or(0.0)
+                                .to_radians();
                             directionals[dir_count as usize] = DirectionalLight {
                                 direction,
                                 volumetric_intensity,
                                 color,
                                 intensity,
                                 volumetric_color,
-                                _pad1: 0.0,
+                                angular_size,
                             };
                             dir_count += 1;
                         }
@@ -2917,11 +3185,17 @@ impl SceneRenderer {
                                 .or_else(|| light.get("radius"))
                                 .and_then(toml_f32)
                                 .unwrap_or(10.0);
+                            let source_radius =
+                                light.get("source_radius").and_then(toml_f32).unwrap_or(0.0);
                             points[point_count as usize] = PointLight {
                                 position: [light_pos.x, light_pos.y, light_pos.z],
                                 radius,
                                 color,
                                 intensity,
+                                source_radius,
+                                _pad0: 0.0,
+                                _pad1: 0.0,
+                                _pad2: 0.0,
                             };
                             point_count += 1;
                         }
@@ -2941,6 +3215,8 @@ impl SceneRenderer {
                                 light.get("inner_angle").and_then(toml_f32).unwrap_or(0.3);
                             let outer_angle =
                                 light.get("outer_angle").and_then(toml_f32).unwrap_or(0.5);
+                            let source_radius =
+                                light.get("source_radius").and_then(toml_f32).unwrap_or(0.0);
                             spots[spot_count as usize] = SpotLight {
                                 position: [light_pos.x, light_pos.y, light_pos.z],
                                 radius,
@@ -2949,7 +3225,7 @@ impl SceneRenderer {
                                 color,
                                 outer_angle,
                                 intensity,
-                                _pad0: 0.0,
+                                source_radius,
                                 _pad1: 0.0,
                                 _pad2: 0.0,
                             };
@@ -2961,9 +3237,19 @@ impl SceneRenderer {
             }
         }
 
+        // Strongest directional casts the shadows: only index 0 gets CSM, so
+        // put the highest-intensity directional first (sun over fill),
+        // independent of entity naming. Stable sort keeps name order on ties.
+        directionals[..dir_count as usize].sort_by(|a, b| {
+            b.intensity
+                .partial_cmp(&a.intensity)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
         // If no lights found in scene, use defaults
         if dir_count == 0 && point_count == 0 && spot_count == 0 {
             self.light_uniforms = LightUniforms::default_scene_lights();
+            self.apply_ambient_override();
         } else {
             self.light_uniforms.directional_lights = directionals;
             self.light_uniforms.point_lights = points;
@@ -3025,6 +3311,37 @@ impl SceneRenderer {
             height,
             self.postprocess_config.kuwahara_enabled,
         ));
+        // The recreated resources drop the FXAA intermediate; re-allocate it
+        // at the new size when the pass is active (ADR 0050).
+        self.ensure_fxaa_resources(device);
+    }
+
+    /// Ensure FXAA GPU resources exist (call after enabling FXAA at runtime
+    /// and after resize). No-op when `fxaa` is disabled — the default-off
+    /// path allocates nothing (ADR 0050, Kuwahara lazy pattern).
+    pub fn ensure_fxaa_resources(&mut self, device: &wgpu::Device) {
+        if !self.postprocess_config.fxaa_enabled {
+            return;
+        }
+        if let Some(pp) = &mut self.postprocess_pipeline {
+            if pp.fxaa.is_none() {
+                pp.fxaa = Some(crate::postprocess::FxaaPipeline::new(
+                    device,
+                    self.surface_format,
+                ));
+            }
+        }
+        if let Some(resources) = &mut self.postprocess_resources {
+            if resources.fxaa.is_none() {
+                let (w, h) = (resources.width, resources.height);
+                resources.fxaa = Some(crate::postprocess::FxaaResources::new(
+                    device,
+                    w,
+                    h,
+                    self.surface_format,
+                ));
+            }
+        }
     }
 
     /// Get the current post-processing configuration.
@@ -3078,6 +3395,164 @@ impl SceneRenderer {
                 resources.kuwahara = Some(crate::postprocess::KuwaharaTextures::new(device, w, h));
             }
         }
+    }
+
+    /// Validate the configured MSAA sample count (ADR 0058): 1 or 4;
+    /// anything else clamps to 1 with a warning.
+    fn resolve_sample_count(requested: u32) -> u32 {
+        match requested {
+            1 | 4 => requested,
+            other => {
+                tracing::warn!(
+                    "Unsupported MSAA sample count {} - falling back to 1 (supported: 1, 4)",
+                    other
+                );
+                1
+            }
+        }
+    }
+
+    /// Lazily (re)create the MSAA color+depth targets at the given size.
+    fn ensure_msaa_targets(&mut self, device: &wgpu::Device, width: u32, height: u32) {
+        if let Some((_, _, w, h)) = &self.msaa_color {
+            if *w == width && *h == height {
+                return;
+            }
+        }
+        let color = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("MSAA Scene Color"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: self.sample_count,
+            dimension: wgpu::TextureDimension::D2,
+            format: HDR_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let color_view = color.create_view(&wgpu::TextureViewDescriptor::default());
+        let depth = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("MSAA Scene Depth"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: self.sample_count,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Depth32Float,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let depth_view = depth.create_view(&wgpu::TextureViewDescriptor::default());
+        self.msaa_color = Some((color, color_view, width, height));
+        self.msaa_depth = Some((depth, depth_view));
+    }
+
+    /// Lazily create the sample-0 depth-resolve pipeline (ADR 0058).
+    fn ensure_depth_resolve_pipeline(&mut self, device: &wgpu::Device) {
+        if self.depth_resolve_pipeline.is_some() {
+            return;
+        }
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Depth Resolve Shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("../depth_resolve.wgsl").into()),
+        });
+        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Depth Resolve Bind Group Layout"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Depth,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: true,
+                },
+                count: None,
+            }],
+        });
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Depth Resolve Pipeline Layout"),
+            bind_group_layouts: &[&layout],
+            push_constant_ranges: &[],
+        });
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Depth Resolve Pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_fullscreen"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_resolve"),
+                targets: &[],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: true,
+                depth_compare: wgpu::CompareFunction::Always,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+        self.depth_resolve_layout = Some(layout);
+        self.depth_resolve_pipeline = Some(pipeline);
+    }
+
+    /// Copy sample 0 of the MSAA depth into a single-sample depth view via
+    /// a fullscreen frag-depth pass, so SSAO/DoF/fog/volumetric/ocean-grab
+    /// consumers stay unchanged (ADR 0058).
+    fn resolve_depth_into(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        target_depth_view: &wgpu::TextureView,
+    ) {
+        let (pipeline, layout) = match (&self.depth_resolve_pipeline, &self.depth_resolve_layout) {
+            (Some(p), Some(l)) => (p, l),
+            _ => return,
+        };
+        let msaa_depth_view = match &self.msaa_depth {
+            Some((_, v)) => v,
+            None => return,
+        };
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Depth Resolve Bind Group"),
+            layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(msaa_depth_view),
+            }],
+        });
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("Depth Resolve Pass"),
+            color_attachments: &[],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: target_depth_view,
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(1.0),
+                    store: wgpu::StoreOp::Store,
+                }),
+                stencil_ops: None,
+            }),
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        });
+        pass.set_pipeline(pipeline);
+        pass.set_bind_group(0, &bind_group, &[]);
+        pass.draw(0..3, 0..1);
     }
 
     // ── Slim render_to: orchestrates shadow → uniforms → main pass → postprocess ──
@@ -3175,11 +3650,38 @@ impl SceneRenderer {
             self.read_grass_instance_count(device);
         }
 
+        // MSAA (ADR 0058): scene passes draw into MSAA color/depth and
+        // resolve color into the HDR buffer; depth resolves (sample 0) into
+        // the caller's depth view after each opaque phase so every existing
+        // depth consumer stays single-sample. Requires the HDR chain (both
+        // constructors always build it).
+        let msaa_active = self.sample_count > 1 && has_postprocess;
+        if msaa_active {
+            let (w, h) = {
+                let res = self.postprocess_resources.as_ref().unwrap();
+                (res.width, res.height)
+            };
+            self.ensure_msaa_targets(device, w, h);
+            self.ensure_depth_resolve_pipeline(device);
+        }
+
         // Choose render target: HDR buffer or direct to surface
         let scene_target_view = if has_postprocess {
             &self.postprocess_resources.as_ref().unwrap().hdr_view
         } else {
             target_view
+        };
+
+        // Scene-pass attachments: MSAA views with a color resolve when
+        // active, the plain single-sample pair otherwise.
+        let (pass_color_view, pass_resolve_target, pass_depth_view) = if msaa_active {
+            (
+                &self.msaa_color.as_ref().unwrap().1,
+                Some(scene_target_view),
+                &self.msaa_depth.as_ref().unwrap().1,
+            )
+        } else {
+            (scene_target_view, None, depth_view)
         };
 
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -3191,8 +3693,8 @@ impl SceneRenderer {
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Render Pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: scene_target_view,
-                    resolve_target: None,
+                    view: pass_color_view,
+                    resolve_target: pass_resolve_target,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
                             r: 0.1,
@@ -3204,7 +3706,7 @@ impl SceneRenderer {
                     },
                 })],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: depth_view,
+                    view: pass_depth_view,
                     depth_ops: Some(wgpu::Operations {
                         load: wgpu::LoadOp::Clear(1.0),
                         store: wgpu::StoreOp::Store,
@@ -3222,6 +3724,9 @@ impl SceneRenderer {
                 RenderPhase::All,
             );
             drop(render_pass);
+            if msaa_active {
+                self.resolve_depth_into(device, &mut encoder, depth_view);
+            }
         } else {
             // ── Grab-pass split: opaque scene → snapshot → ocean + rest ──
             // Pass A: sky + all opaque geometry (including the legs).
@@ -3229,8 +3734,8 @@ impl SceneRenderer {
                 let mut pass_a = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("Render Pass A (pre-ocean)"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: scene_target_view,
-                        resolve_target: None,
+                        view: pass_color_view,
+                        resolve_target: pass_resolve_target,
                         ops: wgpu::Operations {
                             load: wgpu::LoadOp::Clear(wgpu::Color {
                                 r: 0.1,
@@ -3242,7 +3747,7 @@ impl SceneRenderer {
                         },
                     })],
                     depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                        view: depth_view,
+                        view: pass_depth_view,
                         depth_ops: Some(wgpu::Operations {
                             load: wgpu::LoadOp::Clear(1.0),
                             store: wgpu::StoreOp::Store,
@@ -3259,6 +3764,12 @@ impl SceneRenderer {
                     camera,
                     RenderPhase::PreOcean,
                 );
+            }
+
+            // With MSAA, the grab blit below reads the caller's single-sample
+            // depth view — resolve the opaque depth into it first (ADR 0058).
+            if msaa_active {
+                self.resolve_depth_into(device, &mut encoder, depth_view);
             }
 
             // Blit: snapshot opaque color + depth into sampleable copies.
@@ -3314,15 +3825,15 @@ impl SceneRenderer {
                 let mut pass_b = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("Render Pass B (ocean + transparents)"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: scene_target_view,
-                        resolve_target: None,
+                        view: pass_color_view,
+                        resolve_target: pass_resolve_target,
                         ops: wgpu::Operations {
                             load: wgpu::LoadOp::Load,
                             store: wgpu::StoreOp::Store,
                         },
                     })],
                     depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                        view: depth_view,
+                        view: pass_depth_view,
                         depth_ops: Some(wgpu::Operations {
                             load: wgpu::LoadOp::Load,
                             store: wgpu::StoreOp::Store,
@@ -3339,6 +3850,12 @@ impl SceneRenderer {
                     camera,
                     RenderPhase::PostOcean,
                 );
+            }
+
+            // Final depth resolve so postprocess (SSAO/DoF/fog/volumetric)
+            // sees the complete frame's depth (ADR 0058).
+            if msaa_active {
+                self.resolve_depth_into(device, &mut encoder, depth_view);
             }
         }
 

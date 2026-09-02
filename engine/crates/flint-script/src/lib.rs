@@ -16,12 +16,44 @@ pub mod ui;
 
 pub use context::DrawCommand;
 pub use context::StateScope;
+pub use context::{ConductedCue, ConductedPulse, ConductedSnapshot, CueParam};
 use context::{InputSnapshot, ScriptCommand};
 use engine::ScriptEngine;
 use flint_core::Result;
 use flint_ecs::FlintWorld;
 use flint_runtime::{GameEvent, InputState, RuntimeSystem};
 use sync::ScriptSync;
+
+/// Post-processing overrides set by scripts this frame; each field is `Some`
+/// only if the corresponding `set_*` API was called since the last drain.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct PostProcessOverrides {
+    pub vignette: Option<f32>,
+    pub bloom: Option<f32>,
+    pub exposure: Option<f32>,
+    pub chromatic_aberration: Option<f32>,
+    pub radial_blur: Option<f32>,
+    pub ssao_intensity: Option<f32>,
+    pub fog_density: Option<f32>,
+    pub desaturation: Option<f32>,
+    pub dof_strength: Option<f32>,
+    pub dof_focus_distance: Option<f32>,
+    pub dof_focus_range: Option<f32>,
+}
+
+/// Camera overrides set by scripts this frame; each field is `Some` only if
+/// the corresponding `set_camera_*` API was called since the last drain.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct CameraOverrides {
+    pub position: Option<[f32; 3]>,
+    pub target: Option<[f32; 3]>,
+    pub fov: Option<f32>,
+    pub orthographic: Option<bool>,
+    pub ortho_height: Option<f32>,
+    /// Roll about the view axis, radians. `None` means "no roll this frame" —
+    /// the host resets the camera up vector to world up.
+    pub roll: Option<f32>,
+}
 
 /// Top-level scripting system integrating engine, sync, and the game loop
 pub struct ScriptSystem {
@@ -111,20 +143,20 @@ impl ScriptSystem {
 
     /// Set transition state for script access
     pub fn set_transition_state(&mut self, progress: f64, phase: &str) {
-        let mut c = self.engine.ctx.lock().unwrap();
+        let mut c = crate::lock_or_recover(&self.engine.ctx);
         c.transition_progress = progress;
         c.transition_phase = phase.to_string();
     }
 
     /// Set the current scene path for script access
     pub fn set_current_scene(&mut self, path: &str) {
-        let mut c = self.engine.ctx.lock().unwrap();
+        let mut c = crate::lock_or_recover(&self.engine.ctx);
         c.current_scene_path = path.to_string();
     }
 
     /// Set camera position and direction for weapon aiming
     pub fn set_camera(&mut self, position: [f32; 3], direction: [f32; 3]) {
-        let mut c = self.engine.ctx.lock().unwrap();
+        let mut c = crate::lock_or_recover(&self.engine.ctx);
         c.camera_position = position;
         c.camera_direction = direction;
     }
@@ -136,15 +168,24 @@ impl ScriptSystem {
 
     /// Set screen dimensions for UI draw functions
     pub fn set_screen_size(&mut self, w: f32, h: f32) {
-        let mut c = self.engine.ctx.lock().unwrap();
+        let mut c = crate::lock_or_recover(&self.engine.ctx);
         c.screen_width = w;
         c.screen_height = h;
     }
 
     /// Sync loaded chunk IDs so scripts can query `is_chunk_loaded`
     pub fn set_loaded_chunk_ids(&mut self, ids: std::collections::HashSet<String>) {
-        let mut c = self.engine.ctx.lock().unwrap();
+        let mut c = crate::lock_or_recover(&self.engine.ctx);
         c.loaded_chunk_ids = ids;
+    }
+
+    /// Set the conducted-parameters snapshot for this frame (ADR 0020).
+    /// Persistent, not take(): the host re-sets it every frame, passing
+    /// `ConductedSnapshot::default()` (the neutral, settled-world state)
+    /// when no music session is active.
+    pub fn set_conducted(&mut self, conducted: ConductedSnapshot) {
+        let mut c = crate::lock_or_recover(&self.engine.ctx);
+        c.conducted = conducted;
     }
 
     /// Load a script file for a specific entity (for chunk loading).
@@ -166,10 +207,7 @@ impl ScriptSystem {
                 self.sync.discovered.insert(entity_id);
             }
             Err(e) => {
-                tracing::warn!(
-                    "Compile error for chunk entity {:?}: {}",
-                    entity_id, e
-                );
+                tracing::warn!("Compile error for chunk entity {:?}: {}", entity_id, e);
             }
         }
     }
@@ -201,7 +239,7 @@ impl ScriptSystem {
 
     /// Generate draw commands from the data-driven UI system
     pub fn generate_ui_draw_commands(&mut self, screen_w: f32, screen_h: f32) -> Vec<DrawCommand> {
-        let mut c = self.engine.ctx.lock().unwrap();
+        let mut c = crate::lock_or_recover(&self.engine.ctx);
         c.ui_system.generate_draw_commands(screen_w, screen_h)
     }
 
@@ -225,58 +263,39 @@ impl ScriptSystem {
     }
 
     /// Take camera overrides set by scripts this frame (clears them)
-    pub fn take_camera_overrides(
-        &mut self,
-    ) -> (
-        Option<[f32; 3]>,
-        Option<[f32; 3]>,
-        Option<f32>,
-        Option<bool>,
-        Option<f32>,
-    ) {
-        let mut c = self.engine.ctx.lock().unwrap();
-        let pos = c.camera_position_override.take();
-        let target = c.camera_target_override.take();
-        let fov = c.camera_fov_override.take();
-        let orthographic = c.camera_orthographic_override.take();
-        let ortho_height = c.camera_ortho_height_override.take();
-        (pos, target, fov, orthographic, ortho_height)
+    pub fn take_camera_overrides(&mut self) -> CameraOverrides {
+        let mut c = crate::lock_or_recover(&self.engine.ctx);
+        CameraOverrides {
+            position: c.camera_position_override.take(),
+            target: c.camera_target_override.take(),
+            fov: c.camera_fov_override.take(),
+            orthographic: c.camera_orthographic_override.take(),
+            ortho_height: c.camera_ortho_height_override.take(),
+            roll: c.camera_roll_override.take(),
+        }
     }
 
     /// Take post-processing overrides set by scripts this frame (clears them)
-    pub fn take_postprocess_overrides(
-        &mut self,
-    ) -> (
-        Option<f32>,
-        Option<f32>,
-        Option<f32>,
-        Option<f32>,
-        Option<f32>,
-        Option<f32>,
-        Option<f32>,
-    ) {
-        let mut c = self.engine.ctx.lock().unwrap();
-        let vignette = c.postprocess_vignette_override.take();
-        let bloom = c.postprocess_bloom_override.take();
-        let exposure = c.postprocess_exposure_override.take();
-        let chromatic_aberration = c.postprocess_chromatic_aberration_override.take();
-        let radial_blur = c.postprocess_radial_blur_override.take();
-        let ssao_intensity = c.postprocess_ssao_intensity_override.take();
-        let fog_density = c.postprocess_fog_density_override.take();
-        (
-            vignette,
-            bloom,
-            exposure,
-            chromatic_aberration,
-            radial_blur,
-            ssao_intensity,
-            fog_density,
-        )
+    pub fn take_postprocess_overrides(&mut self) -> PostProcessOverrides {
+        let mut c = crate::lock_or_recover(&self.engine.ctx);
+        PostProcessOverrides {
+            vignette: c.postprocess_vignette_override.take(),
+            bloom: c.postprocess_bloom_override.take(),
+            exposure: c.postprocess_exposure_override.take(),
+            chromatic_aberration: c.postprocess_chromatic_aberration_override.take(),
+            radial_blur: c.postprocess_radial_blur_override.take(),
+            ssao_intensity: c.postprocess_ssao_intensity_override.take(),
+            fog_density: c.postprocess_fog_density_override.take(),
+            desaturation: c.postprocess_desaturation_override.take(),
+            dof_strength: c.postprocess_dof_strength_override.take(),
+            dof_focus_distance: c.postprocess_dof_focus_distance_override.take(),
+            dof_focus_range: c.postprocess_dof_focus_range_override.take(),
+        }
     }
 
     /// Take audio low-pass filter override set by scripts this frame (clears it)
     pub fn take_audio_overrides(&mut self) -> Option<f32> {
-        let mut c = self.engine.ctx.lock().unwrap();
+        let mut c = crate::lock_or_recover(&self.engine.ctx);
         c.audio_lowpass_cutoff_override.take()
     }
 
@@ -295,9 +314,7 @@ impl ScriptSystem {
     /// Take the reality-tear render mode overrides set by scripts this
     /// frame (clears them): ((mode, mix), mode_params).
     #[allow(clippy::type_complexity)]
-    pub fn take_render_mode_overrides(
-        &mut self,
-    ) -> (Option<(u32, f32)>, Option<[f32; 4]>) {
+    pub fn take_render_mode_overrides(&mut self) -> (Option<(u32, f32)>, Option<[f32; 4]>) {
         let mut c = self.engine.ctx.lock().unwrap();
         (
             c.postprocess_render_mode_override.take(),
@@ -312,7 +329,7 @@ impl ScriptSystem {
 
     /// Set the terrain height sampling callback for scripts
     pub fn set_terrain_height_fn(&mut self, f: Option<Box<dyn Fn(f32, f32) -> f32 + Send + Sync>>) {
-        let mut c = self.engine.ctx.lock().unwrap();
+        let mut c = crate::lock_or_recover(&self.engine.ctx);
         c.terrain_height_fn = f;
     }
 }
@@ -440,4 +457,36 @@ mod tests {
         let commands = system.engine.drain_commands();
         assert!(commands.is_empty());
     }
+
+    #[test]
+    fn test_desaturation_override_round_trip() {
+        let mut system = ScriptSystem::new();
+        {
+            let mut c = crate::lock_or_recover(&system.engine.ctx);
+            c.postprocess_desaturation_override = Some(0.85);
+        }
+        let overrides = system.take_postprocess_overrides();
+        assert_eq!(overrides.desaturation, Some(0.85));
+        // Drain clears: a second take returns all-None
+        let overrides = system.take_postprocess_overrides();
+        assert_eq!(overrides, PostProcessOverrides::default());
+    }
+}
+
+/// Lock a shared script-state mutex, recovering from poisoning instead of
+/// propagating the panic (ADR 0039). The guarded values are always-valid
+/// snapshots written whole each frame, so the last-written state is safe to
+/// read after a writer panicked; propagating would turn one panic into a
+/// panic on every later script call, contradicting the crate's
+/// log-and-continue policy. Logs once per process.
+pub(crate) fn lock_or_recover<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|poisoned| {
+        static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            tracing::error!(
+                "script context mutex poisoned (a thread panicked holding it);                  recovering with the last-written snapshot (ADR 0039)"
+            );
+        }
+        poisoned.into_inner()
+    })
 }

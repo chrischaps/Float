@@ -35,8 +35,175 @@ pub fn register_all(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>) {
     register_camera_2d_api(engine, ctx.clone());
     register_chunk_api(engine, ctx.clone());
     register_screen_ui_api(engine, ctx.clone());
+    register_conducted_api(engine, ctx.clone());
     register_ocean_api(engine, ctx.clone());
     register_log_api(engine, ctx);
+}
+
+// ─── Conducted-parameters API (ADR 0020) ──────────────────
+//
+// The music session's per-frame state for scene bindings: lean, target,
+// coherence, musical position, judged pulses, and the ladder/reintegration
+// visual ramps. Neutral defaults when no session is active (a clean,
+// settled world), so scripts never branch on session existence.
+
+fn register_conducted_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>) {
+    // conducted_lean() / conducted_target() -> Map #{x, y}
+    {
+        let ctx = ctx.clone();
+        engine.register_fn("conducted_lean", move || -> Map {
+            let c = crate::lock_or_recover(&ctx);
+            let mut map = Map::new();
+            map.insert("x".into(), Dynamic::from(c.conducted.lean[0]));
+            map.insert("y".into(), Dynamic::from(c.conducted.lean[1]));
+            map
+        });
+    }
+    {
+        let ctx = ctx.clone();
+        engine.register_fn("conducted_target", move || -> Map {
+            let c = crate::lock_or_recover(&ctx);
+            let mut map = Map::new();
+            map.insert("x".into(), Dynamic::from(c.conducted.target[0]));
+            map.insert("y".into(), Dynamic::from(c.conducted.target[1]));
+            map
+        });
+    }
+
+    // conducted_next_target() -> Map #{x, y, beats}: the next authored lean
+    // key and suite beats until its anchor (ADR 0023). beats = 1e6 (and
+    // x/y = the current target) when nothing is upcoming.
+    {
+        let ctx = ctx.clone();
+        engine.register_fn("conducted_next_target", move || -> Map {
+            let c = crate::lock_or_recover(&ctx);
+            let mut map = Map::new();
+            map.insert("x".into(), Dynamic::from(c.conducted.next_target[0]));
+            map.insert("y".into(), Dynamic::from(c.conducted.next_target[1]));
+            map.insert("beats".into(), Dynamic::from(c.conducted.next_target_beats));
+            map
+        });
+    }
+
+    // Scalar getters, all f64 (Rhai has no implicit numeric coercion).
+    macro_rules! scalar_getter {
+        ($name:literal, $field:ident) => {{
+            let ctx = ctx.clone();
+            engine.register_fn($name, move || -> f64 {
+                let c = crate::lock_or_recover(&ctx);
+                c.conducted.$field
+            });
+        }};
+    }
+    scalar_getter!("conducted_coherence", coherence);
+    scalar_getter!("conducted_beat_phase", beat_phase);
+    scalar_getter!("conducted_bar_phase", bar_phase);
+    scalar_getter!("conducted_beat", beat);
+    scalar_getter!("conducted_desaturate", desaturate);
+    scalar_getter!("conducted_blur", blur);
+    scalar_getter!("conducted_chromatic", chromatic);
+    scalar_getter!("conducted_reassembly", reassembly);
+    scalar_getter!("conducted_rewind", rewind);
+
+    // conducted_bar() -> i64
+    {
+        let ctx = ctx.clone();
+        engine.register_fn("conducted_bar", move || -> i64 {
+            let c = crate::lock_or_recover(&ctx);
+            c.conducted.bar
+        });
+    }
+
+    // conducted_section() -> String ("" when none)
+    {
+        let ctx = ctx.clone();
+        engine.register_fn("conducted_section", move || -> String {
+            let c = crate::lock_or_recover(&ctx);
+            c.conducted.section.clone()
+        });
+    }
+
+    // conducted_pulses() -> Array of Map #{age: f64, err_ms: f64, kind: string}
+    // Pulses judged this frame — empty most frames.
+    {
+        let ctx = ctx.clone();
+        engine.register_fn("conducted_pulses", move || -> rhai::Array {
+            let c = crate::lock_or_recover(&ctx);
+            c.conducted
+                .pulses
+                .iter()
+                .map(|p| {
+                    let mut map = Map::new();
+                    map.insert("age".into(), Dynamic::from(p.age));
+                    map.insert("err_ms".into(), Dynamic::from(p.err_ms));
+                    map.insert("kind".into(), Dynamic::from(p.kind.clone()));
+                    Dynamic::from_map(map)
+                })
+                .collect()
+        });
+    }
+
+    // conducted_sway() -> Map #{x, y} (zeros under the prototype input map)
+    {
+        let ctx = ctx.clone();
+        engine.register_fn("conducted_sway", move || -> Map {
+            let c = crate::lock_or_recover(&ctx);
+            let mut map = Map::new();
+            map.insert("x".into(), Dynamic::from(c.conducted.sway[0]));
+            map.insert("y".into(), Dynamic::from(c.conducted.sway[1]));
+            map
+        });
+    }
+
+    // conducted_pressure_l() / conducted_pressure_r() -> f64 in [0,1]
+    scalar_getter!("conducted_pressure_l", pressure_l);
+    scalar_getter!("conducted_pressure_r", pressure_r);
+
+    // conducted_cues() -> Array of Map #{name: string, age: f64, params: Map}
+    // Chart cues fired this frame (ADR 0033) — empty most frames. Params are
+    // the chart's free-form table, flattened to floats/strings/bools.
+    {
+        let ctx = ctx.clone();
+        engine.register_fn("conducted_cues", move || -> rhai::Array {
+            let c = crate::lock_or_recover(&ctx);
+            c.conducted
+                .cues
+                .iter()
+                .map(|cue| {
+                    let mut params = Map::new();
+                    for (k, v) in &cue.params {
+                        let d = match v {
+                            crate::context::CueParam::Number(n) => Dynamic::from(*n),
+                            crate::context::CueParam::Text(s) => Dynamic::from(s.clone()),
+                            crate::context::CueParam::Flag(b) => Dynamic::from(*b),
+                        };
+                        params.insert(k.as_str().into(), d);
+                    }
+                    let mut map = Map::new();
+                    map.insert("name".into(), Dynamic::from(cue.name.clone()));
+                    map.insert("age".into(), Dynamic::from(cue.age));
+                    map.insert("params".into(), Dynamic::from_map(params));
+                    Dynamic::from_map(map)
+                })
+                .collect()
+        });
+    }
+
+    // conducted_no_input() / conducted_preroll() -> bool
+    {
+        let ctx = ctx.clone();
+        engine.register_fn("conducted_no_input", move || -> bool {
+            let c = crate::lock_or_recover(&ctx);
+            c.conducted.no_input
+        });
+    }
+    {
+        let ctx = ctx.clone();
+        engine.register_fn("conducted_preroll", move || -> bool {
+            let c = crate::lock_or_recover(&ctx);
+            c.conducted.preroll
+        });
+    }
 }
 
 // ─── Ocean API ───────────────────────────────────────────
@@ -128,7 +295,7 @@ fn register_entity_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>) 
     {
         let ctx = ctx.clone();
         engine.register_fn("self_entity", move || -> i64 {
-            let c = ctx.lock().unwrap();
+            let c = crate::lock_or_recover(&ctx);
             c.current_entity.raw() as i64
         });
     }
@@ -137,7 +304,7 @@ fn register_entity_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>) 
     {
         let ctx = ctx.clone();
         engine.register_fn("this_entity", move || -> i64 {
-            let c = ctx.lock().unwrap();
+            let c = crate::lock_or_recover(&ctx);
             c.current_entity.raw() as i64
         });
     }
@@ -146,7 +313,7 @@ fn register_entity_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>) 
     {
         let ctx = ctx.clone();
         engine.register_fn("get_entity", move |name: &str| -> i64 {
-            let c = ctx.lock().unwrap();
+            let c = crate::lock_or_recover(&ctx);
             let world = unsafe { c.world_ref() };
             world.get_id(name).map(|id| id.raw() as i64).unwrap_or(-1)
         });
@@ -159,7 +326,7 @@ fn register_entity_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>) 
             if id < 0 {
                 return false;
             }
-            let c = ctx.lock().unwrap();
+            let c = crate::lock_or_recover(&ctx);
             let world = unsafe { c.world_ref() };
             world.contains(EntityId::from_raw(id as u64))
         });
@@ -172,7 +339,7 @@ fn register_entity_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>) 
             if id < 0 {
                 return String::new();
             }
-            let c = ctx.lock().unwrap();
+            let c = crate::lock_or_recover(&ctx);
             let world = unsafe { c.world_ref() };
             world
                 .get_name(EntityId::from_raw(id as u64))
@@ -188,7 +355,7 @@ fn register_entity_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>) 
             if id < 0 {
                 return false;
             }
-            let c = ctx.lock().unwrap();
+            let c = crate::lock_or_recover(&ctx);
             let world = unsafe { c.world_ref() };
             world
                 .get_components(EntityId::from_raw(id as u64))
@@ -204,7 +371,7 @@ fn register_entity_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>) 
             if id < 0 {
                 return Dynamic::UNIT;
             }
-            let c = ctx.lock().unwrap();
+            let c = crate::lock_or_recover(&ctx);
             let world = unsafe { c.world_ref() };
             match world.get_components(EntityId::from_raw(id as u64)) {
                 Some(comps) => match comps.get(comp) {
@@ -225,7 +392,7 @@ fn register_entity_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>) 
                 if id < 0 {
                     return Dynamic::UNIT;
                 }
-                let c = ctx.lock().unwrap();
+                let c = crate::lock_or_recover(&ctx);
                 let world = unsafe { c.world_ref() };
                 world
                     .get_components(EntityId::from_raw(id as u64))
@@ -245,7 +412,7 @@ fn register_entity_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>) 
                 if id < 0 {
                     return;
                 }
-                let c = ctx.lock().unwrap();
+                let c = crate::lock_or_recover(&ctx);
                 let world = unsafe { c.world_mut() };
                 if let Some(tv) = dynamic_to_toml(&val) {
                     if let Some(comps) = world.get_components_mut(EntityId::from_raw(id as u64)) {
@@ -264,7 +431,7 @@ fn register_entity_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>) 
             if id < 0 {
                 return map;
             }
-            let c = ctx.lock().unwrap();
+            let c = crate::lock_or_recover(&ctx);
             let world = unsafe { c.world_ref() };
             if let Some(transform) = world.get_transform(EntityId::from_raw(id as u64)) {
                 map.insert("x".into(), Dynamic::from(transform.position.x as f64));
@@ -282,7 +449,7 @@ fn register_entity_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>) 
             if id < 0 {
                 return;
             }
-            let c = ctx.lock().unwrap();
+            let c = crate::lock_or_recover(&ctx);
             let world = unsafe { c.world_mut() };
             let eid = EntityId::from_raw(id as u64);
             if let Some(comps) = world.get_components_mut(eid) {
@@ -307,7 +474,7 @@ fn register_entity_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>) 
             if id < 0 {
                 return map;
             }
-            let c = ctx.lock().unwrap();
+            let c = crate::lock_or_recover(&ctx);
             let world = unsafe { c.world_ref() };
             if let Some(transform) = world.get_transform(EntityId::from_raw(id as u64)) {
                 map.insert("x".into(), Dynamic::from(transform.rotation.x as f64));
@@ -325,7 +492,7 @@ fn register_entity_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>) 
             if id < 0 {
                 return;
             }
-            let c = ctx.lock().unwrap();
+            let c = crate::lock_or_recover(&ctx);
             let world = unsafe { c.world_mut() };
             let eid = EntityId::from_raw(id as u64);
             if let Some(comps) = world.get_components_mut(eid) {
@@ -355,7 +522,7 @@ fn register_entity_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>) 
             if a < 0 || b < 0 {
                 return f64::MAX;
             }
-            let c = ctx.lock().unwrap();
+            let c = crate::lock_or_recover(&ctx);
             let world = unsafe { c.world_ref() };
             let ta = world.get_transform(EntityId::from_raw(a as u64));
             let tb = world.get_transform(EntityId::from_raw(b as u64));
@@ -375,7 +542,7 @@ fn register_entity_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>) 
     {
         let ctx = ctx.clone();
         engine.register_fn("spawn_entity", move |name: &str| -> i64 {
-            let c = ctx.lock().unwrap();
+            let c = crate::lock_or_recover(&ctx);
             let world = unsafe { c.world_mut() };
             world.spawn(name).map(|id| id.raw() as i64).unwrap_or(-1)
         });
@@ -388,7 +555,7 @@ fn register_entity_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>) 
             if id < 0 {
                 return;
             }
-            let c = ctx.lock().unwrap();
+            let c = crate::lock_or_recover(&ctx);
             let world = unsafe { c.world_mut() };
             let _ = world.despawn(EntityId::from_raw(id as u64));
         });
@@ -401,7 +568,7 @@ fn register_entity_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>) 
             if child_id < 0 || parent_id < 0 {
                 return;
             }
-            let c = ctx.lock().unwrap();
+            let c = crate::lock_or_recover(&ctx);
             let world = unsafe { c.world_mut() };
             let _ = world.set_parent(
                 EntityId::from_raw(child_id as u64),
@@ -417,7 +584,7 @@ fn register_entity_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>) 
             if id < 0 {
                 return -1;
             }
-            let c = ctx.lock().unwrap();
+            let c = crate::lock_or_recover(&ctx);
             let world = unsafe { c.world_ref() };
             world
                 .get_parent(EntityId::from_raw(id as u64))
@@ -433,7 +600,7 @@ fn register_entity_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>) 
             if id < 0 {
                 return vec![];
             }
-            let c = ctx.lock().unwrap();
+            let c = crate::lock_or_recover(&ctx);
             let world = unsafe { c.world_ref() };
             world
                 .get_children(EntityId::from_raw(id as u64))
@@ -451,7 +618,7 @@ fn register_entity_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>) 
             if id < 0 {
                 return map;
             }
-            let c = ctx.lock().unwrap();
+            let c = crate::lock_or_recover(&ctx);
             let world = unsafe { c.world_ref() };
             if let Some(pos) = world.get_world_position(EntityId::from_raw(id as u64)) {
                 map.insert("x".into(), Dynamic::from(pos.x as f64));
@@ -471,7 +638,7 @@ fn register_entity_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>) 
                 if id < 0 {
                     return;
                 }
-                let c = ctx.lock().unwrap();
+                let c = crate::lock_or_recover(&ctx);
                 let world = unsafe { c.world_mut() };
                 let eid = EntityId::from_raw(id as u64);
                 if let Some(comps) = world.get_components_mut(eid) {
@@ -488,7 +655,7 @@ fn register_entity_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>) 
     {
         let ctx = ctx.clone();
         engine.register_fn("find_entities_with", move |comp: &str| -> rhai::Array {
-            let c = ctx.lock().unwrap();
+            let c = crate::lock_or_recover(&ctx);
             let world = unsafe { c.world_ref() };
             world
                 .entities_with_component(comp)
@@ -502,7 +669,7 @@ fn register_entity_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>) 
     {
         let ctx = ctx.clone();
         engine.register_fn("entity_count_with", move |comp: &str| -> i64 {
-            let c = ctx.lock().unwrap();
+            let c = crate::lock_or_recover(&ctx);
             let world = unsafe { c.world_ref() };
             world.entities_with_component(comp).len() as i64
         });
@@ -521,7 +688,7 @@ fn register_spline_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>) 
                 if spline_id < 0 {
                     return Dynamic::UNIT;
                 }
-                let c = ctx.lock().unwrap();
+                let c = crate::lock_or_recover(&ctx);
                 let world = unsafe { c.world_ref() };
                 let eid = EntityId::from_raw(spline_id as u64);
                 let comps = match world.get_components(eid) {
@@ -606,7 +773,7 @@ fn register_spline_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>) 
             if spline_id < 0 {
                 return false;
             }
-            let c = ctx.lock().unwrap();
+            let c = crate::lock_or_recover(&ctx);
             let world = unsafe { c.world_ref() };
             let eid = EntityId::from_raw(spline_id as u64);
             let comps = match world.get_components(eid) {
@@ -668,7 +835,7 @@ fn register_spline_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>) 
             if spline_id < 0 {
                 return Dynamic::UNIT;
             }
-            let c = ctx.lock().unwrap();
+            let c = crate::lock_or_recover(&ctx);
             let world = unsafe { c.world_ref() };
             let eid = EntityId::from_raw(spline_id as u64);
             let comps = match world.get_components(eid) {
@@ -733,7 +900,7 @@ fn register_spline_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>) 
                 if spline_id < 0 {
                     return Dynamic::UNIT;
                 }
-                let c = ctx.lock().unwrap();
+                let c = crate::lock_or_recover(&ctx);
                 let world = unsafe { c.world_ref() };
                 let eid = EntityId::from_raw(spline_id as u64);
                 let comps = match world.get_components(eid) {
@@ -859,7 +1026,7 @@ fn register_input_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>) {
     {
         let ctx = ctx.clone();
         engine.register_fn("is_action_pressed", move |action: &str| -> bool {
-            let c = ctx.lock().unwrap();
+            let c = crate::lock_or_recover(&ctx);
             c.input.actions_pressed.contains(action)
         });
     }
@@ -868,7 +1035,7 @@ fn register_input_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>) {
     {
         let ctx = ctx.clone();
         engine.register_fn("is_action_just_pressed", move |action: &str| -> bool {
-            let c = ctx.lock().unwrap();
+            let c = crate::lock_or_recover(&ctx);
             c.input.actions_just_pressed.contains(action)
         });
     }
@@ -877,7 +1044,7 @@ fn register_input_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>) {
     {
         let ctx = ctx.clone();
         engine.register_fn("is_action_just_released", move |action: &str| -> bool {
-            let c = ctx.lock().unwrap();
+            let c = crate::lock_or_recover(&ctx);
             c.input.actions_just_released.contains(action)
         });
     }
@@ -886,7 +1053,7 @@ fn register_input_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>) {
     {
         let ctx = ctx.clone();
         engine.register_fn("action_value", move |action: &str| -> f64 {
-            let c = ctx.lock().unwrap();
+            let c = crate::lock_or_recover(&ctx);
             c.input.action_values.get(action).copied().unwrap_or(0.0)
         });
     }
@@ -906,7 +1073,7 @@ fn register_input_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>) {
     {
         let ctx = ctx.clone();
         engine.register_fn("mouse_delta_x", move || -> f64 {
-            let c = ctx.lock().unwrap();
+            let c = crate::lock_or_recover(&ctx);
             c.input.mouse_delta.0
         });
     }
@@ -915,7 +1082,7 @@ fn register_input_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>) {
     {
         let ctx = ctx.clone();
         engine.register_fn("mouse_delta_y", move || -> f64 {
-            let c = ctx.lock().unwrap();
+            let c = crate::lock_or_recover(&ctx);
             c.input.mouse_delta.1
         });
     }
@@ -927,14 +1094,14 @@ fn register_time_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>) {
     {
         let ctx = ctx.clone();
         engine.register_fn("delta_time", move || -> f64 {
-            let c = ctx.lock().unwrap();
+            let c = crate::lock_or_recover(&ctx);
             c.delta_time
         });
     }
     {
         let ctx = ctx.clone();
         engine.register_fn("total_time", move || -> f64 {
-            let c = ctx.lock().unwrap();
+            let c = crate::lock_or_recover(&ctx);
             c.total_time
         });
     }
@@ -947,7 +1114,7 @@ fn register_audio_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>) {
     {
         let ctx = ctx.clone();
         engine.register_fn("play_sound", move |name: &str| {
-            let mut c = ctx.lock().unwrap();
+            let mut c = crate::lock_or_recover(&ctx);
             c.commands.push(ScriptCommand::PlaySound {
                 name: name.to_string(),
                 volume: 1.0,
@@ -959,7 +1126,7 @@ fn register_audio_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>) {
     {
         let ctx = ctx.clone();
         engine.register_fn("play_sound", move |name: &str, volume: f64| {
-            let mut c = ctx.lock().unwrap();
+            let mut c = crate::lock_or_recover(&ctx);
             c.commands.push(ScriptCommand::PlaySound {
                 name: name.to_string(),
                 volume,
@@ -973,7 +1140,7 @@ fn register_audio_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>) {
         engine.register_fn(
             "play_sound_at",
             move |name: &str, x: f64, y: f64, z: f64, vol: f64| {
-                let mut c = ctx.lock().unwrap();
+                let mut c = crate::lock_or_recover(&ctx);
                 c.commands.push(ScriptCommand::PlaySoundAt {
                     name: name.to_string(),
                     position: (x, y, z),
@@ -1005,7 +1172,7 @@ fn register_audio_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>) {
     {
         let ctx = ctx.clone();
         engine.register_fn("stop_sound", move |name: &str| {
-            let mut c = ctx.lock().unwrap();
+            let mut c = crate::lock_or_recover(&ctx);
             c.commands.push(ScriptCommand::StopSound {
                 name: name.to_string(),
             });
@@ -1023,7 +1190,7 @@ fn register_animation_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>
             if entity_id < 0 {
                 return;
             }
-            let c = ctx.lock().unwrap();
+            let c = crate::lock_or_recover(&ctx);
             let world = unsafe { c.world_mut() };
             let eid = EntityId::from_raw(entity_id as u64);
             if let Some(comps) = world.get_components_mut(eid) {
@@ -1044,7 +1211,7 @@ fn register_animation_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>
             if entity_id < 0 {
                 return;
             }
-            let c = ctx.lock().unwrap();
+            let c = crate::lock_or_recover(&ctx);
             let world = unsafe { c.world_mut() };
             let eid = EntityId::from_raw(entity_id as u64);
             if let Some(comps) = world.get_components_mut(eid) {
@@ -1062,7 +1229,7 @@ fn register_animation_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>
                 if entity_id < 0 {
                     return;
                 }
-                let c = ctx.lock().unwrap();
+                let c = crate::lock_or_recover(&ctx);
                 let world = unsafe { c.world_mut() };
                 let eid = EntityId::from_raw(entity_id as u64);
                 if let Some(comps) = world.get_components_mut(eid) {
@@ -1088,7 +1255,7 @@ fn register_animation_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>
             if entity_id < 0 {
                 return;
             }
-            let c = ctx.lock().unwrap();
+            let c = crate::lock_or_recover(&ctx);
             let world = unsafe { c.world_mut() };
             let eid = EntityId::from_raw(entity_id as u64);
             if let Some(comps) = world.get_components_mut(eid) {
@@ -1107,7 +1274,7 @@ fn register_physics_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>)
         engine.register_fn(
             "raycast",
             move |ox: f64, oy: f64, oz: f64, dx: f64, dy: f64, dz: f64, max_dist: f64| -> Dynamic {
-                let c = ctx.lock().unwrap();
+                let c = crate::lock_or_recover(&ctx);
                 let physics = unsafe { c.physics_ref() };
                 let physics = match physics {
                     Some(p) => p,
@@ -1145,7 +1312,7 @@ fn register_physics_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>)
     {
         let ctx = ctx.clone();
         engine.register_fn("get_camera_direction", move || -> Map {
-            let c = ctx.lock().unwrap();
+            let c = crate::lock_or_recover(&ctx);
             let mut map = Map::new();
             map.insert("x".into(), Dynamic::from(c.camera_direction[0] as f64));
             map.insert("y".into(), Dynamic::from(c.camera_direction[1] as f64));
@@ -1158,7 +1325,7 @@ fn register_physics_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>)
     {
         let ctx = ctx.clone();
         engine.register_fn("get_camera_position", move || -> Map {
-            let c = ctx.lock().unwrap();
+            let c = crate::lock_or_recover(&ctx);
             let mut map = Map::new();
             map.insert("x".into(), Dynamic::from(c.camera_position[0] as f64));
             map.insert("y".into(), Dynamic::from(c.camera_position[1] as f64));
@@ -1171,7 +1338,7 @@ fn register_physics_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>)
     {
         let ctx = ctx.clone();
         engine.register_fn("set_camera_position", move |x: f64, y: f64, z: f64| {
-            let mut c = ctx.lock().unwrap();
+            let mut c = crate::lock_or_recover(&ctx);
             c.camera_position_override = Some([x as f32, y as f32, z as f32]);
         });
     }
@@ -1180,7 +1347,7 @@ fn register_physics_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>)
     {
         let ctx = ctx.clone();
         engine.register_fn("set_camera_target", move |x: f64, y: f64, z: f64| {
-            let mut c = ctx.lock().unwrap();
+            let mut c = crate::lock_or_recover(&ctx);
             c.camera_target_override = Some([x as f32, y as f32, z as f32]);
         });
     }
@@ -1189,7 +1356,7 @@ fn register_physics_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>)
     {
         let ctx = ctx.clone();
         engine.register_fn("set_camera_fov", move |fov: f64| {
-            let mut c = ctx.lock().unwrap();
+            let mut c = crate::lock_or_recover(&ctx);
             c.camera_fov_override = Some(fov as f32);
         });
     }
@@ -1198,7 +1365,7 @@ fn register_physics_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>)
     {
         let ctx = ctx.clone();
         engine.register_fn("set_camera_orthographic", move |enabled: bool| {
-            let mut c = ctx.lock().unwrap();
+            let mut c = crate::lock_or_recover(&ctx);
             c.camera_orthographic_override = Some(enabled);
         });
     }
@@ -1207,8 +1374,17 @@ fn register_physics_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>)
     {
         let ctx = ctx.clone();
         engine.register_fn("set_camera_ortho_height", move |height: f64| {
-            let mut c = ctx.lock().unwrap();
+            let mut c = crate::lock_or_recover(&ctx);
             c.camera_ortho_height_override = Some(height as f32);
+        });
+    }
+
+    // set_camera_roll(radians) — roll the camera about its view axis
+    {
+        let ctx = ctx.clone();
+        engine.register_fn("set_camera_roll", move |radians: f64| {
+            let mut c = crate::lock_or_recover(&ctx);
+            c.camera_roll_override = Some(radians as f32);
         });
     }
 
@@ -1216,7 +1392,7 @@ fn register_physics_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>)
     {
         let ctx = ctx.clone();
         engine.register_fn("set_vignette", move |intensity: f64| {
-            let mut c = ctx.lock().unwrap();
+            let mut c = crate::lock_or_recover(&ctx);
             c.postprocess_vignette_override = Some(intensity as f32);
         });
     }
@@ -1225,7 +1401,7 @@ fn register_physics_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>)
     {
         let ctx = ctx.clone();
         engine.register_fn("set_bloom_intensity", move |intensity: f64| {
-            let mut c = ctx.lock().unwrap();
+            let mut c = crate::lock_or_recover(&ctx);
             c.postprocess_bloom_override = Some(intensity as f32);
         });
     }
@@ -1234,7 +1410,7 @@ fn register_physics_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>)
     {
         let ctx = ctx.clone();
         engine.register_fn("set_exposure", move |value: f64| {
-            let mut c = ctx.lock().unwrap();
+            let mut c = crate::lock_or_recover(&ctx);
             c.postprocess_exposure_override = Some(value as f32);
         });
     }
@@ -1243,7 +1419,7 @@ fn register_physics_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>)
     {
         let ctx = ctx.clone();
         engine.register_fn("set_chromatic_aberration", move |intensity: f64| {
-            let mut c = ctx.lock().unwrap();
+            let mut c = crate::lock_or_recover(&ctx);
             c.postprocess_chromatic_aberration_override = Some(intensity as f32);
         });
     }
@@ -1252,7 +1428,7 @@ fn register_physics_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>)
     {
         let ctx = ctx.clone();
         engine.register_fn("set_radial_blur", move |intensity: f64| {
-            let mut c = ctx.lock().unwrap();
+            let mut c = crate::lock_or_recover(&ctx);
             c.postprocess_radial_blur_override = Some(intensity as f32);
         });
     }
@@ -1261,7 +1437,7 @@ fn register_physics_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>)
     {
         let ctx = ctx.clone();
         engine.register_fn("set_ssao_intensity", move |intensity: f64| {
-            let mut c = ctx.lock().unwrap();
+            let mut c = crate::lock_or_recover(&ctx);
             c.postprocess_ssao_intensity_override = Some(intensity as f32);
         });
     }
@@ -1270,8 +1446,36 @@ fn register_physics_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>)
     {
         let ctx = ctx.clone();
         engine.register_fn("set_fog_density", move |density: f64| {
-            let mut c = ctx.lock().unwrap();
+            let mut c = crate::lock_or_recover(&ctx);
             c.postprocess_fog_density_override = Some(density as f32);
+        });
+    }
+
+    // set_desaturation(amount) — override desaturation (0 = full color, 1 = ash-grey)
+    {
+        let ctx = ctx.clone();
+        engine.register_fn("set_desaturation", move |amount: f64| {
+            let mut c = crate::lock_or_recover(&ctx);
+            c.postprocess_desaturation_override = Some(amount as f32);
+        });
+    }
+
+    // set_dof(strength) — depth-of-field defocus strength (0 = off / sharp, 1 = full blur)
+    {
+        let ctx = ctx.clone();
+        engine.register_fn("set_dof", move |strength: f64| {
+            let mut c = crate::lock_or_recover(&ctx);
+            c.postprocess_dof_strength_override = Some(strength as f32);
+        });
+    }
+
+    // set_dof_focus(distance, range) — focus plane depth and half-width, world units
+    {
+        let ctx = ctx.clone();
+        engine.register_fn("set_dof_focus", move |distance: f64, range: f64| {
+            let mut c = crate::lock_or_recover(&ctx);
+            c.postprocess_dof_focus_distance_override = Some(distance as f32);
+            c.postprocess_dof_focus_range_override = Some(range as f32);
         });
     }
 
@@ -1316,7 +1520,7 @@ fn register_physics_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>)
     {
         let ctx = ctx.clone();
         engine.register_fn("set_audio_lowpass", move |cutoff_hz: f64| {
-            let mut c = ctx.lock().unwrap();
+            let mut c = crate::lock_or_recover(&ctx);
             c.audio_lowpass_cutoff_override = Some(cutoff_hz as f32);
         });
     }
@@ -1342,7 +1546,7 @@ fn register_physics_2d_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext
         engine.register_fn(
             "overlap_rect",
             move |x: f64, y: f64, w: f64, h: f64| -> rhai::Array {
-                let c = ctx.lock().unwrap();
+                let c = crate::lock_or_recover(&ctx);
                 let physics = unsafe { c.physics_ref() };
                 match physics {
                     Some(p) => p
@@ -1362,7 +1566,7 @@ fn register_physics_2d_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext
         engine.register_fn(
             "raycast_2d",
             move |ox: f64, oy: f64, dx: f64, dy: f64, max_dist: f64| -> Dynamic {
-                let c = ctx.lock().unwrap();
+                let c = crate::lock_or_recover(&ctx);
                 let physics = unsafe { c.physics_ref() };
                 let physics = match physics {
                     Some(p) => p,
@@ -1399,7 +1603,7 @@ fn register_physics_2d_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext
         engine.register_fn(
             "set_velocity_2d",
             move |entity_id: i64, vx: f64, vy: f64| {
-                let mut c = ctx.lock().unwrap();
+                let mut c = crate::lock_or_recover(&ctx);
                 c.commands
                     .push(ScriptCommand::SetVelocity2D { entity_id, vx, vy });
             },
@@ -1413,7 +1617,7 @@ fn register_physics_2d_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext
             if entity_id < 0 {
                 return Dynamic::UNIT;
             }
-            let c = ctx.lock().unwrap();
+            let c = crate::lock_or_recover(&ctx);
             let physics = unsafe { c.physics_ref() };
             match physics {
                 Some(p) => match p.get_velocity_2d(EntityId::from_raw(entity_id as u64)) {
@@ -1515,7 +1719,7 @@ fn register_event_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>) {
     {
         let ctx = ctx.clone();
         engine.register_fn("fire_event", move |name: &str| {
-            let mut c = ctx.lock().unwrap();
+            let mut c = crate::lock_or_recover(&ctx);
             c.commands.push(ScriptCommand::FireEvent {
                 name: name.to_string(),
                 data: toml::Value::Table(toml::map::Map::new()),
@@ -1527,7 +1731,7 @@ fn register_event_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>) {
     {
         let ctx = ctx.clone();
         engine.register_fn("fire_event_data", move |name: &str, data: Map| {
-            let mut c = ctx.lock().unwrap();
+            let mut c = crate::lock_or_recover(&ctx);
             let toml_data = map_to_toml(&data);
             c.commands.push(ScriptCommand::FireEvent {
                 name: name.to_string(),
@@ -1544,7 +1748,7 @@ fn register_particle_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>
     {
         let ctx = ctx.clone();
         engine.register_fn("emit_burst", move |entity_id: i64, count: i64| {
-            let mut c = ctx.lock().unwrap();
+            let mut c = crate::lock_or_recover(&ctx);
             c.commands
                 .push(ScriptCommand::EmitBurst { entity_id, count });
         });
@@ -1554,7 +1758,7 @@ fn register_particle_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>
     {
         let ctx = ctx.clone();
         engine.register_fn("start_emitter", move |entity_id: i64| {
-            let mut c = ctx.lock().unwrap();
+            let mut c = crate::lock_or_recover(&ctx);
             let world = unsafe { &mut *c.world };
             let eid = EntityId(entity_id as u64);
             if let Some(comps) = world.get_components_mut(eid) {
@@ -1571,7 +1775,7 @@ fn register_particle_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>
     {
         let ctx = ctx.clone();
         engine.register_fn("stop_emitter", move |entity_id: i64| {
-            let mut c = ctx.lock().unwrap();
+            let mut c = crate::lock_or_recover(&ctx);
             let world = unsafe { &mut *c.world };
             let eid = EntityId(entity_id as u64);
             if let Some(comps) = world.get_components_mut(eid) {
@@ -1588,7 +1792,7 @@ fn register_particle_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>
     {
         let ctx = ctx.clone();
         engine.register_fn("set_emission_rate", move |entity_id: i64, rate: f64| {
-            let mut c = ctx.lock().unwrap();
+            let mut c = crate::lock_or_recover(&ctx);
             let world = unsafe { &mut *c.world };
             let eid = EntityId(entity_id as u64);
             if let Some(comps) = world.get_components_mut(eid) {
@@ -1607,7 +1811,7 @@ fn register_log_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>) {
     {
         let ctx = ctx.clone();
         engine.register_fn("log", move |msg: &str| {
-            let mut c = ctx.lock().unwrap();
+            let mut c = crate::lock_or_recover(&ctx);
             c.commands.push(ScriptCommand::Log {
                 level: LogLevel::Info,
                 message: msg.to_string(),
@@ -1619,7 +1823,7 @@ fn register_log_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>) {
     {
         let ctx = ctx.clone();
         engine.register_fn("log_info", move |msg: &str| {
-            let mut c = ctx.lock().unwrap();
+            let mut c = crate::lock_or_recover(&ctx);
             c.commands.push(ScriptCommand::Log {
                 level: LogLevel::Info,
                 message: msg.to_string(),
@@ -1631,7 +1835,7 @@ fn register_log_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>) {
     {
         let ctx = ctx.clone();
         engine.register_fn("log_warn", move |msg: &str| {
-            let mut c = ctx.lock().unwrap();
+            let mut c = crate::lock_or_recover(&ctx);
             c.commands.push(ScriptCommand::Log {
                 level: LogLevel::Warn,
                 message: msg.to_string(),
@@ -1643,7 +1847,7 @@ fn register_log_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>) {
     {
         let ctx = ctx.clone();
         engine.register_fn("log_error", move |msg: &str| {
-            let mut c = ctx.lock().unwrap();
+            let mut c = crate::lock_or_recover(&ctx);
             c.commands.push(ScriptCommand::Log {
                 level: LogLevel::Error,
                 message: msg.to_string(),
@@ -1661,7 +1865,7 @@ fn register_ui_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>) {
         engine.register_fn(
             "draw_text",
             move |x: f64, y: f64, text: &str, size: f64, r: f64, g: f64, b: f64, a: f64| {
-                let mut c = ctx.lock().unwrap();
+                let mut c = crate::lock_or_recover(&ctx);
                 c.draw_commands.push(DrawCommand::Text {
                     x: x as f32,
                     y: y as f32,
@@ -1690,7 +1894,7 @@ fn register_ui_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>) {
                   b: f64,
                   a: f64,
                   layer: i64| {
-                let mut c = ctx.lock().unwrap();
+                let mut c = crate::lock_or_recover(&ctx);
                 c.draw_commands.push(DrawCommand::Text {
                     x: x as f32,
                     y: y as f32,
@@ -1723,7 +1927,7 @@ fn register_ui_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>) {
                   sb: f64,
                   sa: f64,
                   sw: f64| {
-                let mut c = ctx.lock().unwrap();
+                let mut c = crate::lock_or_recover(&ctx);
                 c.draw_commands.push(DrawCommand::Text {
                     x: x as f32,
                     y: y as f32,
@@ -1744,7 +1948,7 @@ fn register_ui_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>) {
         engine.register_fn(
             "draw_rect",
             move |x: f64, y: f64, w: f64, h: f64, r: f64, g: f64, b: f64, a: f64| {
-                let mut c = ctx.lock().unwrap();
+                let mut c = crate::lock_or_recover(&ctx);
                 c.draw_commands.push(DrawCommand::RectFilled {
                     x: x as f32,
                     y: y as f32,
@@ -1773,7 +1977,7 @@ fn register_ui_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>) {
                   a: f64,
                   rounding: f64,
                   layer: i64| {
-                let mut c = ctx.lock().unwrap();
+                let mut c = crate::lock_or_recover(&ctx);
                 c.draw_commands.push(DrawCommand::RectFilled {
                     x: x as f32,
                     y: y as f32,
@@ -1801,7 +2005,7 @@ fn register_ui_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>) {
                   b: f64,
                   a: f64,
                   thickness: f64| {
-                let mut c = ctx.lock().unwrap();
+                let mut c = crate::lock_or_recover(&ctx);
                 c.draw_commands.push(DrawCommand::RectOutline {
                     x: x as f32,
                     y: y as f32,
@@ -1821,7 +2025,7 @@ fn register_ui_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>) {
         engine.register_fn(
             "draw_circle",
             move |x: f64, y: f64, radius: f64, r: f64, g: f64, b: f64, a: f64| {
-                let mut c = ctx.lock().unwrap();
+                let mut c = crate::lock_or_recover(&ctx);
                 c.draw_commands.push(DrawCommand::CircleFilled {
                     x: x as f32,
                     y: y as f32,
@@ -1839,7 +2043,7 @@ fn register_ui_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>) {
         engine.register_fn(
             "draw_circle_ex",
             move |x: f64, y: f64, radius: f64, r: f64, g: f64, b: f64, a: f64, layer: i64| {
-                let mut c = ctx.lock().unwrap();
+                let mut c = crate::lock_or_recover(&ctx);
                 c.draw_commands.push(DrawCommand::CircleFilled {
                     x: x as f32,
                     y: y as f32,
@@ -1857,7 +2061,7 @@ fn register_ui_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>) {
         engine.register_fn(
             "draw_circle_outline",
             move |x: f64, y: f64, radius: f64, r: f64, g: f64, b: f64, a: f64, thickness: f64| {
-                let mut c = ctx.lock().unwrap();
+                let mut c = crate::lock_or_recover(&ctx);
                 c.draw_commands.push(DrawCommand::CircleOutline {
                     x: x as f32,
                     y: y as f32,
@@ -1884,7 +2088,7 @@ fn register_ui_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>) {
                   a: f64,
                   thickness: f64,
                   layer: i64| {
-                let mut c = ctx.lock().unwrap();
+                let mut c = crate::lock_or_recover(&ctx);
                 c.draw_commands.push(DrawCommand::CircleOutline {
                     x: x as f32,
                     y: y as f32,
@@ -1911,7 +2115,7 @@ fn register_ui_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>) {
                   b: f64,
                   a: f64,
                   thickness: f64| {
-                let mut c = ctx.lock().unwrap();
+                let mut c = crate::lock_or_recover(&ctx);
                 c.draw_commands.push(DrawCommand::Line {
                     x1: x1 as f32,
                     y1: y1 as f32,
@@ -1940,7 +2144,7 @@ fn register_ui_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>) {
                   a: f64,
                   thickness: f64,
                   layer: i64| {
-                let mut c = ctx.lock().unwrap();
+                let mut c = crate::lock_or_recover(&ctx);
                 c.draw_commands.push(DrawCommand::Line {
                     x1: x1 as f32,
                     y1: y1 as f32,
@@ -1960,7 +2164,7 @@ fn register_ui_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>) {
         engine.register_fn(
             "draw_sprite",
             move |x: f64, y: f64, w: f64, h: f64, name: &str| {
-                let mut c = ctx.lock().unwrap();
+                let mut c = crate::lock_or_recover(&ctx);
                 c.draw_commands.push(DrawCommand::Sprite {
                     x: x as f32,
                     y: y as f32,
@@ -1994,7 +2198,7 @@ fn register_ui_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>) {
                   b: f64,
                   a: f64,
                   layer: i64| {
-                let mut c = ctx.lock().unwrap();
+                let mut c = crate::lock_or_recover(&ctx);
                 c.draw_commands.push(DrawCommand::Sprite {
                     x: x as f32,
                     y: y as f32,
@@ -2013,7 +2217,7 @@ fn register_ui_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>) {
     {
         let ctx = ctx.clone();
         engine.register_fn("screen_width", move || -> f64 {
-            let c = ctx.lock().unwrap();
+            let c = crate::lock_or_recover(&ctx);
             c.screen_width as f64
         });
     }
@@ -2022,7 +2226,7 @@ fn register_ui_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>) {
     {
         let ctx = ctx.clone();
         engine.register_fn("screen_height", move || -> f64 {
-            let c = ctx.lock().unwrap();
+            let c = crate::lock_or_recover(&ctx);
             c.screen_height as f64
         });
     }
@@ -2031,7 +2235,7 @@ fn register_ui_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>) {
     {
         let ctx = ctx.clone();
         engine.register_fn("find_nearest_interactable", move || -> Dynamic {
-            let c = ctx.lock().unwrap();
+            let c = crate::lock_or_recover(&ctx);
             let world = unsafe { c.world_ref() };
             match crate::engine::find_nearest_interactable(world) {
                 Some(nearest) => {
@@ -2057,7 +2261,7 @@ fn register_ui_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>) {
     {
         let ctx = ctx.clone();
         engine.register_fn("measure_text", move |text: &str, size: f64| -> Map {
-            drop(ctx.lock().unwrap());
+            drop(crate::lock_or_recover(&ctx));
             // Approximate text width: average character width ~0.6 * font_size
             let char_width = size * 0.6;
             let width = text.len() as f64 * char_width;
@@ -2077,7 +2281,7 @@ fn register_ui_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>) {
                 if entity_id < 0 {
                     return Dynamic::UNIT;
                 }
-                let c = ctx.lock().unwrap();
+                let c = crate::lock_or_recover(&ctx);
                 let physics = unsafe { c.physics_ref() };
                 let physics = match physics {
                     Some(p) => p,
@@ -2120,7 +2324,7 @@ fn register_ui_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>) {
             if entity_id < 0 {
                 return Dynamic::UNIT;
             }
-            let c = ctx.lock().unwrap();
+            let c = crate::lock_or_recover(&ctx);
             let physics = unsafe { c.physics_ref() };
             let physics = match physics {
                 Some(p) => p,
@@ -2168,7 +2372,7 @@ fn register_data_ui_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>)
     {
         let ctx = ctx.clone();
         engine.register_fn("load_ui", move |layout_path: &str| -> i64 {
-            let mut c = ctx.lock().unwrap();
+            let mut c = crate::lock_or_recover(&ctx);
             // Resolve relative to project root (scene's parent's parent)
             let scene_dir = if c.current_scene_path.is_empty() {
                 std::path::PathBuf::from(".")
@@ -2193,7 +2397,7 @@ fn register_data_ui_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>)
     {
         let ctx = ctx.clone();
         engine.register_fn("unload_ui", move |handle: i64| {
-            let mut c = ctx.lock().unwrap();
+            let mut c = crate::lock_or_recover(&ctx);
             c.ui_system.unload(handle);
         });
     }
@@ -2202,7 +2406,7 @@ fn register_data_ui_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>)
     {
         let ctx = ctx.clone();
         engine.register_fn("ui_set_text", move |element_id: &str, text: &str| {
-            let mut c = ctx.lock().unwrap();
+            let mut c = crate::lock_or_recover(&ctx);
             c.ui_system.set_text(element_id, text);
         });
     }
@@ -2211,7 +2415,7 @@ fn register_data_ui_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>)
     {
         let ctx = ctx.clone();
         engine.register_fn("ui_show", move |element_id: &str| {
-            let mut c = ctx.lock().unwrap();
+            let mut c = crate::lock_or_recover(&ctx);
             c.ui_system.show(element_id);
         });
     }
@@ -2220,7 +2424,7 @@ fn register_data_ui_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>)
     {
         let ctx = ctx.clone();
         engine.register_fn("ui_hide", move |element_id: &str| {
-            let mut c = ctx.lock().unwrap();
+            let mut c = crate::lock_or_recover(&ctx);
             c.ui_system.hide(element_id);
         });
     }
@@ -2229,7 +2433,7 @@ fn register_data_ui_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>)
     {
         let ctx = ctx.clone();
         engine.register_fn("ui_set_visible", move |element_id: &str, visible: bool| {
-            let mut c = ctx.lock().unwrap();
+            let mut c = crate::lock_or_recover(&ctx);
             c.ui_system.set_visible(element_id, visible);
         });
     }
@@ -2240,7 +2444,7 @@ fn register_data_ui_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>)
         engine.register_fn(
             "ui_set_color",
             move |element_id: &str, r: f64, g: f64, b: f64, a: f64| {
-                let mut c = ctx.lock().unwrap();
+                let mut c = crate::lock_or_recover(&ctx);
                 c.ui_system
                     .set_color(element_id, r as f32, g as f32, b as f32, a as f32);
             },
@@ -2253,7 +2457,7 @@ fn register_data_ui_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>)
         engine.register_fn(
             "ui_set_bg_color",
             move |element_id: &str, r: f64, g: f64, b: f64, a: f64| {
-                let mut c = ctx.lock().unwrap();
+                let mut c = crate::lock_or_recover(&ctx);
                 c.ui_system
                     .set_bg_color(element_id, r as f32, g as f32, b as f32, a as f32);
             },
@@ -2266,7 +2470,7 @@ fn register_data_ui_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>)
         engine.register_fn(
             "ui_set_style",
             move |element_id: &str, prop: &str, val: Dynamic| {
-                let mut c = ctx.lock().unwrap();
+                let mut c = crate::lock_or_recover(&ctx);
                 let style_val = if val.is_float() {
                     StyleValue::Float(val.as_float().unwrap_or(0.0) as f32)
                 } else if val.is_int() {
@@ -2287,7 +2491,7 @@ fn register_data_ui_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>)
     {
         let ctx = ctx.clone();
         engine.register_fn("ui_reset_style", move |element_id: &str| {
-            let mut c = ctx.lock().unwrap();
+            let mut c = crate::lock_or_recover(&ctx);
             c.ui_system.reset_style(element_id);
         });
     }
@@ -2296,7 +2500,7 @@ fn register_data_ui_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>)
     {
         let ctx = ctx.clone();
         engine.register_fn("ui_set_class", move |element_id: &str, class: &str| {
-            let mut c = ctx.lock().unwrap();
+            let mut c = crate::lock_or_recover(&ctx);
             c.ui_system.set_class(element_id, class);
         });
     }
@@ -2305,7 +2509,7 @@ fn register_data_ui_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>)
     {
         let ctx = ctx.clone();
         engine.register_fn("ui_exists", move |element_id: &str| -> bool {
-            let c = ctx.lock().unwrap();
+            let c = crate::lock_or_recover(&ctx);
             c.ui_system.exists(element_id)
         });
     }
@@ -2314,7 +2518,7 @@ fn register_data_ui_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>)
     {
         let ctx = ctx.clone();
         engine.register_fn("ui_get_rect", move |element_id: &str| -> Dynamic {
-            let mut c = ctx.lock().unwrap();
+            let mut c = crate::lock_or_recover(&ctx);
             let sw = c.screen_width;
             let sh = c.screen_height;
             match c.ui_system.get_rect(element_id, sw, sh) {
@@ -2339,7 +2543,7 @@ fn register_state_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>) {
     {
         let ctx = ctx.clone();
         engine.register_fn("push_state", move |name: &str| {
-            let mut c = ctx.lock().unwrap();
+            let mut c = crate::lock_or_recover(&ctx);
             c.commands.push(ScriptCommand::PushState {
                 name: name.to_string(),
             });
@@ -2350,7 +2554,7 @@ fn register_state_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>) {
     {
         let ctx = ctx.clone();
         engine.register_fn("pop_state", move || {
-            let mut c = ctx.lock().unwrap();
+            let mut c = crate::lock_or_recover(&ctx);
             c.commands.push(ScriptCommand::PopState);
         });
     }
@@ -2359,7 +2563,7 @@ fn register_state_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>) {
     {
         let ctx = ctx.clone();
         engine.register_fn("replace_state", move |name: &str| {
-            let mut c = ctx.lock().unwrap();
+            let mut c = crate::lock_or_recover(&ctx);
             c.commands.push(ScriptCommand::ReplaceState {
                 name: name.to_string(),
             });
@@ -2370,7 +2574,7 @@ fn register_state_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>) {
     {
         let ctx = ctx.clone();
         engine.register_fn("current_state", move || -> String {
-            let c = ctx.lock().unwrap();
+            let c = crate::lock_or_recover(&ctx);
             if c.state_machine.is_null() {
                 return "playing".to_string();
             }
@@ -2383,7 +2587,7 @@ fn register_state_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>) {
     {
         let ctx = ctx.clone();
         engine.register_fn("state_stack", move || -> rhai::Array {
-            let c = ctx.lock().unwrap();
+            let c = crate::lock_or_recover(&ctx);
             if c.state_machine.is_null() {
                 return vec![Dynamic::from("playing".to_string())];
             }
@@ -2399,7 +2603,7 @@ fn register_state_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>) {
     {
         let ctx = ctx.clone();
         engine.register_fn("register_state", move |name: &str, config: Map| {
-            let mut c = ctx.lock().unwrap();
+            let mut c = crate::lock_or_recover(&ctx);
             if c.state_machine.is_null() {
                 return;
             }
@@ -2445,7 +2649,7 @@ fn register_scene_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>) {
     {
         let ctx = ctx.clone();
         engine.register_fn("load_scene", move |path: &str| {
-            let mut c = ctx.lock().unwrap();
+            let mut c = crate::lock_or_recover(&ctx);
             c.commands.push(ScriptCommand::LoadScene {
                 path: path.to_string(),
             });
@@ -2456,7 +2660,7 @@ fn register_scene_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>) {
     {
         let ctx = ctx.clone();
         engine.register_fn("reload_scene", move || {
-            let mut c = ctx.lock().unwrap();
+            let mut c = crate::lock_or_recover(&ctx);
             c.commands.push(ScriptCommand::ReloadScene);
         });
     }
@@ -2465,7 +2669,7 @@ fn register_scene_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>) {
     {
         let ctx = ctx.clone();
         engine.register_fn("current_scene", move || -> String {
-            let c = ctx.lock().unwrap();
+            let c = crate::lock_or_recover(&ctx);
             c.current_scene_path.clone()
         });
     }
@@ -2474,7 +2678,7 @@ fn register_scene_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>) {
     {
         let ctx = ctx.clone();
         engine.register_fn("complete_transition", move || {
-            let mut c = ctx.lock().unwrap();
+            let mut c = crate::lock_or_recover(&ctx);
             c.commands.push(ScriptCommand::FireEvent {
                 name: TRANSITION_COMPLETE.to_string(),
                 data: toml::Value::Table(toml::map::Map::new()),
@@ -2486,7 +2690,7 @@ fn register_scene_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>) {
     {
         let ctx = ctx.clone();
         engine.register_fn("transition_progress", move || -> f64 {
-            let c = ctx.lock().unwrap();
+            let c = crate::lock_or_recover(&ctx);
             c.transition_progress
         });
     }
@@ -2495,7 +2699,7 @@ fn register_scene_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>) {
     {
         let ctx = ctx.clone();
         engine.register_fn("is_transitioning", move || -> bool {
-            let c = ctx.lock().unwrap();
+            let c = crate::lock_or_recover(&ctx);
             c.transition_progress >= 0.0
         });
     }
@@ -2504,7 +2708,7 @@ fn register_scene_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>) {
     {
         let ctx = ctx.clone();
         engine.register_fn("transition_phase", move || -> String {
-            let c = ctx.lock().unwrap();
+            let c = crate::lock_or_recover(&ctx);
             c.transition_phase.clone()
         });
     }
@@ -2517,7 +2721,7 @@ fn register_persistence_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContex
     {
         let ctx = ctx.clone();
         engine.register_fn("persist_set", move |key: &str, val: Dynamic| {
-            let mut c = ctx.lock().unwrap();
+            let mut c = crate::lock_or_recover(&ctx);
             if c.persistent_store.is_null() {
                 return;
             }
@@ -2532,7 +2736,7 @@ fn register_persistence_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContex
     {
         let ctx = ctx.clone();
         engine.register_fn("persist_get", move |key: &str| -> Dynamic {
-            let c = ctx.lock().unwrap();
+            let c = crate::lock_or_recover(&ctx);
             if c.persistent_store.is_null() {
                 return Dynamic::UNIT;
             }
@@ -2548,7 +2752,7 @@ fn register_persistence_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContex
     {
         let ctx = ctx.clone();
         engine.register_fn("persist_has", move |key: &str| -> bool {
-            let c = ctx.lock().unwrap();
+            let c = crate::lock_or_recover(&ctx);
             if c.persistent_store.is_null() {
                 return false;
             }
@@ -2561,7 +2765,7 @@ fn register_persistence_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContex
     {
         let ctx = ctx.clone();
         engine.register_fn("persist_remove", move |key: &str| {
-            let mut c = ctx.lock().unwrap();
+            let mut c = crate::lock_or_recover(&ctx);
             if c.persistent_store.is_null() {
                 return;
             }
@@ -2574,7 +2778,7 @@ fn register_persistence_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContex
     {
         let ctx = ctx.clone();
         engine.register_fn("persist_clear", move || {
-            let mut c = ctx.lock().unwrap();
+            let mut c = crate::lock_or_recover(&ctx);
             if c.persistent_store.is_null() {
                 return;
             }
@@ -2587,7 +2791,7 @@ fn register_persistence_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContex
     {
         let ctx = ctx.clone();
         engine.register_fn("persist_keys", move || -> rhai::Array {
-            let c = ctx.lock().unwrap();
+            let c = crate::lock_or_recover(&ctx);
             if c.persistent_store.is_null() {
                 return vec![];
             }
@@ -2604,7 +2808,7 @@ fn register_persistence_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContex
     {
         let ctx = ctx.clone();
         engine.register_fn("persist_save", move |path: &str| {
-            let c = ctx.lock().unwrap();
+            let c = crate::lock_or_recover(&ctx);
             if c.persistent_store.is_null() {
                 return;
             }
@@ -2619,7 +2823,7 @@ fn register_persistence_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContex
     {
         let ctx = ctx.clone();
         engine.register_fn("persist_load", move |path: &str| {
-            let mut c = ctx.lock().unwrap();
+            let mut c = crate::lock_or_recover(&ctx);
             if c.persistent_store.is_null() {
                 return;
             }
@@ -2705,7 +2909,7 @@ fn register_terrain_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>)
     {
         let ctx = ctx.clone();
         engine.register_fn("terrain_height", move |x: f64, z: f64| -> f64 {
-            let c = ctx.lock().unwrap();
+            let c = crate::lock_or_recover(&ctx);
             if let Some(ref height_fn) = c.terrain_height_fn {
                 height_fn(x as f32, z as f32) as f64
             } else {
@@ -2727,7 +2931,7 @@ fn register_sprite_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>) 
                 if id < 0 {
                     return;
                 }
-                let c = ctx.lock().unwrap();
+                let c = crate::lock_or_recover(&ctx);
                 let world = unsafe { c.world_mut() };
                 let eid = EntityId::from_raw(id as u64);
                 if let Some(components) = world.get_components_mut(eid) {
@@ -2758,7 +2962,7 @@ fn register_sprite_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>) 
                 if id < 0 {
                     return;
                 }
-                let c = ctx.lock().unwrap();
+                let c = crate::lock_or_recover(&ctx);
                 let world = unsafe { c.world_mut() };
                 let eid = EntityId::from_raw(id as u64);
                 if let Some(components) = world.get_components_mut(eid) {
@@ -2782,7 +2986,7 @@ fn register_sprite_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>) 
                 if id < 0 {
                     return;
                 }
-                let c = ctx.lock().unwrap();
+                let c = crate::lock_or_recover(&ctx);
                 let world = unsafe { c.world_mut() };
                 let eid = EntityId::from_raw(id as u64);
                 if let Some(components) = world.get_components_mut(eid) {
@@ -2811,7 +3015,7 @@ fn register_sprite_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>) 
             if id < 0 {
                 return;
             }
-            let c = ctx.lock().unwrap();
+            let c = crate::lock_or_recover(&ctx);
             let world = unsafe { c.world_mut() };
             let eid = EntityId::from_raw(id as u64);
             if let Some(components) = world.get_components_mut(eid) {
@@ -2831,7 +3035,7 @@ fn register_sprite_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>) 
             if id < 0 {
                 return;
             }
-            let c = ctx.lock().unwrap();
+            let c = crate::lock_or_recover(&ctx);
             let world = unsafe { c.world_mut() };
             let eid = EntityId::from_raw(id as u64);
             if let Some(components) = world.get_components_mut(eid) {
@@ -2851,7 +3055,7 @@ fn register_sprite_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>) 
             if id < 0 {
                 return 0;
             }
-            let c = ctx.lock().unwrap();
+            let c = crate::lock_or_recover(&ctx);
             let world = unsafe { c.world_ref() };
             let eid = EntityId::from_raw(id as u64);
             if let Some(components) = world.get_components(eid) {
@@ -2877,7 +3081,7 @@ fn register_sprite_animation_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallC
             if id < 0 {
                 return;
             }
-            let c = ctx.lock().unwrap();
+            let c = crate::lock_or_recover(&ctx);
             let world = unsafe { c.world_mut() };
             let eid = EntityId::from_raw(id as u64);
             if let Some(components) = world.get_components_mut(eid) {
@@ -2898,7 +3102,7 @@ fn register_sprite_animation_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallC
             if id < 0 {
                 return;
             }
-            let c = ctx.lock().unwrap();
+            let c = crate::lock_or_recover(&ctx);
             let world = unsafe { c.world_mut() };
             let eid = EntityId::from_raw(id as u64);
             if let Some(components) = world.get_components_mut(eid) {
@@ -2918,7 +3122,7 @@ fn register_sprite_animation_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallC
             if id < 0 {
                 return;
             }
-            let c = ctx.lock().unwrap();
+            let c = crate::lock_or_recover(&ctx);
             let world = unsafe { c.world_mut() };
             let eid = EntityId::from_raw(id as u64);
             if let Some(components) = world.get_components_mut(eid) {
@@ -2934,7 +3138,7 @@ fn register_sprite_animation_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallC
             if id < 0 {
                 return false;
             }
-            let c = ctx.lock().unwrap();
+            let c = crate::lock_or_recover(&ctx);
             let world = unsafe { c.world_ref() };
             let eid = EntityId::from_raw(id as u64);
             if let Some(components) = world.get_components(eid) {
@@ -2954,7 +3158,7 @@ fn register_touch_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>) {
     {
         let ctx = ctx.clone();
         engine.register_fn("touch_count", move || -> i64 {
-            let c = ctx.lock().unwrap();
+            let c = crate::lock_or_recover(&ctx);
             c.input.touches.len() as i64
         });
     }
@@ -2963,7 +3167,7 @@ fn register_touch_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>) {
     {
         let ctx = ctx.clone();
         engine.register_fn("touch_x", move |id: i64| -> f64 {
-            let c = ctx.lock().unwrap();
+            let c = crate::lock_or_recover(&ctx);
             c.input
                 .touches
                 .iter()
@@ -2977,7 +3181,7 @@ fn register_touch_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>) {
     {
         let ctx = ctx.clone();
         engine.register_fn("touch_y", move |id: i64| -> f64 {
-            let c = ctx.lock().unwrap();
+            let c = crate::lock_or_recover(&ctx);
             c.input
                 .touches
                 .iter()
@@ -2991,7 +3195,7 @@ fn register_touch_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>) {
     {
         let ctx = ctx.clone();
         engine.register_fn("is_touching", move |id: i64| -> bool {
-            let c = ctx.lock().unwrap();
+            let c = crate::lock_or_recover(&ctx);
             c.input.touches.iter().any(|(tid, _, _)| *tid == id)
         });
     }
@@ -3000,7 +3204,7 @@ fn register_touch_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>) {
     {
         let ctx = ctx.clone();
         engine.register_fn("touch_just_started", move |id: i64| -> bool {
-            let c = ctx.lock().unwrap();
+            let c = crate::lock_or_recover(&ctx);
             c.input
                 .touch_just_started
                 .iter()
@@ -3012,7 +3216,7 @@ fn register_touch_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>) {
     {
         let ctx = ctx.clone();
         engine.register_fn("touch_just_ended", move |id: i64| -> bool {
-            let c = ctx.lock().unwrap();
+            let c = crate::lock_or_recover(&ctx);
             c.input.touch_just_ended.iter().any(|tid| *tid == id)
         });
     }
@@ -3021,7 +3225,7 @@ fn register_touch_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>) {
     {
         let ctx = ctx.clone();
         engine.register_fn("tap_count", move || -> i64 {
-            let c = ctx.lock().unwrap();
+            let c = crate::lock_or_recover(&ctx);
             c.input.touch_taps.len() as i64
         });
     }
@@ -3030,7 +3234,7 @@ fn register_touch_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>) {
     {
         let ctx = ctx.clone();
         engine.register_fn("tap_x", move |index: i64| -> f64 {
-            let c = ctx.lock().unwrap();
+            let c = crate::lock_or_recover(&ctx);
             c.input
                 .touch_taps
                 .get(index as usize)
@@ -3043,7 +3247,7 @@ fn register_touch_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>) {
     {
         let ctx = ctx.clone();
         engine.register_fn("tap_y", move |index: i64| -> f64 {
-            let c = ctx.lock().unwrap();
+            let c = crate::lock_or_recover(&ctx);
             c.input
                 .touch_taps
                 .get(index as usize)
@@ -3056,7 +3260,7 @@ fn register_touch_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>) {
     {
         let ctx = ctx.clone();
         engine.register_fn("swipe_count", move || -> i64 {
-            let c = ctx.lock().unwrap();
+            let c = crate::lock_or_recover(&ctx);
             c.input.touch_swipes.len() as i64
         });
     }
@@ -3065,7 +3269,7 @@ fn register_touch_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>) {
     {
         let ctx = ctx.clone();
         engine.register_fn("swipe_direction", move |index: i64| -> String {
-            let c = ctx.lock().unwrap();
+            let c = crate::lock_or_recover(&ctx);
             c.input
                 .touch_swipes
                 .get(index as usize)
@@ -3078,7 +3282,7 @@ fn register_touch_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>) {
     {
         let ctx = ctx.clone();
         engine.register_fn("swipe_x", move |index: i64| -> f64 {
-            let c = ctx.lock().unwrap();
+            let c = crate::lock_or_recover(&ctx);
             c.input
                 .touch_swipes
                 .get(index as usize)
@@ -3091,7 +3295,7 @@ fn register_touch_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>) {
     {
         let ctx = ctx.clone();
         engine.register_fn("swipe_y", move |index: i64| -> f64 {
-            let c = ctx.lock().unwrap();
+            let c = crate::lock_or_recover(&ctx);
             c.input
                 .touch_swipes
                 .get(index as usize)
@@ -3104,7 +3308,7 @@ fn register_touch_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>) {
     {
         let ctx = ctx.clone();
         engine.register_fn("is_swipe", move |direction: &str| -> bool {
-            let c = ctx.lock().unwrap();
+            let c = crate::lock_or_recover(&ctx);
             c.input
                 .touch_swipes
                 .iter()
@@ -3127,7 +3331,7 @@ fn register_camera_2d_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>
                   speed: f64,
                   deadzone_w: f64,
                   deadzone_h: f64| {
-                let mut c = ctx.lock().unwrap();
+                let mut c = crate::lock_or_recover(&ctx);
                 let dt = c.delta_time as f32;
                 if dt <= 0.0 {
                     return;
@@ -3204,7 +3408,7 @@ fn register_camera_2d_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>
     {
         let ctx = ctx.clone();
         engine.register_fn("camera_follow_position", move || -> Map {
-            let c = ctx.lock().unwrap();
+            let c = crate::lock_or_recover(&ctx);
             let mut map = Map::new();
             map.insert("x".into(), Dynamic::from(c.camera_follow.current_x as f64));
             map.insert("y".into(), Dynamic::from(c.camera_follow.current_y as f64));
@@ -3216,7 +3420,7 @@ fn register_camera_2d_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>
     {
         let ctx = ctx.clone();
         engine.register_fn("camera_follow_set", move |x: f64, y: f64| {
-            let mut c = ctx.lock().unwrap();
+            let mut c = crate::lock_or_recover(&ctx);
             c.camera_follow.current_x = x as f32;
             c.camera_follow.current_y = y as f32;
             c.camera_follow.initialized = true;
@@ -3229,7 +3433,7 @@ fn register_camera_2d_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>
         engine.register_fn(
             "camera_shake",
             move |amplitude: f64, frequency: f64, decay: f64| {
-                let mut c = ctx.lock().unwrap();
+                let mut c = crate::lock_or_recover(&ctx);
                 // Stack: take max of current + new amplitude
                 let new_amp = (c.shake.amplitude + amplitude as f32).max(amplitude as f32);
                 c.shake.amplitude = new_amp;
@@ -3244,7 +3448,7 @@ fn register_camera_2d_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>
     {
         let ctx = ctx.clone();
         engine.register_fn("camera_shake_stop", move || {
-            let mut c = ctx.lock().unwrap();
+            let mut c = crate::lock_or_recover(&ctx);
             c.shake.amplitude = 0.0;
             c.shake.phase = 0.0;
         });
@@ -3254,7 +3458,7 @@ fn register_camera_2d_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>
     {
         let ctx = ctx.clone();
         engine.register_fn("camera_apply_shake", move || {
-            let mut c = ctx.lock().unwrap();
+            let mut c = crate::lock_or_recover(&ctx);
             let dt = c.delta_time as f32;
             if dt <= 0.0 || c.shake.amplitude < 0.001 {
                 return;
@@ -3296,7 +3500,7 @@ fn register_chunk_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>) {
         engine.register_fn(
             "load_chunk",
             move |path: &str, offset_x: f64, offset_y: f64, chunk_id: &str| {
-                let mut c = ctx.lock().unwrap();
+                let mut c = crate::lock_or_recover(&ctx);
                 c.commands.push(ScriptCommand::LoadChunk {
                     path: path.to_string(),
                     offset_x,
@@ -3311,7 +3515,7 @@ fn register_chunk_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>) {
     {
         let ctx = ctx.clone();
         engine.register_fn("unload_chunk", move |chunk_id: &str| {
-            let mut c = ctx.lock().unwrap();
+            let mut c = crate::lock_or_recover(&ctx);
             c.commands.push(ScriptCommand::UnloadChunk {
                 chunk_id: chunk_id.to_string(),
             });
@@ -3322,7 +3526,7 @@ fn register_chunk_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>) {
     {
         let ctx = ctx.clone();
         engine.register_fn("is_chunk_loaded", move |chunk_id: &str| -> bool {
-            let c = ctx.lock().unwrap();
+            let c = crate::lock_or_recover(&ctx);
             c.loaded_chunk_ids.contains(chunk_id)
         });
     }
@@ -3338,7 +3542,7 @@ fn register_screen_ui_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>
             if id < 0 {
                 return;
             }
-            let c = ctx.lock().unwrap();
+            let c = crate::lock_or_recover(&ctx);
             let world = unsafe { c.world_mut() };
             if let Some(comps) = world.get_components_mut(EntityId::from_raw(id as u64)) {
                 comps.set_field(comp::UI_FILL, "value", toml::Value::Float(value));
@@ -3353,7 +3557,7 @@ fn register_screen_ui_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>
             if id < 0 {
                 return;
             }
-            let c = ctx.lock().unwrap();
+            let c = crate::lock_or_recover(&ctx);
             let world = unsafe { c.world_mut() };
             if let Some(comps) = world.get_components_mut(EntityId::from_raw(id as u64)) {
                 comps.set_field(comp::UI_TEXT, "text", toml::Value::String(text.to_string()));
@@ -3370,7 +3574,7 @@ fn register_screen_ui_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>
                 if id < 0 {
                     return;
                 }
-                let c = ctx.lock().unwrap();
+                let c = crate::lock_or_recover(&ctx);
                 let world = unsafe { c.world_mut() };
                 if let Some(comps) = world.get_components_mut(EntityId::from_raw(id as u64)) {
                     let color = toml::Value::Array(vec![
@@ -3392,7 +3596,7 @@ fn register_screen_ui_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>
             if id < 0 {
                 return;
             }
-            let c = ctx.lock().unwrap();
+            let c = crate::lock_or_recover(&ctx);
             let world = unsafe { c.world_mut() };
             if let Some(comps) = world.get_components_mut(EntityId::from_raw(id as u64)) {
                 comps.set_field(
@@ -3411,7 +3615,7 @@ fn register_screen_ui_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>
             if id < 0 {
                 return;
             }
-            let c = ctx.lock().unwrap();
+            let c = crate::lock_or_recover(&ctx);
             let world = unsafe { c.world_mut() };
             if let Some(comps) = world.get_components_mut(EntityId::from_raw(id as u64)) {
                 comps.set_field(comp::SCREEN_ANCHOR, "offset_x", toml::Value::Float(x));

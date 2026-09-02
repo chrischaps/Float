@@ -23,6 +23,18 @@ pub enum DebugMode {
 }
 
 impl DebugMode {
+    /// All modes in cycle order, for UI enumeration (combo boxes)
+    pub const ALL: [DebugMode; 8] = [
+        Self::Pbr,
+        Self::WireframeOverlay,
+        Self::WireframeOnly,
+        Self::Normals,
+        Self::Depth,
+        Self::UvChecker,
+        Self::Unlit,
+        Self::MetallicRoughness,
+    ];
+
     /// Cycle to the next debug mode
     pub fn next(self) -> Self {
         match self {
@@ -42,7 +54,7 @@ impl DebugMode {
         match self {
             Self::Pbr => 0,
             Self::WireframeOverlay => 0, // shader stays PBR, overlay handled by pipeline
-            Self::WireframeOnly => 0, // wireframe is handled by pipeline swap, shader stays PBR
+            Self::WireframeOnly => 0,    // wireframe is handled by pipeline swap, shader stays PBR
             Self::Normals => 1,
             Self::Depth => 2,
             Self::UvChecker => 3,

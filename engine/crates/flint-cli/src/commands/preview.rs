@@ -30,22 +30,69 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
 
+#[derive(clap::Args)]
 pub struct PreviewArgs {
+    /// Path to model file (.glb or .gltf). If omitted, opens an empty window for drag-and-drop.
     pub model: Option<String>,
+
+    /// Render to a PNG file instead of opening a window
+    #[arg(long)]
     pub render: Option<String>,
+
+    /// Image width in pixels
+    #[arg(long, default_value = "1280")]
     pub width: u32,
+
+    /// Image height in pixels
+    #[arg(long, default_value = "720")]
     pub height: u32,
+
+    /// Camera orbit distance
+    #[arg(long)]
     pub distance: Option<f32>,
+
+    /// Camera horizontal angle in degrees
+    #[arg(long)]
     pub yaw: Option<f32>,
+
+    /// Camera vertical angle in degrees
+    #[arg(long)]
     pub pitch: Option<f32>,
+
+    /// Camera look-at point (comma-separated x,y,z)
+    #[arg(long, value_parser = crate::commands::common_args::parse_vec3)]
     pub target: Option<[f32; 3]>,
+
+    /// Field of view in degrees
+    #[arg(long)]
     pub fov: Option<f32>,
+
+    /// Disable ground grid
+    #[arg(long)]
     pub no_grid: bool,
+
+    /// Watch model file for changes and auto-reload
+    #[arg(long)]
     pub watch: bool,
+
+    /// Disable animation playback (animations play by default when present)
+    #[arg(long)]
     pub no_animate: bool,
+
+    /// Start with a specific animation clip by name
+    #[arg(long)]
     pub clip: Option<String>,
+
+    /// Animation playback speed multiplier (default: 1.0)
+    #[arg(long, default_value = "1.0")]
     pub anim_speed: f32,
+
+    /// Sample animation at a specific time in seconds (headless --render mode only)
+    #[arg(long)]
     pub anim_time: Option<f32>,
+
+    /// Start with auto-orbit enabled
+    #[arg(long)]
     pub auto_orbit: bool,
 }
 
@@ -363,6 +410,7 @@ fn run_headless(args: &PreviewArgs, output_path: &str) -> Result<()> {
         ctx.height,
         RendererConfig {
             show_grid: !args.no_grid,
+            ..Default::default()
         },
     );
 
@@ -406,7 +454,13 @@ fn run_headless(args: &PreviewArgs, output_path: &str) -> Result<()> {
                 // Upload bone matrices
                 for (eid, asset) in &skeletal_entity_assets {
                     if let Some(matrices) = animation.bone_matrices(eid) {
-                        renderer.update_bone_matrices(&ctx.queue, asset, matrices);
+                        renderer.update_bone_matrices(
+                            &ctx.device,
+                            &ctx.queue,
+                            *eid,
+                            asset,
+                            matrices,
+                        );
                     }
                 }
 
@@ -644,6 +698,7 @@ impl PreviewApp {
             &context,
             RendererConfig {
                 show_grid: !self.args.no_grid,
+                ..Default::default()
             },
         );
 
@@ -1009,10 +1064,19 @@ impl PreviewApp {
             return;
         }
 
+        // Prefer the live animated pose when the animation system owns a skeleton
+        // for this entity; fall back to the rest pose baked into the import.
+        let entity_id = self.state.lock().ok().and_then(|s| s.entity_id);
+        if let Some(skel) = entity_id.and_then(|eid| self.animation.skeleton(&eid)) {
+            let mesh = skeleton_overlay_mesh(skel);
+            renderer.set_skeleton_overlay(&context.device, &mesh);
+            return;
+        }
+
         let state_guard = self.state.lock().ok();
-        let skeleton = state_guard.as_ref().and_then(|s| {
-            s.import_result.as_ref().and_then(|ir| ir.skeletons.first())
-        });
+        let skeleton = state_guard
+            .as_ref()
+            .and_then(|s| s.import_result.as_ref().and_then(|ir| ir.skeletons.first()));
 
         let Some(skeleton) = skeleton else {
             renderer.clear_skeleton_overlay();
@@ -1549,7 +1613,11 @@ impl PreviewApp {
         }
         if let Some(wf) = new_wireframe {
             if let Some(renderer) = &mut self.scene_renderer {
-                let mode = if wf { DebugMode::WireframeOverlay } else { DebugMode::Pbr };
+                let mode = if wf {
+                    DebugMode::WireframeOverlay
+                } else {
+                    DebugMode::Pbr
+                };
                 renderer.set_debug_mode(mode);
             }
         }
@@ -1609,15 +1677,32 @@ impl PreviewApp {
             if let (Some(renderer), Some(ctx)) = (&mut self.scene_renderer, &self.render_context) {
                 for (entity_id, asset_name) in &self.skeletal_entity_assets {
                     if let Some(matrices) = self.animation.bone_matrices(entity_id) {
-                        renderer.update_bone_matrices(&ctx.queue, asset_name, matrices);
+                        renderer.update_bone_matrices(
+                            &ctx.device,
+                            &ctx.queue,
+                            *entity_id,
+                            asset_name,
+                            matrices,
+                        );
                     }
                 }
             }
+            self.update_skeleton_overlay_from_model();
         }
     }
 }
 
 /// Recursively render a node tree in the UI
+/// Build the armature overlay from a skeleton's current model-space joint globals.
+fn skeleton_overlay_mesh(skel: &Skeleton) -> flint_render::Mesh {
+    let positions: Vec<[f32; 3]> = skel
+        .global_matrices
+        .iter()
+        .map(|g| [g[3][0], g[3][1], g[3][2]])
+        .collect();
+    flint_render::generate_skeleton_lines(&positions, &skel.parents)
+}
+
 /// Invert a row-major 4x4 matrix (for extracting world transforms from inverse bind matrices).
 fn invert_4x4(m: &[[f32; 4]; 4]) -> [[f32; 4]; 4] {
     // Use cofactor expansion for a general 4x4 inverse
@@ -1640,34 +1725,39 @@ fn invert_4x4(m: &[[f32; 4]; 4]) -> [[f32; 4]; 4] {
 
     let det = s[0] * c[5] - s[1] * c[4] + s[2] * c[3] + s[3] * c[2] - s[4] * c[1] + s[5] * c[0];
     if det.abs() < 1e-12 {
-        return [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]];
+        return [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ];
     }
     let inv_det = 1.0 / det;
 
     [
         [
-            ( m[1][1] * c[5] - m[1][2] * c[4] + m[1][3] * c[3]) * inv_det,
+            (m[1][1] * c[5] - m[1][2] * c[4] + m[1][3] * c[3]) * inv_det,
             (-m[0][1] * c[5] + m[0][2] * c[4] - m[0][3] * c[3]) * inv_det,
-            ( m[3][1] * s[5] - m[3][2] * s[4] + m[3][3] * s[3]) * inv_det,
+            (m[3][1] * s[5] - m[3][2] * s[4] + m[3][3] * s[3]) * inv_det,
             (-m[2][1] * s[5] + m[2][2] * s[4] - m[2][3] * s[3]) * inv_det,
         ],
         [
             (-m[1][0] * c[5] + m[1][2] * c[2] - m[1][3] * c[1]) * inv_det,
-            ( m[0][0] * c[5] - m[0][2] * c[2] + m[0][3] * c[1]) * inv_det,
+            (m[0][0] * c[5] - m[0][2] * c[2] + m[0][3] * c[1]) * inv_det,
             (-m[3][0] * s[5] + m[3][2] * s[2] - m[3][3] * s[1]) * inv_det,
-            ( m[2][0] * s[5] - m[2][2] * s[2] + m[2][3] * s[1]) * inv_det,
+            (m[2][0] * s[5] - m[2][2] * s[2] + m[2][3] * s[1]) * inv_det,
         ],
         [
-            ( m[1][0] * c[4] - m[1][1] * c[2] + m[1][3] * c[0]) * inv_det,
+            (m[1][0] * c[4] - m[1][1] * c[2] + m[1][3] * c[0]) * inv_det,
             (-m[0][0] * c[4] + m[0][1] * c[2] - m[0][3] * c[0]) * inv_det,
-            ( m[3][0] * s[4] - m[3][1] * s[2] + m[3][3] * s[0]) * inv_det,
+            (m[3][0] * s[4] - m[3][1] * s[2] + m[3][3] * s[0]) * inv_det,
             (-m[2][0] * s[4] + m[2][1] * s[2] - m[2][3] * s[0]) * inv_det,
         ],
         [
             (-m[1][0] * c[3] + m[1][1] * c[1] - m[1][2] * c[0]) * inv_det,
-            ( m[0][0] * c[3] - m[0][1] * c[1] + m[0][2] * c[0]) * inv_det,
+            (m[0][0] * c[3] - m[0][1] * c[1] + m[0][2] * c[0]) * inv_det,
             (-m[3][0] * s[3] + m[3][1] * s[1] - m[3][2] * s[0]) * inv_det,
-            ( m[2][0] * s[3] - m[2][1] * s[1] + m[2][2] * s[0]) * inv_det,
+            (m[2][0] * s[3] - m[2][1] * s[1] + m[2][2] * s[0]) * inv_det,
         ],
     ]
 }
@@ -1912,11 +2002,8 @@ impl ApplicationHandler for PreviewApp {
             ref ev @ (WindowEvent::MouseInput { .. }
             | WindowEvent::CursorMoved { .. }
             | WindowEvent::MouseWheel { .. }) => {
-                self.orbit.handle_event(
-                    ev,
-                    &mut self.camera,
-                    self.egui_ctx.is_pointer_over_area(),
-                );
+                self.orbit
+                    .handle_event(ev, &mut self.camera, self.egui_ctx.is_pointer_over_area());
             }
             WindowEvent::RedrawRequested => {
                 let now = Instant::now();
@@ -1977,10 +2064,27 @@ impl ApplicationHandler for PreviewApp {
 
                     // Upload bone matrices for skinned meshes
                     for (entity_id, asset_name) in &self.skeletal_entity_assets {
-                        if let Some(matrices) =
-                            self.animation.bone_matrices(entity_id)
+                        if let Some(matrices) = self.animation.bone_matrices(entity_id) {
+                            renderer.update_bone_matrices(
+                                &context.device,
+                                &context.queue,
+                                *entity_id,
+                                asset_name,
+                                matrices,
+                            );
+                        }
+                    }
+
+                    // Keep the armature overlay in step with the animated pose
+                    if renderer.debug_state().show_skeleton {
+                        if let Some(skel) = self
+                            .skeletal_entity_assets
+                            .keys()
+                            .next()
+                            .and_then(|eid| self.animation.skeleton(eid))
                         {
-                            renderer.update_bone_matrices(&context.queue, asset_name, matrices);
+                            let mesh = skeleton_overlay_mesh(skel);
+                            renderer.set_skeleton_overlay(&context.device, &mesh);
                         }
                     }
                 }
