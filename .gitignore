@@ -5,6 +5,9 @@ engine/target/
 snapshots/
 *.png.tmp
 
+# Packaged builds (tools/package.py assembles these from tracked sources)
+dist/
+
 # Python
 __pycache__/
 *.pyc

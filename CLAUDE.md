@@ -31,8 +31,20 @@ build.bat                 # cargo build --release in engine/ (flint, flint-playe
 play.bat [scene]          # run scenes/float.scene.toml (default)
 play_sfx_only.bat [scene] # same, music bus muted (--music-volume 0)
 render.bat                # headless PNG snapshots into snapshots/
+package.bat [version]     # build + stage dist\Float\ + the itch.io zip
 python tools/generate_raft.py   # regenerate models/raft.glb
 ```
+
+`tools/package.py` stages a standalone Windows build (player exe renamed
+`Float.exe`, `Float.bat` launcher, player-facing `README.txt`, `.itch.toml`).
+Everything sits under `data/` **mirroring the repo's layout** — asset paths
+resolve relative to the SCENE (`scene_dir` then its parent), so the shape is
+load-bearing and must not be flattened. The engine's stdout is redirected to
+`%TEMP%\float_log.txt` because the player prints a WASD/Jump/Sprint banner
+that is wrong for Float. Before zipping, the script re-parses the PACKAGED
+scene + scripts and fails on any asset they name but that didn't ship
+(extension-less refs are treated as prefix families — `"audio/lap_" + n`);
+this matters because missing one-shots fail silently at runtime.
 
 Schemas are layered: `--schemas engine\schemas --schemas schemas` (game wins).
 

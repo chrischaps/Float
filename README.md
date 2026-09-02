@@ -33,6 +33,7 @@ build.bat                 # cargo build --release in engine/
 play.bat [scene]          # run scenes/float.scene.toml (default)
 play_sfx_only.bat [scene] # same, music bus muted
 render.bat [quick]        # headless PNG snapshots into snapshots/
+package.bat [version]     # build + assemble dist/Float-<version>-win64.zip
 ```
 
 Mouse or right stick to look. `A`/`D` or left stick to scoot around the raft's
@@ -56,6 +57,24 @@ Schemas layer engine-first, game-second:
 Assets are **generated, not authored**. `models/body.glb` comes out of
 `tools/generate_body.py`; the audio out of `tools/generate_audio.py`. Don't
 hand-edit the outputs — change the generator.
+
+## Shipping it
+
+`package.bat` (or `python tools/package.py`) assembles a standalone Windows
+build into `dist/Float/` and zips it for itch.io — ~38 MB staged, ~18 MB
+zipped. Only what the main scene reaches goes in: the player binary, both
+schema layers, the scripts, and the six models the scene names. Fixtures,
+`tools/`, `specs/` and the engine source stay home.
+
+The package mirrors this repo's directory shape under `data/` for a reason —
+the engine resolves assets relative to the **scene**, searching `scene_dir`
+then its parent. Flattening the layout breaks it.
+
+Before zipping, the script re-reads the packaged scene and scripts and checks
+that every asset they name is actually present, including the prefix families
+scripts build by hand (`"audio/lap_" + n`). That check earns its keep: a
+one-shot whose file is missing fails *silently* at runtime — a log line, no
+sound — so a dropped `.ogg` would otherwise ship as a hole in the soundscape.
 
 ## What happens out there
 
