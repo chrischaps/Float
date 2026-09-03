@@ -220,3 +220,7 @@ Nothing game-specific lives in engine/ (class b): Float keeps its code under sce
 - `press/` (240 KB, cover_630x500.png) and `tools/{package,generate_cover}.py` were swept into
   the wip snapshot commit as instructed; dist/ (57 MB) stayed ignored.
 - Not pushed; not merged into master. No vault note written by this sub-task.
+
+## Second pull, 2026-09-03
+
+Subtree pulled to Flint main 81e54fc (schema defaults 424b981, animation PR #40, Starchild features). engine/ byte-identical to Flint main. Release build pass; flint-player launch check pass on the canonical scene (see build2.log / player2.log). Full engine suite on this exact tree: 1107 passed, 0 failed, 6 ignored (run in Flint).
