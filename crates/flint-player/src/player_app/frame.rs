@@ -22,7 +22,7 @@ use flint_core::components as comp;
 use flint_core::Vec3 as FlintVec3;
 #[cfg(feature = "debug-hud")]
 use flint_debug_ui::DebugPanel as _;
-use flint_render::{GrassEntityPosition, ParticleDrawData, ParticleInstanceGpu};
+use flint_render::GrassEntityPosition;
 use flint_runtime::{RuntimeSystem, StateConfig, SystemPolicy};
 use std::collections::HashSet;
 
@@ -155,6 +155,74 @@ impl PlayerApp {
                     }
                 }
                 panel.clear_dirty();
+            }
+        }
+
+        // Particles panel (ADR 0068): live-mirror counts while clean, apply
+        // play/stop/burst/budget/draw actions when dirty.
+        #[cfg(feature = "debug-hud")]
+        for panel in &mut self.debug_panels {
+            if panel.name() != flint_debug_ui::PARTICLES_DEBUG_PANEL {
+                continue;
+            }
+            let Some(pp) = panel
+                .as_any_mut()
+                .downcast_mut::<flint_debug_ui::ParticlesDebugPanel>()
+            else {
+                continue;
+            };
+            if flint_debug_ui::DebugPanel::is_dirty(pp) {
+                for action in pp.take_actions() {
+                    use flint_debug_ui::ParticlePanelAction as A;
+                    match action {
+                        A::Play(id) => self.particles.sync.set_playing(id, true),
+                        A::Stop(id) => self.particles.sync.set_playing(id, false),
+                        A::Burst(id, n) => self.particles.sync.queue_burst(id, n),
+                        A::StopDetached(h) => self.particles.sync.stop_effect(h),
+                        A::RestartAll => self.particles.sync.restart_all(),
+                        A::SetBudget(b) => self.particles.sync.set_budget(b as usize),
+                        A::SetRender(on) => self.particles_render_enabled = on,
+                    }
+                }
+                flint_debug_ui::DebugPanel::clear_dirty(pp);
+            } else {
+                let rows: Vec<flint_debug_ui::EmitterRow> = self
+                    .particles
+                    .sync
+                    .instances()
+                    .map(|(key, inst)| {
+                        let (entity_id, handle, label) = match key {
+                            flint_particles::InstanceKey::Entity(id) => (
+                                Some(id),
+                                0,
+                                self.world.get_name(id).unwrap_or("?").to_string(),
+                            ),
+                            flint_particles::InstanceKey::Detached(h) => {
+                                (None, h, format!("effect #{h}"))
+                            }
+                        };
+                        let effect = match &inst.source {
+                            flint_particles::EffectSource::Asset(fx) => Some(fx.name.clone()),
+                            flint_particles::EffectSource::Inline => None,
+                        };
+                        flint_debug_ui::EmitterRow {
+                            entity_id,
+                            handle,
+                            label,
+                            effect,
+                            emitters: inst.emitters.len(),
+                            alive: inst.alive(),
+                            capacity: inst.capacity(),
+                            playing: inst.any_emitter_playing(),
+                        }
+                    })
+                    .collect();
+                pp.refresh(
+                    rows,
+                    self.particles.sync.total_alive(),
+                    self.particles.sync.budget() as u32,
+                );
+                pp.render_enabled = self.particles_render_enabled;
             }
         }
 
@@ -483,9 +551,122 @@ impl PlayerApp {
         }
 
         // Render egui HUD overlay on top of the 3D scene
-        self.render_hud(&view);
+        // HUD draws into a non-sRGB view of the same texture (see
+        // RenderContext::hud_format) so egui blends in display space.
+        let hud_view = output.texture.create_view(&wgpu::TextureViewDescriptor {
+            format: Some(context.hud_format),
+            ..Default::default()
+        });
+        self.render_hud(&hud_view);
+
+        // Capture the composited frame (scene + HUD) before it is presented.
+        if let Some(path) = self.capture_path_due() {
+            self.write_screenshot(&output.texture, &path);
+        }
 
         output.present();
+
+        if let Some(exit_after) = self.capture.exit_after {
+            if self.clock.total_time >= super::PERF_SKIP_SECS {
+                self.capture.perf_frames += 1;
+                self.capture.perf_time += self.clock.delta_time;
+            }
+            if self.clock.total_time >= exit_after {
+                self.exit_requested = true;
+                // Headless perf figure: average frame time over the run, so a
+                // scene change can be A/B'd without watching the overlay.
+                let frames = self.capture.perf_frames;
+                if frames > 0 {
+                    let avg_ms = self.capture.perf_time * 1000.0 / frames as f64;
+                    eprintln!(
+                        "[perf] {frames} frames over {:.2} s after t={:.0}: avg {avg_ms:.2} ms/frame ({:.1} fps)",
+                        self.capture.perf_time,
+                        super::PERF_SKIP_SECS,
+                        1000.0 / avg_ms
+                    );
+                }
+            }
+        }
+    }
+
+    /// Decide whether this frame should be written to disk, and to where.
+    ///
+    /// Single-shot: the first frame at or after `capture.at`. Interval mode:
+    /// the first frame at or after `capture.at`, then every `every` seconds,
+    /// numbered `<stem>_0001.<ext>`, `<stem>_0002.<ext>`, ...
+    fn capture_path_due(&mut self) -> Option<std::path::PathBuf> {
+        let base = self.capture.path.clone()?;
+        let now = self.clock.total_time;
+        match self.capture.every {
+            None => {
+                if self.capture.taken || now < self.capture.at {
+                    return None;
+                }
+                self.capture.taken = true;
+                Some(base)
+            }
+            Some(every) => {
+                if !self.capture.taken {
+                    if now < self.capture.at {
+                        return None;
+                    }
+                    self.capture.taken = true;
+                    self.capture.next_due = now;
+                }
+                // Tolerance so `--screenshot-every` equal to `--frame-step`
+                // writes every frame instead of losing some to rounding.
+                if now + 1e-6 < self.capture.next_due {
+                    return None;
+                }
+                self.capture.sequence += 1;
+                self.capture.next_due = now + every.max(1.0 / 240.0);
+                Some(numbered_capture_path(&base, self.capture.sequence))
+            }
+        }
+    }
+
+    /// Read the swapchain texture back and save it as a PNG.
+    fn write_screenshot(&self, texture: &wgpu::Texture, path: &std::path::Path) {
+        let Some(context) = &self.render_context else {
+            return;
+        };
+        if !context.surface_copyable {
+            tracing::warn!(
+                "screenshot skipped: surface has no COPY_SRC usage on this adapter ({})",
+                path.display()
+            );
+            return;
+        }
+        let pixels = match context.read_surface_rgba(texture) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!("screenshot readback failed: {e}");
+                return;
+            }
+        };
+        let Some(img) = image::RgbaImage::from_raw(texture.width(), texture.height(), pixels)
+        else {
+            tracing::warn!("screenshot: pixel buffer size mismatch");
+            return;
+        };
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                if let Err(e) = std::fs::create_dir_all(parent) {
+                    tracing::warn!("screenshot: cannot create {}: {e}", parent.display());
+                    return;
+                }
+            }
+        }
+        match img.save(path) {
+            Ok(()) => tracing::info!(
+                "screenshot written: {} ({}x{} at t={:.2}s)",
+                path.display(),
+                texture.width(),
+                texture.height(),
+                self.clock.total_time
+            ),
+            Err(e) => tracing::warn!("screenshot: failed to save {}: {e}", path.display()),
+        }
     }
 
     pub(super) fn tick(&mut self) {
@@ -495,6 +676,11 @@ impl PlayerApp {
         // Advance game clock
         self.clock.tick();
 
+        // Scripted input due by now (`--input-script`), before anything reads it
+        if let Some(script) = &mut self.capture.input_script {
+            script.apply(self.clock.total_time, &mut self.input);
+        }
+
         // Advance transition phase timing
         self.advance_transition();
 
@@ -503,28 +689,53 @@ impl PlayerApp {
 
         let has_fps_player = self.physics.has_player_entity();
 
-        // Fixed-timestep physics + FPS camera/listener follow
-        self.tick_fixed_physics(&config, has_fps_player);
-
-        // Physics + input events — scripts and audio both consume them
+        // Physics events from the previous frame's fixed steps + this frame's
+        // input events — scripts and audio both consume them. Drained before
+        // the scripts run, so a collision reaches scripts one frame after the
+        // step that produced it.
         let game_events = self.collect_game_events();
 
-        // Set state machine + persistent store + physics pointers for script
-        // access. The RAII guard must outlive every script call this frame —
+        // on_update runs BEFORE the fixed physics loop. Scripts pose kinematic
+        // bodies with this frame's delta_time, and PhysicsSystem::begin_frame
+        // spreads that motion over this frame's accumulator: the two must
+        // describe the same span of wall time. With physics first, the loop
+        // spread a pose written with the previous frame's delta over the
+        // current frame's accumulator, and whenever consecutive frame times
+        // disagreed (a maximized, GPU-bound window) the kinematic parent's
+        // step velocity swung by their ratio and jointed children rang.
+        //
+        // The state guard sets raw state-machine / store / physics pointers
+        // for script access and clears them on drop; it cannot overlap the
+        // physics tick's mutable borrow, so scripts get their own scope here
+        // and the later script calls (UI, sprite-anim-end callbacks) another
+        // below.
+        {
+            let _state_scope = self.script.state_scope(
+                &mut self.state_machine,
+                &mut self.persistent_store,
+                &self.physics,
+            );
+            self.script.set_current_scene(&self.scene_path);
+
+            // Script context (transition state, camera, input/events, conducted
+            // parameters — session tick above precedes set_conducted, which
+            // precedes provide_context/on_update: F4/ADR 0020 ordering), then
+            // on_update.
+            self.run_scripts(&config, &game_events);
+        }
+
+        // Fixed-timestep physics + FPS camera/listener follow, against the
+        // poses and joint targets the scripts just wrote
+        self.tick_fixed_physics(&config, has_fps_player);
+
+        // Script pointers again for every remaining script call this frame —
         // including the sprite-anim-end callbacks inside tick_av_systems —
-        // so it lives here, in tick's own scope, not in a sub-step.
+        // so the guard lives here, in tick's own scope, not in a sub-step.
         let _state_scope = self.script.state_scope(
             &mut self.state_machine,
             &mut self.persistent_store,
             &self.physics,
         );
-        self.script.set_current_scene(&self.scene_path);
-
-        // Script context (transition state, camera, input/events, conducted
-        // parameters — session tick above precedes set_conducted, which
-        // precedes provide_context/on_update: F4/ADR 0020 ordering), then
-        // on_update.
-        self.run_scripts(&config, &game_events);
 
         // Script camera overrides (chase cam etc.) + roll basis + listener
         self.apply_script_camera_overrides(has_fps_player);
@@ -568,6 +779,10 @@ impl PlayerApp {
                 self.release_cursor();
             }
         }
+
+        // Debounced save of the persistent store (1 s after the last change,
+        // or now if a script called persist_save()).
+        self.flush_persistent_store(false, "debounce");
 
         // Clear per-frame input state
         self.input.end_frame();
@@ -630,6 +845,7 @@ impl PlayerApp {
 
     fn tick_fixed_physics(&mut self, config: &StateConfig, has_fps_player: bool) {
         // Fixed-timestep physics loop (skip when paused, but still consume steps to avoid spiral)
+        self.physics.begin_frame(self.clock.pending_fixed_ratio());
         while self.clock.should_fixed_update() {
             let dt = self.clock.fixed_timestep;
 
@@ -701,6 +917,8 @@ impl PlayerApp {
         // Script system: provide camera context, then run updates
         self.script
             .set_camera(self.camera.position_array(), self.camera.forward_vector());
+        self.script
+            .set_camera_view_proj(self.camera.view_projection_matrix());
         self.script.provide_context(
             &self.input,
             &game_events,
@@ -710,6 +928,14 @@ impl PlayerApp {
         let screen_rect = self.egui_ctx.screen_rect();
         self.script
             .set_screen_size(screen_rect.width(), screen_rect.height());
+        // Cursor in the same logical-point space as screen_width()/draw_*:
+        // InputState holds physical pixels, egui's ppp is the window scale.
+        {
+            let ppp = self.egui_ctx.pixels_per_point().max(0.01);
+            let (mx, my) = self.input.mouse_position;
+            self.script
+                .set_mouse_position(mx as f32 / ppp, my as f32 / ppp);
+        }
 
         // Sync loaded chunk IDs so scripts can query is_chunk_loaded()
         let chunk_ids: HashSet<String> = self.loaded_chunks.keys().cloned().collect();
@@ -904,6 +1130,11 @@ impl PlayerApp {
             }
         }
 
+        // Two-bone IK (ADR 0070): pin chain tips to their targets now that
+        // scripts, physics and animation have all posed the world; the renderer
+        // reads world matrices on demand, so this is the last writer it sees.
+        self.animation.run_ik(&mut self.world);
+
         // Advance particle simulation (skip when paused)
         if config.particles == SystemPolicy::Run {
             self.particles
@@ -945,22 +1176,18 @@ impl PlayerApp {
             renderer.update_from_world(&self.world, &context.device);
         }
 
-        // Upload particle instance data to GPU
+        // Pack (camera-sorted) and upload particle instances (ADR 0068)
         if let (Some(renderer), Some(context)) = (&mut self.scene_renderer, &self.render_context) {
-            let sync_draw_data = self.particles.sync.draw_data();
-            let render_draw_data: Vec<ParticleDrawData<'_>> = sync_draw_data
-                .iter()
-                .map(|d| {
-                    let gpu_instances: &[ParticleInstanceGpu] =
-                        bytemuck::cast_slice(bytemuck::cast_slice::<_, u8>(d.instances));
-                    ParticleDrawData {
-                        instances: gpu_instances,
-                        texture: d.texture,
-                        additive: d.blend_mode == flint_particles::ParticleBlendMode::Additive,
-                    }
-                })
-                .collect();
-            renderer.update_particles(&context.device, render_draw_data);
+            if self.particles_render_enabled {
+                self.particles.pack(Some(self.camera.position_array()));
+                renderer.update_particles_from(
+                    &context.device,
+                    &context.queue,
+                    &self.particles.sync,
+                );
+            } else {
+                renderer.update_particles(&context.device, &context.queue, &[]);
+            }
         }
 
         // Update grass time and entity positions for bend-on-contact
@@ -1045,6 +1272,8 @@ impl PlayerApp {
         #[cfg(feature = "debug-hud")]
         let mut debug_panels = std::mem::take(&mut self.debug_panels);
         let ui_textures = &self.ui_textures;
+        let ui_fonts = &self.ui_fonts;
+        let ui_fonts_warned = &mut self.ui_fonts_warned;
 
         let show_stats = self.show_stats;
         let stats_data = if show_stats {
@@ -1072,7 +1301,7 @@ impl PlayerApp {
             // Script UI first: it shares the panels' background layer, so
             // issuing it before the panels puts the panels in front of it
             // (title card, HUD) — see render_draw_commands.
-            render_draw_commands(ctx, &draw_commands, ui_textures);
+            render_draw_commands(ctx, &draw_commands, ui_textures, ui_fonts, ui_fonts_warned);
 
             #[cfg(feature = "debug-hud")]
             {
@@ -1147,6 +1376,9 @@ impl PlayerApp {
         {
             self.debug_panels = debug_panels;
         }
+        // Fonts exist from here on; measure_text may now lay text out for real.
+        self.egui_fonts_ready
+            .store(true, std::sync::atomic::Ordering::Relaxed);
 
         egui_winit.handle_platform_output(window, full_output.platform_output);
 
@@ -1302,4 +1534,35 @@ fn render_stats_overlay(ctx: &egui::Context, stats: &flint_render::RenderStats) 
                     );
                 });
         });
+}
+
+/// `hud.png` + 3 -> `hud_0003.png`; extension-less paths get `.png`.
+pub(crate) fn numbered_capture_path(base: &std::path::Path, n: u32) -> std::path::PathBuf {
+    let stem = base
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "frame".to_string());
+    let ext = base
+        .extension()
+        .map(|e| e.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "png".to_string());
+    base.with_file_name(format!("{stem}_{n:04}.{ext}"))
+}
+
+#[cfg(test)]
+mod capture_tests {
+    use super::numbered_capture_path;
+    use std::path::Path;
+
+    #[test]
+    fn numbered_path_keeps_dir_and_extension() {
+        let p = numbered_capture_path(Path::new("renders/hud.png"), 7);
+        assert_eq!(p, Path::new("renders/hud_0007.png"));
+    }
+
+    #[test]
+    fn numbered_path_defaults_extension() {
+        let p = numbered_capture_path(Path::new("shot"), 12);
+        assert_eq!(p, Path::new("shot_0012.png"));
+    }
 }

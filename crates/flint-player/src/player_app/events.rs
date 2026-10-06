@@ -46,6 +46,12 @@ impl AndroidGamepadTracker {
     }
 
     /// Register a device as a gamepad and return its slot index.
+    /// True once any device has been registered as a gamepad.
+    #[cfg(target_os = "android")]
+    fn any_registered(&self) -> bool {
+        !self.device_slots.is_empty()
+    }
+
     fn register_device(&mut self, device_id: winit::event::DeviceId) -> u32 {
         self.known_device_ids.insert(device_id);
         *self.device_slots.entry(device_id).or_insert_with(|| {
@@ -99,6 +105,24 @@ impl PlayerApp {
         if let Some(gilrs) = &mut self.gilrs {
             while let Some(event) = gilrs.next_event() {
                 events.push(event);
+            }
+        }
+
+        // gamepad_connected(): gilrs knows on desktop; on Android (no gilrs
+        // backend) a pad exists once any gamepad-shaped event has been seen.
+        #[cfg(not(target_os = "android"))]
+        {
+            let connected = self
+                .gilrs
+                .as_ref()
+                .map(|g| g.gamepads().next().is_some())
+                .unwrap_or(false);
+            self.input.set_gamepad_connected(connected);
+        }
+        #[cfg(target_os = "android")]
+        {
+            if self.android_gamepad.any_registered() || !events.is_empty() {
+                self.input.set_gamepad_connected(true);
             }
         }
 
@@ -355,7 +379,7 @@ impl ApplicationHandler for PlayerApp {
             WindowEvent::RedrawRequested => {
                 self.tick();
                 self.render();
-                if self.music_exit_requested {
+                if self.music_exit_requested || self.exit_requested {
                     event_loop.exit();
                 }
             }
@@ -383,6 +407,12 @@ impl ApplicationHandler for PlayerApp {
         if let Some(window) = &self.window {
             window.request_redraw();
         }
+    }
+
+    /// Every exit path (close button, Escape, --exit-after, script-requested,
+    /// init failure) funnels through here: last chance to write the store.
+    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        self.flush_persistent_store(true, "exit");
     }
 }
 
@@ -593,33 +623,35 @@ impl PlayerApp {
     }
 
     fn handle_mouse_input(&mut self, state: ElementState, button: MouseButton) {
-            // FPS scenes gate mouse input behind click-to-capture (hides the
-            // cursor for mouse-look). 2D / UI scenes have no player entity, so
-            // keep the cursor visible and forward mouse buttons directly — this
-            // lets screen-space UI (e.g. card games) be clicked and dragged.
-            if !self.cursor_captured && self.physics.has_player_entity() {
-                if state == ElementState::Pressed && button == MouseButton::Left {
-                    #[cfg(feature = "debug-hud")]
-                    let panel_open = self.debug_panels.iter().any(|p| p.is_open());
-                    #[cfg(not(feature = "debug-hud"))]
-                    let panel_open = false;
-                    if !panel_open {
-                        self.capture_cursor();
-                    }
+            // Mouse button state always reaches InputState so scripts can
+            // read it (`is_mouse_pressed`, menus, screen-space UI) and the
+            // mouse-as-touch emulation keeps working. FPS scenes (a player
+            // entity exists) additionally treat the first left click as
+            // click-to-capture, which hides the cursor for mouse-look.
+            if let Some(btn) = match button {
+                MouseButton::Left => Some(0),
+                MouseButton::Right => Some(1),
+                MouseButton::Middle => Some(2),
+                _ => None,
+            } {
+                match state {
+                    ElementState::Pressed => self.input.process_mouse_button_down(btn),
+                    ElementState::Released => self.input.process_mouse_button_up(btn),
                 }
-                return;
             }
 
-            let btn = match button {
-                MouseButton::Left => 0,
-                MouseButton::Right => 1,
-                MouseButton::Middle => 2,
-                _ => return,
-            };
-
-            match state {
-                ElementState::Pressed => self.input.process_mouse_button_down(btn),
-                ElementState::Released => self.input.process_mouse_button_up(btn),
+            if !self.cursor_captured
+                && self.physics.has_player_entity()
+                && state == ElementState::Pressed
+                && button == MouseButton::Left
+            {
+                #[cfg(feature = "debug-hud")]
+                let panel_open = self.debug_panels.iter().any(|p| p.is_open());
+                #[cfg(not(feature = "debug-hud"))]
+                let panel_open = false;
+                if !panel_open {
+                    self.capture_cursor();
+                }
             }
     }
 

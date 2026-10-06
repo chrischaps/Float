@@ -2,8 +2,10 @@
 
 mod extract;
 mod helpers;
+mod particles;
 mod render_passes;
 
+pub use particles::load_particle_textures;
 use render_passes::RenderPhase;
 
 use helpers::{identity_matrix, mat4_inv_transpose};
@@ -18,7 +20,7 @@ use crate::grass_pipeline::{
     GrassComputeUniforms, GrassEntityPosition, GrassInstanceGpu, GrassPipeline,
     GrassRenderUniforms, MAX_GRASS_ENTITIES,
 };
-use crate::particle_pipeline::{ParticleDrawCall, ParticleDrawData, ParticlePipeline};
+use crate::particle_pipeline::{ParticleDrawCall, ParticlePipeline};
 use crate::pipeline::{
     BlendMode, DirectionalLight, LightUniforms, MaterialUniforms, PointLight, RenderPipeline,
     SpotLight, TransformUniforms, MAX_DIRECTIONAL_LIGHTS, MAX_POINT_LIGHTS, MAX_SPOT_LIGHTS,
@@ -40,7 +42,12 @@ use flint_ecs::FlintWorld;
 use flint_import::ImportResult;
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 use wgpu::util::DeviceExt;
+
+/// Default main-pass clear colour (linear RGBA), matching the historical
+/// dark slate background.
+pub const DEFAULT_CLEAR_COLOR: [f32; 4] = [0.1, 0.1, 0.15, 1.0];
 
 /// Visual representation for an archetype
 #[derive(Clone)]
@@ -62,20 +69,63 @@ impl Default for ArchetypeVisual {
 
 /// A single draw call with its own GPU resources
 #[allow(dead_code)]
-struct DrawCall {
-    vertex_buffer: wgpu::Buffer,
-    index_buffer: wgpu::Buffer,
+pub(super) struct DrawCall {
+    // GPU handles are `Arc`s so the per-entity caches below can hand the
+    // same buffers and bind groups to every frame's draw list (wgpu 23
+    // resources are not `Clone`).
+    vertex_buffer: Arc<wgpu::Buffer>,
+    index_buffer: Arc<wgpu::Buffer>,
     index_count: u32,
     is_wireframe: bool,
-    transform_buffer: wgpu::Buffer,
-    transform_bind_group: wgpu::BindGroup,
-    material_buffer: wgpu::Buffer, // kept alive for bind group
-    material_bind_group: wgpu::BindGroup,
+    transform_buffer: Arc<wgpu::Buffer>,
+    transform_bind_group: Arc<wgpu::BindGroup>,
+    material_buffer: Arc<wgpu::Buffer>, // kept alive for bind group
+    material_bind_group: Arc<wgpu::BindGroup>,
     model: [[f32; 4]; 4],
     model_inv_transpose: [[f32; 4]; 4],
     entity_id: Option<flint_core::EntityId>,
     blend_mode: BlendMode,
     sort_depth: f32,
+}
+
+/// Transform + material GPU resources of one draw of one entity, kept
+/// across frames. `update_from_world` used to rebuild every draw call from
+/// scratch each frame (buffers, bind groups, even a private copy of the
+/// vertex data), which cost more CPU than the draws themselves once a scene
+/// had a few hundred entities. The transform buffer is rewritten every frame
+/// by `update_per_frame_uniforms` anyway; the material side is rebuilt only
+/// when `material_key` (uniforms + texture identity) changes.
+pub(super) struct CachedDrawBinds {
+    pub transform_buffer: Arc<wgpu::Buffer>,
+    pub transform_bind_group: Arc<wgpu::BindGroup>,
+    pub material_buffer: Arc<wgpu::Buffer>,
+    pub material_bind_group: Arc<wgpu::BindGroup>,
+    pub material_key: u64,
+    /// `extract_frame` of the last frame that used this entry; stale entries
+    /// (despawned entities, swapped models) are evicted after extraction.
+    pub touched: u64,
+}
+
+/// One uploaded procedural box, shared by every `bounds` entity with the
+/// same size/colour/wireframe (a tiled park is mostly identical boxes).
+pub(super) struct CachedBoxMesh {
+    pub vertex_buffer: Arc<wgpu::Buffer>,
+    pub index_buffer: Arc<wgpu::Buffer>,
+    pub index_count: u32,
+}
+
+/// FNV-1a over a few byte slices: a cheap, stable key for the draw caches.
+pub(super) fn hash_parts(parts: &[&[u8]]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for part in parts {
+        for b in part.iter() {
+            h ^= *b as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        h ^= 0xff;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
 }
 
 /// A draw call for a skinned mesh (has bone bind group)
@@ -146,6 +196,13 @@ pub struct SceneRenderer {
     billboard_pipeline: Option<BillboardPipeline>,
     archetype_visuals: HashMap<String, ArchetypeVisual>,
     mesh_cache: MeshCache,
+    /// Per-(entity, sub-mesh) transform/material resources reused across
+    /// frames; see `CachedDrawBinds`.
+    draw_bind_cache: HashMap<(flint_core::EntityId, u32), CachedDrawBinds>,
+    /// Uploaded procedural boxes keyed by size/colour/wireframe.
+    box_mesh_cache: HashMap<u64, CachedBoxMesh>,
+    /// Bumped once per `update_from_world`; stamps cache entries.
+    extract_frame: u64,
     grid_draw: Option<DrawCall>,
     entity_draws: Vec<DrawCall>,
     skinned_entity_draws: Vec<SkinnedDrawCall>,
@@ -240,9 +297,17 @@ pub struct SceneRenderer {
     /// the game clock — the same clock scripts see via total_time(), which is
     /// what keeps script-side ocean_height() queries in sync with the GPU.
     pub ocean_time: f64,
-    // Particles
+    // Particles (ADR 0068)
     particle_pipeline: Option<ParticlePipeline>,
     particle_draws: Vec<ParticleDrawCall>,
+    /// Texture bind groups keyed by texture-cache name ("" = white).
+    particle_texture_bind_groups: HashMap<String, std::sync::Arc<wgpu::BindGroup>>,
+    /// Reused CPU staging for the per-frame instance upload.
+    particle_upload_scratch: Vec<flint_particles::ParticleInstance>,
+    /// Editor/gizmo line overlay, drawn on top regardless of debug mode.
+    debug_overlay_draws: Vec<DrawCall>,
+    /// Main-pass clear colour (linear RGBA).
+    clear_color: [f32; 4],
     // 2D sprites
     sprite2d_pipeline: Option<Sprite2dPipeline>,
     sprite2d_batches: Vec<crate::sprite2d_pipeline::Sprite2dBatch>,
@@ -380,6 +445,9 @@ impl SceneRenderer {
             billboard_pipeline: Some(billboard_pipeline),
             archetype_visuals,
             mesh_cache: MeshCache::new(),
+            draw_bind_cache: HashMap::new(),
+            box_mesh_cache: HashMap::new(),
+            extract_frame: 0,
             entity_bone_buffers: HashMap::new(),
             grid_draw,
             entity_draws: Vec::new(),
@@ -459,6 +527,10 @@ impl SceneRenderer {
             ocean_time: 0.0,
             particle_pipeline: Some(particle_pipeline),
             particle_draws: Vec::new(),
+            particle_texture_bind_groups: HashMap::new(),
+            particle_upload_scratch: Vec::new(),
+            debug_overlay_draws: Vec::new(),
+            clear_color: DEFAULT_CLEAR_COLOR,
             sprite2d_pipeline: Some(sprite2d_pipeline),
             sprite2d_batches: Vec::new(),
             sample_count,
@@ -680,101 +752,6 @@ impl SceneRenderer {
         self.ocean_grab_color = Some(color);
         self.ocean_grab_depth = Some(depth);
         self.ocean_grab_size = (width, height);
-    }
-
-    /// Upload particle instance data from the simulation and create draw calls.
-    /// Called each frame after ParticleSystem::update().
-    pub fn update_particles(&mut self, device: &wgpu::Device, draw_data: Vec<ParticleDrawData>) {
-        self.particle_draws.clear();
-
-        let pp = match &self.particle_pipeline {
-            Some(pp) => pp,
-            None => return,
-        };
-
-        for data in &draw_data {
-            if data.instances.is_empty() {
-                continue;
-            }
-
-            // Create storage buffer with instance data
-            let instance_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("Particle Instance Buffer"),
-                contents: bytemuck::cast_slice(data.instances),
-                usage: wgpu::BufferUsages::STORAGE,
-            });
-
-            // Create instance bind group
-            let instance_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                layout: &pp.instance_bind_group_layout,
-                entries: &[wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: instance_buffer.as_entire_binding(),
-                }],
-                label: Some("Particle Instance Bind Group"),
-            });
-
-            // Resolve texture (use white fallback if none specified)
-            let texture_bind_group = if !data.texture.is_empty() {
-                if let Some(tc) = &self.texture_cache {
-                    if let Some(tex) = tc.get(data.texture) {
-                        device.create_bind_group(&wgpu::BindGroupDescriptor {
-                            layout: &pp.texture_bind_group_layout,
-                            entries: &[
-                                wgpu::BindGroupEntry {
-                                    binding: 0,
-                                    resource: wgpu::BindingResource::TextureView(&tex.view),
-                                },
-                                wgpu::BindGroupEntry {
-                                    binding: 1,
-                                    resource: wgpu::BindingResource::Sampler(&tex.sampler),
-                                },
-                            ],
-                            label: Some("Particle Texture Bind Group"),
-                        })
-                    } else {
-                        self.create_white_particle_texture_bind_group(device, pp)
-                    }
-                } else {
-                    self.create_white_particle_texture_bind_group(device, pp)
-                }
-            } else {
-                self.create_white_particle_texture_bind_group(device, pp)
-            };
-
-            self.particle_draws.push(ParticleDrawCall {
-                instance_buffer,
-                instance_count: data.instances.len() as u32,
-                texture_bind_group,
-                instance_bind_group,
-                additive: data.additive,
-            });
-        }
-    }
-
-    fn create_white_particle_texture_bind_group(
-        &self,
-        device: &wgpu::Device,
-        pp: &ParticlePipeline,
-    ) -> wgpu::BindGroup {
-        if let Some(tc) = &self.texture_cache {
-            device.create_bind_group(&wgpu::BindGroupDescriptor {
-                layout: &pp.texture_bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&tc.default_white.view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::Sampler(&tc.default_white.sampler),
-                    },
-                ],
-                label: Some("Particle White Texture Bind Group"),
-            })
-        } else {
-            panic!("TextureCache required for particle rendering");
-        }
     }
 
     /// Load terrain chunks and create GPU resources for terrain rendering.
@@ -1633,6 +1610,8 @@ impl SceneRenderer {
     /// Used by the preview command when drag-and-dropping a replacement model.
     pub fn clear_model_data(&mut self) {
         self.mesh_cache.clear();
+        self.draw_bind_cache.clear();
+        self.box_mesh_cache.clear();
         if let Some(tc) = &mut self.texture_cache {
             tc.clear_user_textures();
         }
@@ -1645,6 +1624,9 @@ impl SceneRenderer {
         self.wireframe_overlay_draws.clear();
         self.normal_arrow_draws.clear();
         self.skeleton_overlay_draws.clear();
+        self.debug_overlay_draws.clear();
+        self.particle_draws.clear();
+        self.particle_texture_bind_groups.clear();
         self.bitmap_font_cache.clear();
     }
 
@@ -1721,6 +1703,7 @@ impl SceneRenderer {
 
         let billboard_pipeline = BillboardPipeline::new(device, scene_format, sample_count);
         let sprite2d_pipeline = Sprite2dPipeline::new(device, scene_format, sample_count);
+        let particle_pipeline = ParticlePipeline::new(device, scene_format, sample_count);
         let skybox_pipeline = SkyboxPipeline::new(device, scene_format, sample_count);
 
         let ocean_resources = Self::create_ocean_resources(
@@ -1749,6 +1732,9 @@ impl SceneRenderer {
             billboard_pipeline: Some(billboard_pipeline),
             archetype_visuals,
             mesh_cache: MeshCache::new(),
+            draw_bind_cache: HashMap::new(),
+            box_mesh_cache: HashMap::new(),
+            extract_frame: 0,
             entity_bone_buffers: HashMap::new(),
             grid_draw,
             entity_draws: Vec::new(),
@@ -1826,8 +1812,14 @@ impl SceneRenderer {
             ocean_grab_this_frame: false,
             ocean_camera_near_far: (0.1, 1000.0),
             ocean_time: 0.0,
-            particle_pipeline: None, // No particles in headless mode
+            // Headless particles (ADR 0068): zero instances until a caller
+            // steps a ParticleSystem, so existing pixel gates are unchanged.
+            particle_pipeline: Some(particle_pipeline),
             particle_draws: Vec::new(),
+            particle_texture_bind_groups: HashMap::new(),
+            particle_upload_scratch: Vec::new(),
+            debug_overlay_draws: Vec::new(),
+            clear_color: DEFAULT_CLEAR_COLOR,
             sprite2d_pipeline: Some(sprite2d_pipeline),
             sprite2d_batches: Vec::new(),
             sample_count,
@@ -2473,6 +2465,7 @@ impl SceneRenderer {
         self.sprite2d_batches.clear();
         self.wireframe_overlay_draws.clear();
         self.normal_arrow_draws.clear();
+        self.extract_frame = self.extract_frame.wrapping_add(1);
 
         // Extract lights from scene entities
         self.extract_lights_from_world(world);
@@ -2613,8 +2606,124 @@ impl SceneRenderer {
         // Sort & batch sprite2d instances
         self.batch_sprite2d_instances(device, tex_cache_ref, sprite2d_collected);
 
+        // Drop cached resources nothing used this frame (despawned entities,
+        // entities that changed shape/model).
+        let frame = self.extract_frame;
+        self.draw_bind_cache.retain(|_, c| c.touched == frame);
+
         // Put texture cache back
         self.texture_cache = tex_cache;
+    }
+
+    /// Transform + material resources for one draw of `key`, created on
+    /// first use and reused afterwards; the material side is rebuilt when
+    /// `material_key` changes. Free-standing over the cache and pipeline so
+    /// callers holding other `self` fields borrowed can still use it.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn cached_binds<'a>(
+        cache: &'a mut HashMap<(flint_core::EntityId, u32), CachedDrawBinds>,
+        frame: u64,
+        device: &wgpu::Device,
+        pipeline: &RenderPipeline,
+        key: (flint_core::EntityId, u32),
+        transform_uniforms: &TransformUniforms,
+        material_uniforms: &MaterialUniforms,
+        material_key: u64,
+        base_color: (&wgpu::TextureView, &wgpu::Sampler),
+        normal: (&wgpu::TextureView, &wgpu::Sampler),
+        metallic_roughness: (&wgpu::TextureView, &wgpu::Sampler),
+    ) -> &'a CachedDrawBinds {
+        let make_material = |device: &wgpu::Device| {
+            let (b, bg) = Self::create_material_bind_with_textures(
+                device,
+                pipeline,
+                material_uniforms,
+                base_color.0,
+                base_color.1,
+                normal.0,
+                normal.1,
+                metallic_roughness.0,
+                metallic_roughness.1,
+            );
+            (Arc::new(b), Arc::new(bg))
+        };
+        let entry = cache.entry(key).or_insert_with(|| {
+            let (tb, tbg) = Self::create_transform_bind(device, pipeline, transform_uniforms);
+            let (mb, mbg) = make_material(device);
+            CachedDrawBinds {
+                transform_buffer: Arc::new(tb),
+                transform_bind_group: Arc::new(tbg),
+                material_buffer: mb,
+                material_bind_group: mbg,
+                material_key,
+                touched: frame,
+            }
+        });
+        if entry.material_key != material_key {
+            let (mb, mbg) = make_material(device);
+            entry.material_buffer = mb;
+            entry.material_bind_group = mbg;
+            entry.material_key = material_key;
+        }
+        entry.touched = frame;
+        entry
+    }
+
+    /// The uploaded box for `key`, building it with `build` on a miss.
+    pub(super) fn cached_box_mesh<'a>(
+        cache: &'a mut HashMap<u64, CachedBoxMesh>,
+        device: &wgpu::Device,
+        key: u64,
+        build: impl FnOnce() -> crate::primitives::Mesh,
+    ) -> &'a CachedBoxMesh {
+        cache.entry(key).or_insert_with(|| {
+            let mesh = build();
+            let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("Box Vertex Buffer (cached)"),
+                contents: bytemuck::cast_slice(&mesh.vertices),
+                usage: wgpu::BufferUsages::VERTEX,
+            });
+            let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("Box Index Buffer (cached)"),
+                contents: bytemuck::cast_slice(&mesh.indices),
+                usage: wgpu::BufferUsages::INDEX,
+            });
+            CachedBoxMesh {
+                vertex_buffer: Arc::new(vertex_buffer),
+                index_buffer: Arc::new(index_buffer),
+                index_count: mesh.indices.len() as u32,
+            }
+        })
+    }
+
+    /// A draw call over cached geometry and cached binds.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn draw_from_cache(
+        vertex_buffer: &Arc<wgpu::Buffer>,
+        index_buffer: &Arc<wgpu::Buffer>,
+        index_count: u32,
+        is_wireframe: bool,
+        binds: &CachedDrawBinds,
+        model: [[f32; 4]; 4],
+        model_inv_transpose: [[f32; 4]; 4],
+        entity_id: flint_core::EntityId,
+        blend_mode: BlendMode,
+    ) -> DrawCall {
+        DrawCall {
+            vertex_buffer: vertex_buffer.clone(),
+            index_buffer: index_buffer.clone(),
+            index_count,
+            is_wireframe,
+            transform_buffer: binds.transform_buffer.clone(),
+            transform_bind_group: binds.transform_bind_group.clone(),
+            material_buffer: binds.material_buffer.clone(),
+            material_bind_group: binds.material_bind_group.clone(),
+            model,
+            model_inv_transpose,
+            entity_id: Some(entity_id),
+            blend_mode,
+            sort_depth: 0.0,
+        }
     }
 
     // ── Draw call factory methods ──
@@ -2646,116 +2755,14 @@ impl SceneRenderer {
             Self::create_material_bind(device, pipeline, &material_uniforms, texture_cache);
 
         DrawCall {
-            vertex_buffer,
-            index_buffer,
+            vertex_buffer: Arc::new(vertex_buffer),
+            index_buffer: Arc::new(index_buffer),
             index_count: mesh.indices.len() as u32,
             is_wireframe,
-            transform_buffer,
-            transform_bind_group,
-            material_buffer,
-            material_bind_group,
-            model: transform_uniforms.model,
-            model_inv_transpose: transform_uniforms.model_inv_transpose,
-            entity_id: None,
-            blend_mode: BlendMode::Alpha,
-            sort_depth: 0.0,
-        }
-    }
-
-    /// Create a draw call for a procedural mesh with explicit texture bindings.
-    fn create_textured_draw_call(
-        device: &wgpu::Device,
-        pipeline: &RenderPipeline,
-        mesh: &crate::primitives::Mesh,
-        transform_uniforms: TransformUniforms,
-        material_uniforms: MaterialUniforms,
-        base_color_view: &wgpu::TextureView,
-        base_color_sampler: &wgpu::Sampler,
-        normal_view: &wgpu::TextureView,
-        normal_sampler: &wgpu::Sampler,
-        mr_view: &wgpu::TextureView,
-        mr_sampler: &wgpu::Sampler,
-    ) -> DrawCall {
-        let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Textured Vertex Buffer"),
-            contents: bytemuck::cast_slice(&mesh.vertices),
-            usage: wgpu::BufferUsages::VERTEX,
-        });
-
-        let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Textured Index Buffer"),
-            contents: bytemuck::cast_slice(&mesh.indices),
-            usage: wgpu::BufferUsages::INDEX,
-        });
-
-        let (transform_buffer, transform_bind_group) =
-            Self::create_transform_bind(device, pipeline, &transform_uniforms);
-        let (material_buffer, material_bind_group) = Self::create_material_bind_with_textures(
-            device,
-            pipeline,
-            &material_uniforms,
-            base_color_view,
-            base_color_sampler,
-            normal_view,
-            normal_sampler,
-            mr_view,
-            mr_sampler,
-        );
-
-        DrawCall {
-            vertex_buffer,
-            index_buffer,
-            index_count: mesh.indices.len() as u32,
-            is_wireframe: false,
-            transform_buffer,
-            transform_bind_group,
-            material_buffer,
-            material_bind_group,
-            model: transform_uniforms.model,
-            model_inv_transpose: transform_uniforms.model_inv_transpose,
-            entity_id: None,
-            blend_mode: BlendMode::Alpha,
-            sort_depth: 0.0,
-        }
-    }
-
-    /// Create a draw call for an imported mesh that already has GPU buffers.
-    fn create_imported_draw_call(
-        device: &wgpu::Device,
-        pipeline: &RenderPipeline,
-        gpu_mesh: &crate::gpu_mesh::GpuMesh,
-        transform_uniforms: TransformUniforms,
-        material_uniforms: MaterialUniforms,
-        base_color_view: &wgpu::TextureView,
-        base_color_sampler: &wgpu::Sampler,
-        normal_view: &wgpu::TextureView,
-        normal_sampler: &wgpu::Sampler,
-        mr_view: &wgpu::TextureView,
-        mr_sampler: &wgpu::Sampler,
-    ) -> DrawCall {
-        let (transform_buffer, transform_bind_group) =
-            Self::create_transform_bind(device, pipeline, &transform_uniforms);
-        let (material_buffer, material_bind_group) = Self::create_material_bind_with_textures(
-            device,
-            pipeline,
-            &material_uniforms,
-            base_color_view,
-            base_color_sampler,
-            normal_view,
-            normal_sampler,
-            mr_view,
-            mr_sampler,
-        );
-
-        DrawCall {
-            vertex_buffer: gpu_mesh.create_vertex_buffer_copy(device),
-            index_buffer: gpu_mesh.create_index_buffer_copy(device),
-            index_count: gpu_mesh.index_count,
-            is_wireframe: false,
-            transform_buffer,
-            transform_bind_group,
-            material_buffer,
-            material_bind_group,
+            transform_buffer: Arc::new(transform_buffer),
+            transform_bind_group: Arc::new(transform_bind_group),
+            material_buffer: Arc::new(material_buffer),
+            material_bind_group: Arc::new(material_bind_group),
             model: transform_uniforms.model,
             model_inv_transpose: transform_uniforms.model_inv_transpose,
             entity_id: None,
@@ -3569,6 +3576,12 @@ impl SceneRenderer {
         if self.device_lost {
             return;
         }
+        let clear_color = wgpu::Color {
+            r: self.clear_color[0] as f64,
+            g: self.clear_color[1] as f64,
+            b: self.clear_color[2] as f64,
+            a: self.clear_color[3] as f64,
+        };
         let view_proj = camera.view_projection_matrix();
         self.camera_frustum = Some(crate::frustum::Frustum::from_view_projection(&view_proj));
 
@@ -3696,12 +3709,7 @@ impl SceneRenderer {
                     view: pass_color_view,
                     resolve_target: pass_resolve_target,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.1,
-                            g: 0.1,
-                            b: 0.15,
-                            a: 1.0,
-                        }),
+                        load: wgpu::LoadOp::Clear(clear_color),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -3737,12 +3745,7 @@ impl SceneRenderer {
                         view: pass_color_view,
                         resolve_target: pass_resolve_target,
                         ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(wgpu::Color {
-                                r: 0.1,
-                                g: 0.1,
-                                b: 0.15,
-                                a: 1.0,
-                            }),
+                            load: wgpu::LoadOp::Clear(clear_color),
                             store: wgpu::StoreOp::Store,
                         },
                     })],
