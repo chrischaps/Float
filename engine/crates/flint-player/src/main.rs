@@ -4,6 +4,15 @@
 //!
 //! Usage:
 //!   flint-player <scene.toml> [--schemas <path>] [--fullscreen]
+//!                [--width <px>] [--height <px>]
+//!                [--screenshot <out.png>] [--screenshot-at <secs>]
+//!                [--screenshot-every <secs>] [--exit-after <secs>]
+//!                [--frame-step <secs>] [--input-script <file>]
+//!
+//! Screenshots capture the presented frame — the 3D scene *and* the egui
+//! HUD — right before `present()`, so they show exactly what a player sees.
+//! `flint render` remains the headless, script-free snapshot; this path is
+//! for verifying script-driven UI and live gameplay state.
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -18,6 +27,7 @@ use winit::event_loop::{ControlFlow, EventLoop};
 #[command(about = "Flint game player - run scenes with physics and first-person controls")]
 struct Args {
     /// Path to scene file
+    #[arg(required_unless_present = "list_gpus", default_value = "")]
     scene: String,
 
     /// Paths to schemas directories (can specify multiple)
@@ -43,6 +53,55 @@ struct Args {
     /// MSAA sample count for the scene passes: 1 (off) or 4 (ADR 0058)
     #[arg(long, default_value_t = 1)]
     msaa: u32,
+
+    /// GPU adapter to use (case-insensitive substring of the adapter name,
+    /// e.g. "NVIDIA"). Overrides WGPU_ADAPTER_NAME; default prefers the
+    /// high-performance adapter. Use --list-gpus to see names.
+    #[arg(long)]
+    gpu: Option<String>,
+
+    /// List available GPU adapters and exit
+    #[arg(long)]
+    list_gpus: bool,
+
+    /// Initial window width in pixels (ignored with --fullscreen)
+    #[arg(long, default_value_t = 1280)]
+    width: u32,
+
+    /// Initial window height in pixels (ignored with --fullscreen)
+    #[arg(long, default_value_t = 720)]
+    height: u32,
+
+    /// Write a PNG of the presented frame (scene + HUD) to this path.
+    /// With --screenshot-every the path becomes a numbered base name
+    /// (hud.png -> hud_0001.png, hud_0002.png, ...).
+    #[arg(long, value_name = "PATH")]
+    screenshot: Option<String>,
+
+    /// Game time in seconds at which to take the screenshot (first frame
+    /// whose elapsed time reaches this value). Default 0 = first frame.
+    #[arg(long, default_value_t = 0.0, value_name = "SECS")]
+    screenshot_at: f64,
+
+    /// Keep capturing every N seconds after --screenshot-at until exit,
+    /// writing numbered files next to --screenshot
+    #[arg(long, value_name = "SECS")]
+    screenshot_every: Option<f64>,
+
+    /// Exit the player once game time reaches this many seconds
+    #[arg(long, value_name = "SECS")]
+    exit_after: Option<f64>,
+
+    /// Advance the game exactly this many seconds per frame, whatever the
+    /// wall time. With `--screenshot-every` equal to it, every frame is
+    /// written: smooth offline video however slow the capture runs.
+    #[arg(long, value_name = "SECS")]
+    frame_step: Option<f64>,
+
+    /// Play timed key / gamepad input from a file (see
+    /// `player_app/input_script.rs` for the format)
+    #[arg(long, value_name = "FILE")]
+    input_script: Option<String>,
 }
 
 fn main() -> Result<()> {
@@ -54,6 +113,13 @@ fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
+    if args.list_gpus {
+        for a in flint_render::list_adapters() {
+            println!("{a}");
+        }
+        return Ok(());
+    }
+    flint_render::set_gpu_override(args.gpu.clone());
 
     // Merge explicit schemas with auto-discovered dirs from scene path
     let mut all_schemas = args.schemas.clone();
@@ -108,6 +174,17 @@ fn main() -> Result<()> {
 
     app.msaa_sample_count = args.msaa;
     app.scene_preload_audio = scene_file.scene.preload_audio;
+    app.window_size = (args.width, args.height);
+    app.capture = flint_player::CaptureConfig::new(
+        args.screenshot.map(std::path::PathBuf::from),
+        args.screenshot_at,
+        args.screenshot_every,
+        args.exit_after,
+    );
+    if let Some(path) = &args.input_script {
+        app.capture.input_script = Some(flint_player::InputScript::load(path)?);
+    }
+    app.clock.frame_step = args.frame_step.filter(|s| *s > 0.0);
 
     // Apply initial mixer bus volumes from CLI (e.g. --music-volume 0)
     app.audio

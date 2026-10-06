@@ -248,6 +248,10 @@ impl PlayerApp {
         // transient render state cleared.
         self.teardown_current_scene();
 
+        // The outgoing scene's on_scene_exit has run: persist whatever it
+        // (and the scene before it) stored, before the path changes.
+        self.flush_persistent_store(true, "scene transition");
+
         // Load: resolve + schema discovery + scene parse; on failure the
         // transition aborts here (world already cleared, same as before).
         if !self.load_target_scene(target_scene) {
@@ -541,6 +545,9 @@ impl PlayerApp {
         // Update terrain height callback for scripts
         self.update_terrain_height_fn();
 
+        // Project fonts may differ when the new scene lives in another project
+        self.refresh_project_fonts();
+
         // Re-initialize systems
         self.physics
             .initialize(&mut self.world)
@@ -569,6 +576,7 @@ impl PlayerApp {
             .initialize(&mut self.world)
             .unwrap_or_else(|e| tracing::warn!("Animation init failed: {:?}", e));
 
+        flint_particles::load_particle_effects_from_world(&self.scene_path, &mut self.particles);
         self.particles
             .initialize(&mut self.world)
             .unwrap_or_else(|e| tracing::warn!("Particles init failed: {:?}", e));

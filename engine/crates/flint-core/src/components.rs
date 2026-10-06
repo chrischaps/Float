@@ -7,6 +7,9 @@ pub const TRANSFORM: &str = "transform";
 
 // --- Rendering ---
 pub const MATERIAL: &str = "material";
+/// Per-glTF-material base-colour overrides (`{ <material name> = [r,g,b(,a)] }`),
+/// honoured on the entity or any ancestor. See `SceneRenderer::ecs_material_override`.
+pub const MATERIAL_OVERRIDES: &str = "material_overrides";
 pub const MODEL: &str = "model";
 pub const BOUNDS: &str = "bounds";
 pub const SPRITE: &str = "sprite";
@@ -21,10 +24,12 @@ pub const HEALTH: &str = "health";
 pub const ANIMATOR: &str = "animator";
 pub const SKELETON: &str = "skeleton";
 pub const SPRITE_ANIMATOR: &str = "sprite_animator";
+pub const IK_TWO_BONE: &str = "ik_two_bone";
 
 // --- Physics ---
 pub const RIGIDBODY: &str = "rigidbody";
 pub const COLLIDER: &str = "collider";
+pub const JOINT: &str = "joint";
 pub const CHARACTER_CONTROLLER: &str = "character_controller";
 pub const PLAYER: &str = "player";
 
@@ -34,6 +39,7 @@ pub const AUDIO_TRIGGER: &str = "audio_trigger";
 
 // --- Particles ---
 pub const PARTICLE_EMITTER: &str = "particle_emitter";
+pub const PARTICLE_EFFECT: &str = "particle_effect";
 
 // --- Terrain ---
 pub const TERRAIN: &str = "terrain";

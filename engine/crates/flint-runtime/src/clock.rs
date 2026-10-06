@@ -10,6 +10,10 @@ pub struct GameClock {
     pub delta_time: f64,
     /// Fixed timestep interval (default: 1/60 second)
     pub fixed_timestep: f64,
+    /// When set, every frame advances by exactly this many seconds instead
+    /// of the wall time since the last tick (offline capture: a frame that
+    /// takes 80 ms to render and save still moves the game 1/30 s).
+    pub frame_step: Option<f64>,
     /// Accumulated time for fixed-step consumption
     accumulator: f64,
     /// Last tick instant
@@ -24,6 +28,7 @@ impl Default for GameClock {
             total_time: 0.0,
             delta_time: 0.0,
             fixed_timestep: 1.0 / 60.0,
+            frame_step: None,
             accumulator: 0.0,
             last_instant: Instant::now(),
             first_tick: true,
@@ -56,7 +61,10 @@ impl GameClock {
             return;
         }
 
-        let elapsed = now.duration_since(self.last_instant).as_secs_f64();
+        let elapsed = match self.frame_step {
+            Some(step) => step,
+            None => now.duration_since(self.last_instant).as_secs_f64(),
+        };
         self.last_instant = now;
 
         // Clamp to avoid spiral of death (max 250ms frame time)
@@ -68,6 +76,27 @@ impl GameClock {
     /// Returns true if there's enough accumulated time for a fixed update step
     pub fn should_fixed_update(&self) -> bool {
         self.accumulator >= self.fixed_timestep
+    }
+
+    /// Number of fixed steps the accumulator currently holds — how many
+    /// `should_fixed_update` / `consume_fixed_step` rounds this frame will run.
+    pub fn pending_fixed_steps(&self) -> usize {
+        if self.fixed_timestep <= 0.0 {
+            return 0;
+        }
+        (self.accumulator / self.fixed_timestep).floor().max(0.0) as usize
+    }
+
+    /// Accumulated time in units of the fixed step, before this frame's
+    /// steps are consumed: `pending_fixed_steps()` plus the remainder that
+    /// will be carried into the next frame. Scripted kinematic motion is
+    /// spread over this span so its step velocity stays even when one step
+    /// covers several frames (see `PhysicsSystem::begin_frame`).
+    pub fn pending_fixed_ratio(&self) -> f64 {
+        if self.fixed_timestep <= 0.0 {
+            return 0.0;
+        }
+        (self.accumulator / self.fixed_timestep).max(0.0)
     }
 
     /// Consume one fixed timestep from the accumulator

@@ -10,13 +10,14 @@
 
 pub mod api;
 pub mod context;
+pub mod draw2d;
 pub mod engine;
 pub mod sync;
 pub mod ui;
 
-pub use context::DrawCommand;
 pub use context::StateScope;
 pub use context::{ConductedCue, ConductedPulse, ConductedSnapshot, CueParam};
+pub use context::{DrawCommand, DrawItem};
 use context::{InputSnapshot, ScriptCommand};
 use engine::ScriptEngine;
 use flint_core::Result;
@@ -117,7 +118,17 @@ impl ScriptSystem {
             actions_just_released: snapshot_actions_released(input),
             action_values: snapshot_action_values(input),
             any_just_pressed: input.any_just_pressed(),
+            last_device: input.last_device().as_str().to_string(),
+            gamepad_connected: input.gamepad_connected(),
             mouse_delta: input.raw_mouse_delta(),
+            mouse_buttons_down: (0..3_u32)
+                .filter(|b| input.is_mouse_button_down(*b))
+                .map(|b| b as i64)
+                .collect(),
+            mouse_buttons_just_pressed: (0..3_u32)
+                .filter(|b| input.is_mouse_button_just_pressed(*b))
+                .map(|b| b as i64)
+                .collect(),
             touches,
             touch_just_started,
             touch_just_ended,
@@ -161,6 +172,13 @@ impl ScriptSystem {
         c.camera_direction = direction;
     }
 
+    /// Camera view-projection (column-major) for world-space debug drawing
+    /// (`draw_line_3d`, `world_to_screen`). Pass the matrix the frame renders with.
+    pub fn set_camera_view_proj(&mut self, view_proj: [[f32; 4]; 4]) {
+        let mut c = crate::lock_or_recover(&self.engine.ctx);
+        c.camera_view_proj = view_proj;
+    }
+
     /// Drain commands produced by scripts this frame
     pub fn drain_commands(&mut self) -> Vec<ScriptCommand> {
         self.engine.drain_commands()
@@ -171,6 +189,14 @@ impl ScriptSystem {
         let mut c = crate::lock_or_recover(&self.engine.ctx);
         c.screen_width = w;
         c.screen_height = h;
+    }
+
+    /// Set the cursor position in logical points (the `screen_width` space)
+    /// for `mouse_x()` / `mouse_y()`. The host divides the physical cursor
+    /// position by its pixels-per-point before calling this.
+    pub fn set_mouse_position(&mut self, x: f32, y: f32) {
+        let mut c = crate::lock_or_recover(&self.engine.ctx);
+        c.mouse_pos_logical = (x, y);
     }
 
     /// Sync loaded chunk IDs so scripts can query `is_chunk_loaded`
@@ -232,15 +258,20 @@ impl ScriptSystem {
         self.engine.call_draw_uis(world);
     }
 
-    /// Drain draw commands produced by scripts this frame
-    pub fn drain_draw_commands(&mut self) -> Vec<DrawCommand> {
+    /// Drain draw commands produced by scripts this frame (each stamped
+    /// with the clip rect active when it was issued)
+    pub fn drain_draw_commands(&mut self) -> Vec<DrawItem> {
         self.engine.drain_draw_commands()
     }
 
-    /// Generate draw commands from the data-driven UI system
-    pub fn generate_ui_draw_commands(&mut self, screen_w: f32, screen_h: f32) -> Vec<DrawCommand> {
+    /// Generate draw commands from the data-driven UI system (unclipped)
+    pub fn generate_ui_draw_commands(&mut self, screen_w: f32, screen_h: f32) -> Vec<DrawItem> {
         let mut c = crate::lock_or_recover(&self.engine.ctx);
-        c.ui_system.generate_draw_commands(screen_w, screen_h)
+        c.ui_system
+            .generate_draw_commands(screen_w, screen_h)
+            .into_iter()
+            .map(DrawItem::unclipped)
+            .collect()
     }
 
     /// Call on_animation_end(clip_name) for entities whose sprite animation finished
@@ -331,15 +362,26 @@ impl ScriptSystem {
         )
     }
 
-    /// Set up the script system's scripts directory from the scene path
+    /// Set up the script system's scripts directory from the scene path.
+    /// Also points `import` at `<scripts>/lib` and starts watching it.
     pub fn load_scripts_from_scene(&mut self, scene_path: &str) {
         sync::load_scripts_from_scene(scene_path, &mut self.sync);
+        if let Some(lib) = self.sync.lib_dir() {
+            self.engine.set_module_base(lib);
+        }
     }
 
     /// Set the terrain height sampling callback for scripts
     pub fn set_terrain_height_fn(&mut self, f: Option<Box<dyn Fn(f32, f32) -> f32 + Send + Sync>>) {
         let mut c = crate::lock_or_recover(&self.engine.ctx);
         c.terrain_height_fn = f;
+    }
+
+    /// Install (or clear) the host's real text measurer used by
+    /// `measure_text` / `measure_text_ex`.
+    pub fn set_text_measurer(&mut self, f: Option<context::TextMeasurer>) {
+        let mut c = crate::lock_or_recover(&self.engine.ctx);
+        c.text_measurer = f;
     }
 }
 
@@ -373,6 +415,11 @@ impl RuntimeSystem for ScriptSystem {
     fn update(&mut self, world: &mut FlintWorld, _dt: f64) -> Result<()> {
         // Check for hot-reloaded scripts
         self.sync.check_hot_reload(&mut self.engine);
+
+        // Check for edited .ui.toml / .style.toml / token files
+        crate::lock_or_recover(&self.engine.ctx)
+            .ui_system
+            .poll_reload();
 
         // Discover any new script entities
         self.sync.discover_and_load(world, &mut self.engine);

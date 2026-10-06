@@ -12,6 +12,7 @@ mod camera;
 mod context;
 mod debug;
 pub mod frustum;
+pub mod gpu_select;
 mod gpu_mesh;
 pub mod grass_pipeline;
 mod headless;
@@ -37,6 +38,7 @@ pub use billboard_pipeline::BillboardPipeline;
 pub use bitmap_font::{anchor_origin, apply_fill, BitmapFont};
 pub use camera::{Camera, CameraMode};
 pub use context::{RenderContext, RenderError};
+pub use gpu_select::{list_adapters, set_gpu_override};
 pub use debug::{DebugMode, DebugState};
 pub use frustum::Frustum;
 pub use gpu_mesh::{GpuMesh, GpuSkinnedMesh, MeshCache};
@@ -48,7 +50,8 @@ pub use headless::HeadlessContext;
 pub use ocean_pipeline::{OceanPipeline, OceanUniformsGpu, OceanVisuals};
 pub use orbit_controller::OrbitCameraController;
 pub use particle_pipeline::{
-    ParticleDrawCall, ParticleDrawData, ParticleInstanceGpu, ParticlePipeline, ParticleUniforms,
+    ParticleBlendMode, ParticleDrawCall, ParticleDrawData, ParticleInstance, ParticlePipeline,
+    ParticleUniforms,
 };
 pub use pipeline::{
     DirectionalLight, LightUniforms, MaterialUniforms, PointLight, RenderPipeline, SpotLight,
@@ -64,7 +67,10 @@ pub use primitives::{
     SkinnedVertex, Vertex,
 };
 pub use render_stats::{format_count, RenderStats};
-pub use scene_renderer::{ArchetypeVisual, LightingLevers, RendererConfig, SceneRenderer};
+pub use scene_renderer::{
+    load_particle_textures, ArchetypeVisual, LightingLevers, RendererConfig, SceneRenderer,
+    DEFAULT_CLEAR_COLOR,
+};
 pub use skinned_pipeline::SkinnedPipeline;
 pub use sky_pipeline::{SkyParams, SkyPipeline, SkyUniformsGpu};
 pub use skybox_pipeline::SkyboxPipeline;
@@ -107,9 +113,16 @@ mod tests {
     }
 
     #[test]
-    fn particle_shader_wgsl_parses() {
+    fn particle_shader_wgsl_parses_and_validates() {
         let source = include_str!("particle_shader.wgsl");
-        naga::front::wgsl::parse_str(source).expect("particle_shader.wgsl failed to parse");
+        let module =
+            naga::front::wgsl::parse_str(source).expect("particle_shader.wgsl failed to parse");
+        naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::default(),
+        )
+        .validate(&module)
+        .expect("particle_shader.wgsl failed validation");
     }
 
     #[test]
