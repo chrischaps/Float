@@ -29,3 +29,8 @@ reference/
 
 # Headless render evidence (flint-render skill)
 renders/
+
+# Showcase capture temps (tools/showcase/cap.py writes and removes these;
+# a killed run can leave them behind)
+scenes/_cap_*
+scripts/_cap_*

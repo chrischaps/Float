@@ -402,6 +402,23 @@ hand hover vs contact on the thighs).
 Engine changes live on Flint branch `feature/ocean-pipeline` (merge to main
 when ready). Plan: `C:\Users\chris\.claude\plans\please-make-a-plan-fluffy-pearl.md`
 
+## Showcase capture (tools/showcase/)
+
+`cap.py` films the real game for the chaps.dev page with flint-player's
+`--frame-step` (one exact frame of game time per frame, every frame
+written): shots in `shots.py` patch a copy of float.scene.toml (forced +
+snapped weather, `tod()` start hour/day, event one-shots like
+`dead_calm.trigger_calm`, `reality.trigger_mode`, `raft_visitor.trigger_visit`),
+swap the seat script for a temp copy that never grabs the mouse (and, for
+external views, stops writing the camera + underwater mode), and add
+`showcase_camera.rhai` (rig / fixed / sun-tracking / two-raft pair). `--preview`
+makes contact sheets; `encode.py` makes the site media; `cover.py` builds the
+time-slice cover from the `slice_*` stills (same instant, eight hours — weather,
+idle fidgets, birds and blooms OFF so the water and pose match across strips).
+Script random draws are NOT seeded: weather gusts reshape the spectrum, so a
+preview's swell/dunk timing can differ from the final run — shoot generously
+and trim. Narrow an event's window to pin its timing (the whale shot does).
+
 ## Debug controls in play
 
 F3 toggles the panels (grouped into ≤3 scrollable columns, size-balanced
