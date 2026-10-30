@@ -7,4 +7,8 @@ schemas = ["engine/schemas", "schemas"]
 # scenes are kept, as fixtures a page can open with ?scene=.
 exclude = ["scenes/mixamo_spike.scene.toml"]
 [late]
-audio = ["**/*.ogg", "**/*.wav", "**/*.mp3", "**/*.flac"]
+# Fetched first, in this order (Flint#124): the two beds that play from the
+# first second, 328 KB, so the sea is there at Begin on a slow line. The
+# songs and one-shots follow in the 6.7 MB part.
+ambience = ["audio/ocean_loop.ogg", "audio/wind_light.ogg"]
+audio =["**/*.ogg", "**/*.wav", "**/*.mp3", "**/*.flac"]
