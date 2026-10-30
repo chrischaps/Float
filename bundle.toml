@@ -1,0 +1,10 @@
+# What `flint bundle .` packs for the web player (Flint#98, #102).
+# Flint's docs/design/web.md explains the format and the defaults.
+name = "float"
+scene = "scenes/float.scene.toml"
+schemas = ["engine/schemas", "schemas"]
+# mixamo_spike names mixamo_body.glb, which is not in the repo; the snap_
+# scenes are kept, as fixtures a page can open with ?scene=.
+exclude = ["scenes/mixamo_spike.scene.toml"]
+[late]
+audio = ["**/*.ogg", "**/*.wav", "**/*.mp3", "**/*.flac"]
