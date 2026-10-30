@@ -1,3 +1,0 @@
-[archetype.room]
-description = "A room or enclosed space (transform-only parent container)"
-components = ["transform"]
