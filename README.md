@@ -11,6 +11,8 @@ your feet in the water, watch the light change, listen.
 A contemplative first-person experience built on the [Flint](https://github.com/chrischaps/Flint)
 engine, included here as a git subtree at `engine/`.
 
+**Project page:** [chaps.dev/projects/float](https://chaps.dev/projects/float/) has seven clips of the raft at sea: where you sit, weather rolling in, dead calm, the whale and the visitor.
+
 ## Pillars
 
 - **The ocean is the protagonist.** Wave motion has to be believable — real
