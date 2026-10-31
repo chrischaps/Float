@@ -129,6 +129,22 @@ ELBOW_R = np.array([-0.235, 0.03, -0.03])
 WRIST_L = np.array([+0.165, 0.158, 0.12])
 WRIST_R = np.array([-0.165, 0.158, 0.12])
 HAND_ROLL = 12.0  # deg, outboard edge drops toward the thigh's curve
+# Playtest pass (#6): the wrist JOINT stays put; the hand GEOMETRY
+# sinks below it. Before, the palm perched 2.3 cm up on the fat shorts
+# cuff and the fingers stuck out in the air past the hem (the bare
+# thigh beyond sits 2.2 cm lower) — the outer fingers 2.5-3.5 cm up.
+# Two things legs do UNDER a statically-posed hand set the budget: the
+# legs_rock knee lift (+ idle sway pitching the hand) bounds the
+# fingertips, the scoot's opening leg bounds the palm heel (that one is
+# now ridden out by the passive arm's keys in scoot_right_clip). So the
+# palm comes down, the fingers flatten to hold their tip clearance, and
+# the outer two WRAP (extra droop) down the thigh's curve — the hand
+# lies on the leg instead of perching on two fingertips. Swept against
+# check_clearance(): palm 2.3 → 1.0 cm, tips 1.3-3.5 → 1.4-1.7 cm,
+# worst case −0.49 → −0.24 cm.
+HAND_SINK = 0.012     # m, hand geometry lowered below the wrist joint
+FINGER_DROOP = (10.0, 18.0)   # deg, proximal / distal pitch below level
+FINGER_WRAP = (16.0, 2.0, 0.0, 12.0)   # deg extra droop, index → pinky
 
 JOINTS = [
     # name          parent         global bind position
@@ -244,26 +260,34 @@ def build_hand(side, wrist):
     rolled HAND_ROLL° about the wrist so the palm follows the thigh's
     outboard curve instead of bridging flat across its apex."""
     meshes = []
-    palm = box_at([0.068, 0.024, 0.075],
+    nails = []
+    wrist = np.asarray(wrist, float) - np.array([0.0, HAND_SINK, 0.0])
+    palm = box_at([0.072, 0.024, 0.075],
                   tx=wrist[0], ty=wrist[1] - 0.004, tz=wrist[2] + 0.040, rx=d2r(-8))
     meshes.append(palm)
     # Fingers, index (beside the thumb, inboard) → pinky (outboard).
     # Proximal segment continues the palm's droop at −25°, distal −40°:
     # a DRAPE along the thigh's downslope, not a fist — steeper curls
     # stabbed the fingertips into the thigh capsule (the checker
-    # catches it). A slight per-finger fan separates the tips.
-    offs = (-0.0255, -0.0085, 0.0085, 0.0255)
+    # catches it). A per-finger fan separates the tips.
+    # Playtest (#6): from the eye (~55 cm away) same-colored fingers
+    # touching along their whole length merged into one paddle —
+    # slightly slimmer fingers on a wider pitch, a stronger fan, and a
+    # pale nail on each tip give every finger its own edge.
+    offs = (-0.0275, -0.0092, 0.0092, 0.0275)
     lens = (0.038, 0.041, 0.039, 0.030)
-    rads = (0.0095, 0.0095, 0.0090, 0.0078)
-    fans = (-4.0, -1.0, 1.5, 4.0)
-    for off, ln, r, fan in zip(offs, lens, rads, fans):
+    rads = (0.0088, 0.0088, 0.0084, 0.0074)
+    fans = (-7.0, -2.0, 2.5, 7.5)
+    for off, ln, r, fan, wrap in zip(offs, lens, rads, fans, FINGER_WRAP):
         b = np.array([wrist[0] + off * side, wrist[1] - 0.008, wrist[2] + 0.074])
         knuckle = sphere_at(r * 1.15, b + np.array([0.0, 0.004, -0.004]))
         meshes.append(knuckle)
-        e1 = b + _dir(22.0, fan * side) * ln
+        e1 = b + _dir(FINGER_DROOP[0] + wrap, fan * side) * ln
         meshes.append(capsule_between(b, e1, r))
-        e2 = e1 + _dir(36.0, fan * side) * (ln * 0.75)
+        d2 = _dir(FINGER_DROOP[1] + wrap, fan * side)
+        e2 = e1 + d2 * (ln * 0.75)
         meshes.append(capsule_between(e1, e2, r * 0.92))
+        nails.append(_nail(e2 - d2 * r * 0.55, d2, r * 0.92))
     # Thumb: metacarpal from the inboard palm heel angling forward-in,
     # distal curling toward the fingers. Kept high (above palm plane at
     # the base) for cuff clearance.
@@ -275,11 +299,37 @@ def build_hand(side, wrist):
     tdir2 = np.array([-side * 0.25, -0.35, 0.90])
     tdir2 /= np.linalg.norm(tdir2)
     meshes.append(capsule_between(t1, t1 + tdir2 * 0.032, 0.011))
+    nails.append(_nail(t1 + tdir2 * (0.032 - 0.011 * 0.5), tdir2, 0.011))
     roll = trimesh.transformations.rotation_matrix(
         d2r(-HAND_ROLL) * side, [0, 0, 1], wrist)
-    for m in meshes:
+    for m in meshes + nails:
         m.apply_transform(roll)
-    return meshes
+    return meshes, nails
+
+
+NAIL = (0.86, 0.64, 0.55, 1.0)   # linear; paler and pinker than SKIN
+
+
+def _nail(tip, direction, radius):
+    """Fingernail/toenail: a thin flattened ellipsoid lying on the TOP
+    of a digit just behind its tip, proud of the capsule by ~1 mm. A
+    flat untextured material a few shades paler than the skin — the
+    single strongest 'that is a finger' cue in stylized hands, and it
+    holds under the cel bands because it is a hard edge, not a
+    gradient."""
+    d = np.asarray(direction, float)
+    d = d / np.linalg.norm(d)
+    up = np.array([0.0, 1.0, 0.0])
+    up = up - d * (up @ d)
+    up = up / np.linalg.norm(up)
+    across = np.cross(up, d)
+    s = trimesh.creation.icosphere(subdivisions=2, radius=1.0)
+    v = s.vertices
+    v = (np.outer(v[:, 0], across) * radius * 0.78
+         + np.outer(v[:, 1], up) * radius * 0.30
+         + np.outer(v[:, 2], d) * radius * 0.95)
+    v += np.asarray(tip, float) + up * (radius * 0.80)
+    return trimesh.Trimesh(vertices=v, faces=s.faces, process=False)
 
 
 def build_foot(side, ankle):
@@ -296,14 +346,21 @@ def build_foot(side, ankle):
     lens = (0.045, 0.040, 0.036, 0.032, 0.028)
     rads = (0.0125, 0.0100, 0.0095, 0.0090, 0.0082)
     fans = (0.0, 1.0, 2.0, 3.0, 4.5)                   # toes fan outboard
+    # Playtest (#6): toes a touch slimmer on a wider fan so each one
+    # keeps its own outline under the water's refraction, plus nails.
+    rads = (0.0118, 0.0092, 0.0087, 0.0082, 0.0075)
+    fans = (0.0, 2.0, 4.0, 6.0, 9.0)
+    nails = []
     for off, ln, r, fan in zip(offs, lens, rads, fans):
         b = np.array([off * side, -0.030, 0.110])
-        local.append(capsule_between(b, b + _dir(8.0, fan * side) * ln, r))
+        d = _dir(8.0, fan * side)
+        local.append(capsule_between(b, b + d * ln, r))
+        nails.append(_nail(b + d * (ln + r * 0.25), d, r))
     m = trimesh.transformations.euler_matrix(d2r(-14), side * d2r(5), 0.0, "sxyz")
     m[:3, 3] = ankle
-    for mesh in local:
+    for mesh in local + nails:
         mesh.apply_transform(m)
-    return local
+    return local, nails
 
 
 # ── UV mapping ──────────────────────────────────────────────────────────
@@ -393,9 +450,12 @@ for side, hip, knee, ankle in ((+1.0, HIP_L, KNEE_L, ANKLE_L), (-1.0, HIP_R, KNE
         add_part(f"calf_{sfx}",
                  sphere_at(0.016, [ankle[0] + mx, ankle[1] + 0.008, ankle[2]]),
                  SKIN_LOWER, 0.9, tex="skin_calf", uv=("patch", 0.35, 0.20))
-    for fmesh in build_foot(side, ankle):
+    foot_meshes, foot_nails = build_foot(side, ankle)
+    for fmesh in foot_meshes:
         add_part(f"foot_{sfx}", fmesh, FOOT, 0.9,
                  tex="skin_foot", uv=("planar", f"foot_{sfx}"))
+    for nmesh in foot_nails:
+        add_part(f"foot_{sfx}", nmesh, NAIL, 0.5)
     # Shorts cuff on the upper thigh (rides with the thigh joint), with
     # a hem ring at its open end.
     c0 = hip + np.array([0.0, 0.012, 0.0])
@@ -441,9 +501,12 @@ for side, elbow, wrist in ((+1.0, ELBOW_L, WRIST_L), (-1.0, ELBOW_R, WRIST_R)):
              TEE, 0.9, tex="fabric_tee", uv=("patch", 0.25, 0.35))
     add_part(f"forearm_{sfx}", tapered_capsule_between(elbow, wrist, 0.042, 0.031),
              SKIN, 0.9, tex="skin_arm", uv=("cyl", elbow, wrist, DOWN))
-    for hmesh in build_hand(side, wrist):
+    hand_meshes, hand_nails = build_hand(side, wrist)
+    for hmesh in hand_meshes:
         add_part(f"hand_{sfx}", hmesh, SKIN, 0.9,
                  tex="skin_hand", uv=("planar", f"hand_{sfx}"))
+    for nmesh in hand_nails:
+        add_part(f"hand_{sfx}", nmesh, NAIL, 0.5)
 
 
 # ── Quaternion helpers (x, y, z, w) ─────────────────────────────────────
@@ -554,6 +617,12 @@ print(f"  arm IK: deck wrist err {_err_d * 100:.1f} cm, water wrist err {_err_w 
 # x is bumped ~+0.03 vs where the hand should land to counter the
 # plant-side spine lean (−9° roll shifts the below-pivot hand inboard).
 _SCOOT_ARM_PATH = [
+    # Unpeel: straight UP off the thigh before any outboard travel.
+    # Without it the first segment lerped rest→lift (10 cm outboard)
+    # and cut ~1 cm through the cuff's hem ring at t≈0.07 — the check
+    # only caught it once the hem became one of its solids (#6).
+    (0.06, (0.17, 0.20, 0.12)),
+    (0.10, (0.22, 0.22, 0.11)),
     (0.14, (0.27, 0.20, 0.10)),    # lift over the thigh
     (0.21, (0.35, 0.11, 0.05)),    # descend OUTSIDE the cuff shoulder
     (0.28, (0.33, 0.03, 0.03)),    # reach down-outboard
@@ -561,7 +630,9 @@ _SCOOT_ARM_PATH = [
     (0.72, (0.35, 0.06, 0.02)),    # return: straight up the outboard side
     (0.82, (0.34, 0.12, 0.05)),
     (0.91, (0.31, 0.18, 0.08)),
-    (0.98, (0.27, 0.20, 0.10)),    # over the thigh again, settle to rest
+    (0.98, (0.27, 0.20, 0.10)),    # over the thigh again
+    (1.06, (0.22, 0.22, 0.11)),
+    (1.14, (0.17, 0.20, 0.12)),    # set down: straight onto the rest
 ]
 _UA_KEYS = [(0.0, (0, 0, 0))]
 _FA_KEYS = [(0.0, (0, 0, 0))]
@@ -849,6 +920,15 @@ def scoot_right_clip():
         "forearm_l": list(_FA_KEYS),
         "hand_l": [(0.0, (0, 0, 0)), (0.32, (14, 0, 0)), (0.90, (10, 0, 0)),
                    (1.25, (0, 0, 0))],
+        # Passive (right) hand RIDES its opening leg: the thigh swings
+        # out and lifts its knee right under the resting palm, so the
+        # arm lifts with it (rx < 0 raises the wrist) instead of the leg
+        # sweeping through a statically-posed hand. This is what lets
+        # the rest pose sit DOWN on the thigh (#6, HAND_SINK).
+        "upper_arm_r": [(0.0, (0, 0, 0)), (0.32, (-5, 0, 0)), (0.70, (-4, 0, 0)),
+                        (1.05, (-1, 0, 0)), (1.30, (0, 0, 0))],
+        "hand_r": [(0.0, (0, 0, 0)), (0.32, (-4, 0, 0)), (0.70, (-3, 0, 0)),
+                   (1.05, (0, 0, 0)), (1.30, (0, 0, 0))],
         # Shoulders dip toward the planted (left, +X) arm while it bears
         # weight: negative roll leans the spine toward +X, and the left
         # clavicle shrugs up as the arm takes the load.
@@ -961,6 +1041,9 @@ def _thigh_solids(sfx, g_rot, g_pos):
         # conservative along the rest of its length.
         (g_pos[j], g_pos[f"calf_{sfx}"], THIGH_R + 0.003),
         (c0, c1, THIGH_R + 0.022),
+        # The cuff's hem ring (ring_at major THIGH_R+0.019, minor
+        # 0.006) bulges 3 mm past the cuff: a thin disc solid at c1.
+        (c1 - cvec * 0.006, c1 + cvec * 0.006, THIGH_R + 0.025),
     ]
 
 
@@ -1006,7 +1089,7 @@ def check_clearance():
                     f"hand_{sfx}": (ha, 0.0, 0.0),
                 })
                 pts = _skin_pts(hand_verts[sfx], f"hand_{sfx}", g_rot, g_pos)
-                for solid, (a, b, r) in zip(("thigh", "cuff"),
+                for solid, (a, b, r) in zip(("thigh", "cuff", "hem"),
                                             _thigh_solids(sfx, g_rot, g_pos)):
                     c = _seg_clearance(pts, a, b, r)
                     if c < worst[0]:
@@ -1025,7 +1108,7 @@ def check_clearance():
             for hs in ("l", "r"):
                 pts = _skin_pts(hand_verts[hs], f"hand_{hs}", g_rot, g_pos)
                 for ts_ in ("l", "r"):
-                    for solid, (a, b, r) in zip(("thigh", "cuff"),
+                    for solid, (a, b, r) in zip(("thigh", "cuff", "hem"),
                                                 _thigh_solids(ts_, g_rot, g_pos)):
                         c = _seg_clearance(pts, a, b, r)
                         if c < worst[0]:
