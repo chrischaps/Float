@@ -404,10 +404,31 @@ so every textured multi-node static model rendered untextured (white ×
 factor) — `SceneRenderer::namespace_mesh_textures` now patches both
 paths.
 
+Body playtest pass ✅ (#6): hands LIE on the thighs. The wrist joint is
+unchanged; `HAND_SINK` lowers the hand geometry below it, fingers flatten
+(`FINGER_DROOP`), and the outer two wrap the thigh's curve
+(`FINGER_WRAP`). Bind gap: palm 2.3 → 1.0 cm. The budget comes from legs
+moving UNDER statically-posed hands: legs_rock + idle sway bound the
+fingertips, and the scoot's opening leg bounds the palm heel. The
+passive arm now rides that leg (`upper_arm_r`/`hand_r` keys in
+scoot_right_clip, mirrored). `check_clearance()` now includes the
+cuff's HEM RING as a solid. It exposed a pre-existing ~1 cm clip through
+the hem at the start and end of every scoot, fixed with dense
+unpeel/set-down waypoints. Worst −0.24 cm. A pale untextured `NAIL` on
+every finger, thumb and toe; digits slimmer, on a wider pitch and fan.
+Textures: the first pass had 3-8 sRGB levels of spread, so the body
+read as flat vertex color. Skin now has hue drift, a third mottle
+octave and sparse freckles (`freckle=` per map); weave and knit are
+bolder. Measured in render, low-frequency mottle is INVISIBLE because it
+reads as shading. Small marks survive (freckles, calf hair). At dusk the
+navy shorts sit near black and no value texture survives; that would
+take a palette change. Fixtures: `scenes/snap_body_{dusk,night}` (bind
+pose = clearance case 0) and render.bat's `body_*` shots.
+
 Polish backlog: real M6/M8 + weather SFX from
-`specs/elevenlabs_audio_prompts.md`; playtest pass on the body detail
-(finger/toe read in first person, texture contrast under the cel post,
-hand hover vs contact on the thighs).
+`specs/elevenlabs_audio_prompts.md`; the palm is still a sharp-edged box
+(reads as a card in close-up); live playtest of the scoot with the
+new passive-arm ride.
 Engine changes live on Flint branch `feature/ocean-pipeline` (merge to main
 when ready). Plan: `C:\Users\chris\.claude\plans\please-make-a-plan-fluffy-pearl.md`
 

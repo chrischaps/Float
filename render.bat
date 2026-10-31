@@ -23,6 +23,13 @@ echo Rendering raft overview...
 echo Rendering underwater moment (render mode 5, fixture scene)...
 %FLINT% render scenes\snap_underwater.scene.toml %SCHEMAS% %QUICK% --output snapshots\underwater.png --distance 3 --pitch=-35 --yaw 35 --target 0,0.5,0 --render-mode 5 --mode-mix 1.0 --mode-params 1.2,0.5,1,0
 
+echo Rendering body from the eye (bind pose: hands on thighs) -- day, dusk, night...
+set EYE=--distance 0.55 --pitch 55 --yaw 180 --target 0,0.36,1.25
+%FLINT% render %SCENE% %SCHEMAS% %QUICK% --output snapshotsody_eye_day.png %EYE%
+%FLINT% render scenes\snap_body_dusk.scene.toml %SCHEMAS% %QUICK% --output snapshotsody_eye_dusk.png %EYE%
+%FLINT% render scenes\snap_body_night.scene.toml %SCHEMAS% %QUICK% --output snapshotsody_eye_night.png %EYE%
+%FLINT% render %SCENE% %SCHEMAS% %QUICK% --output snapshotsody_hand_side.png --distance 0.45 --pitch 5 --yaw 90 --target 0.15,0.45,1.15
+
 if /i "%~1"=="quick" goto :done
 
 REM ============================================================
