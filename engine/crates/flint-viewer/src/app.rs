@@ -14,8 +14,11 @@ use flint_constraint::{ConstraintEvaluator, ConstraintRegistry};
 use flint_core::components as comp;
 use flint_ecs::FlintWorld;
 use flint_render::model_loader::{self, ModelLoadConfig};
-use flint_render::{Camera, RenderContext, RendererConfig, SceneRenderer};
-use flint_scene::{load_scene, save_scene, SceneDocument};
+use flint_render::{
+    post_process_config_from_def, Camera, PostProcessConfig, RenderContext, RendererConfig,
+    SceneRenderer,
+};
+use flint_scene::{load_scene, save_scene, CameraDef, PostProcessDef, SceneDocument};
 use flint_schema::SchemaRegistry;
 use notify_debouncer_mini::{new_debouncer, notify::RecursiveMode};
 use std::path::Path;
@@ -36,10 +39,24 @@ struct ViewerState {
     scene_path: String,
     needs_reload: bool,
     scene_doc: Option<SceneDocument>,
+    /// The scene's authored `[post_process]` block, if any — applied on load
+    /// so the viewer shows the authored look (DoF, vignette, fog, …);
+    /// F11 toggles between it and the viewer's default config.
+    scene_post: Option<PostProcessDef>,
+    /// The scene's authored `[camera]` block, if any — seeds the orbit camera
+    /// on load (and on Space reset) so the viewer opens on the authored
+    /// framing instead of the generic default.
+    scene_camera: Option<CameraDef>,
 }
 
 /// Run the viewer application (standard viewer mode)
-pub fn run(scene_path: &str, watch: bool, schemas_path: &str, inspector: bool) -> Result<()> {
+pub fn run(
+    scene_path: &str,
+    watch: bool,
+    schemas_path: &str,
+    inspector: bool,
+    auto_orbit: bool,
+) -> Result<()> {
     let registry = if Path::new(schemas_path).exists() {
         SchemaRegistry::load_from_directory(schemas_path)?
     } else {
@@ -65,6 +82,8 @@ pub fn run(scene_path: &str, watch: bool, schemas_path: &str, inspector: bool) -
         scene_path: scene_path.to_string(),
         needs_reload: false,
         scene_doc,
+        scene_post: scene_file.post_process.clone(),
+        scene_camera: scene_file.camera.clone(),
     }));
 
     let _watcher = if watch {
@@ -114,6 +133,7 @@ pub fn run(scene_path: &str, watch: bool, schemas_path: &str, inspector: bool) -
     event_loop.set_control_flow(ControlFlow::Poll);
 
     let mut app = ViewerApp::new(state, inspector);
+    app.auto_orbit = auto_orbit;
     event_loop.run_app(&mut app)?;
 
     Ok(())
@@ -138,6 +158,8 @@ pub fn run_with_world(
         scene_path: scene_path_anchor.to_string(),
         needs_reload: false,
         scene_doc: None,
+        scene_post: None,
+        scene_camera: None,
     }));
 
     let event_loop = EventLoop::new()?;
@@ -185,6 +207,9 @@ pub fn run_editor(
         scene_path: scene_path.to_string(),
         needs_reload: false,
         scene_doc: None,
+        scene_post: scene_file.post_process.clone(),
+        // Editor mode overrides the camera with its birds-eye view; never seeded.
+        scene_camera: None,
     }));
 
     let _watcher = if watch {
@@ -304,6 +329,50 @@ pub struct ViewerApp {
 
     // Status message (e.g., "Saved!" in editor mode)
     status_message: Option<(String, Instant)>,
+
+    // Scene [post_process] application (authored <-> viewer default, toggled
+    // from the Rendering & Effects menu)
+    scene_post_enabled: bool,
+    default_post_config: Option<PostProcessConfig>,
+
+    // Viewer DoF follow: focus tracks the last selected entity; toggled from
+    // the Rendering & Effects menu, strength/range live in its DoF section.
+    dof_follow: bool,
+    dof_focus_entity: Option<flint_core::EntityId>,
+
+    // Rendering & Effects menu (F4, ADR 0053): the consolidated render/post
+    // debug controls, shared with the player. `open` tracked viewer-side so
+    // the egui Window can own a close button.
+    render_panel: flint_debug_ui::RenderDebugPanel,
+    render_panel_open: bool,
+
+    // Auto-orbit turntable (O toggles, [/] adjust speed, any manual orbit
+    // input cancels — same convention as the model/procgen previewers).
+    auto_orbit: bool,
+    auto_orbit_speed: f32,
+
+    // Live particles (ADR 0068): the viewer steps the same ParticleSystem the
+    // player uses, so inspector edits to particle_emitter / particle_effect
+    // components show immediately. Controls live in the F4 menu.
+    particles: flint_particles::ParticleSystem,
+    show_particles: bool,
+    particles_paused: bool,
+    particle_speed: f32,
+    particle_alive: usize,
+    last_particle_tick: Instant,
+}
+
+/// Rendering & Effects menu interactions that need `&mut self` side effects
+/// (authored-post swap, DoF follow enable/disable), collected inside the egui
+/// closure and handled after the frame.
+#[derive(Default)]
+struct RenderMenuActions {
+    authored_post_clicked: bool,
+    dof_follow: Option<bool>,
+    particles_show: Option<bool>,
+    particles_pause: Option<bool>,
+    particles_speed: Option<f32>,
+    particles_restart: bool,
 }
 
 impl ViewerApp {
@@ -343,6 +412,20 @@ impl ViewerApp {
             gizmo_drag_ended: false,
             dirty_fields: std::collections::HashSet::new(),
             status_message: None,
+            scene_post_enabled: true,
+            default_post_config: None,
+            dof_follow: false,
+            dof_focus_entity: None,
+            render_panel: flint_debug_ui::RenderDebugPanel::new(false),
+            render_panel_open: false,
+            auto_orbit: false,
+            auto_orbit_speed: 0.5,
+            particles: flint_particles::ParticleSystem::new(),
+            show_particles: true,
+            particles_paused: false,
+            particle_speed: 1.0,
+            particle_alive: 0,
+            last_particle_tick: Instant::now(),
         }
     }
 
@@ -382,6 +465,52 @@ impl ViewerApp {
             gizmo_drag_ended: false,
             dirty_fields: std::collections::HashSet::new(),
             status_message: None,
+            scene_post_enabled: true,
+            default_post_config: None,
+            dof_follow: false,
+            dof_focus_entity: None,
+            render_panel: flint_debug_ui::RenderDebugPanel::new(false),
+            render_panel_open: false,
+            auto_orbit: false,
+            auto_orbit_speed: 0.5,
+            particles: flint_particles::ParticleSystem::new(),
+            show_particles: true,
+            particles_paused: false,
+            particle_speed: 1.0,
+            particle_alive: 0,
+            last_particle_tick: Instant::now(),
+        }
+    }
+
+    /// Seed the orbit camera from the scene's authored `[camera]` block so
+    /// the viewer opens on (and Space returns to) the authored framing.
+    /// Orbit distance/yaw/pitch are derived from position/target the same
+    /// way the player does, so `update_orbit()` stays consistent.
+    fn seed_camera_from_scene(&mut self) {
+        let scene_camera = self.state.lock().unwrap().scene_camera.clone();
+        let Some(cam) = scene_camera else { return };
+        if let Some(target) = cam.target {
+            self.camera.target = flint_core::Vec3::new(target[0], target[1], target[2]);
+        }
+        if let Some(fov) = cam.fov {
+            self.camera.fov = fov;
+        }
+        if let Some(near) = cam.near {
+            self.camera.near = near;
+        }
+        if let Some(far) = cam.far {
+            self.camera.far = far;
+        }
+        if let Some(pos) = cam.position {
+            let pos = flint_core::Vec3::new(pos[0], pos[1], pos[2]);
+            let dir = pos - self.camera.target;
+            let dist = dir.length();
+            if dist > 0.001 {
+                self.camera.distance = dist;
+                let n = dir * (1.0 / dist);
+                self.camera.pitch = n.y.asin();
+                self.camera.yaw = n.x.atan2(n.z);
+            }
         }
     }
 
@@ -407,6 +536,11 @@ impl ViewerApp {
             .context("Failed to initialize viewer render context")?;
 
         self.camera.aspect = render_context.aspect_ratio();
+
+        // Standard viewer: open on the scene's authored [camera] framing
+        if self.editor.is_none() {
+            self.seed_camera_from_scene();
+        }
 
         // In editor mode, start with a good birds-eye view
         if self.editor.is_some() {
@@ -454,8 +588,13 @@ impl ViewerApp {
             false,
         );
 
-        let mut scene_renderer =
-            SceneRenderer::new(&render_context, RendererConfig { show_grid: true });
+        let mut scene_renderer = SceneRenderer::new(
+            &render_context,
+            RendererConfig {
+                show_grid: true,
+                ..Default::default()
+            },
+        );
 
         // Load models and update meshes from world
         {
@@ -469,6 +608,33 @@ impl ViewerApp {
                 &config,
             );
             scene_renderer.update_from_world(&state.world, &render_context.device);
+
+            // Particles (ADR 0068): effects next to the scene, then textures.
+            flint_particles::load_particle_effects_from_world(
+                &state.scene_path,
+                &mut self.particles,
+            );
+            self.particles.sync.sync_from_world(&state.world);
+            let dirs = flint_particles::texture_search_dirs(&state.scene_path);
+            flint_render::load_particle_textures(
+                &mut scene_renderer,
+                &render_context.device,
+                &render_context.queue,
+                &self.particles.sync,
+                &dirs,
+            );
+        }
+
+        // Apply the scene's authored [post_process] block (DoF, vignette,
+        // fog, …) so the viewer shows the authored look. F11 toggles back
+        // to the viewer's default config (kept here for that).
+        self.default_post_config = Some(scene_renderer.post_process_config().clone());
+        {
+            let state = self.state.lock().unwrap();
+            if let Some(def) = &state.scene_post {
+                scene_renderer.set_post_process_config(post_process_config_from_def(def));
+                println!("Scene [post_process] applied (F11 toggles scene/default)");
+            }
         }
 
         // Run initial constraint evaluation
@@ -530,6 +696,22 @@ impl ViewerApp {
 
         self.render_stats.record_frame();
 
+        // Track the last selected entity so DoF follow keeps its target
+        // after a deselect, and drive the focus plane while F12 is on.
+        if let Some(id) = self.scene_tree.selected_entity() {
+            self.dof_focus_entity = Some(id);
+        }
+        if self.dof_follow {
+            self.apply_dof_follow();
+        }
+
+        // Rendering & Effects panel: apply last frame's edits / mirror live
+        // state (after DoF follow so the mirror shows the followed focus).
+        self.sync_render_panel();
+
+        // Particles: step, pack, upload (ADR 0068)
+        self.tick_particles();
+
         // Render the 3D scene
         {
             let context = self.render_context.as_ref().unwrap();
@@ -539,7 +721,28 @@ impl ViewerApp {
         }
 
         // Always render egui overlay (gizmo is always visible, panels are conditional)
-        let gizmo_action = self.render_egui(&view);
+        let (gizmo_action, menu_actions) = self.render_egui(&view);
+
+        // Rendering & Effects menu actions that need &mut self (deferred out
+        // of the egui closure's disjoint field borrows)
+        if menu_actions.authored_post_clicked {
+            self.toggle_authored_post();
+        }
+        if let Some(on) = menu_actions.dof_follow {
+            self.set_dof_follow(on);
+        }
+        if let Some(show) = menu_actions.particles_show {
+            self.show_particles = show;
+        }
+        if let Some(paused) = menu_actions.particles_pause {
+            self.particles_paused = paused;
+        }
+        if let Some(speed) = menu_actions.particles_speed {
+            self.particle_speed = speed;
+        }
+        if menu_actions.particles_restart {
+            self.particles.sync.restart_all();
+        }
 
         // Process gizmo interaction
         if let Some(action) = gizmo_action {
@@ -549,6 +752,7 @@ impl ViewerApp {
                     self.camera.orthographic = true;
                 }
                 GizmoAction::OrbitDelta { dyaw, dpitch } => {
+                    self.auto_orbit = false;
                     self.camera.orbit_horizontal(dyaw);
                     self.camera.orbit_vertical(dpitch);
                     self.camera_snap_target = None;
@@ -572,6 +776,218 @@ impl ViewerApp {
         output.present();
     }
 
+    /// Advance the particle simulation by real time (scaled), then pack and
+    /// upload. Runs every frame so inspector edits show live; paused keeps
+    /// the last frame on screen.
+    fn tick_particles(&mut self) {
+        let now = Instant::now();
+        let dt = (now - self.last_particle_tick).as_secs_f32().min(0.1);
+        self.last_particle_tick = now;
+        let (Some(context), Some(renderer)) = (&self.render_context, &mut self.scene_renderer)
+        else {
+            return;
+        };
+        if !self.show_particles {
+            renderer.update_particles(&context.device, &context.queue, &[]);
+            return;
+        }
+        {
+            let state = self.state.lock().unwrap();
+            if self.particles_paused {
+                // Still pick up component edits so a paused frame reflects them.
+                self.particles.sync.sync_from_world(&state.world);
+            } else {
+                self.particles.step(&state.world, dt * self.particle_speed);
+            }
+        }
+        self.particle_alive = self.particles.sync.total_alive();
+        self.particles.pack(Some(self.camera.position_array()));
+        renderer.update_particles_from(&context.device, &context.queue, &self.particles.sync);
+    }
+
+    /// View depth of the DoF focus entity along the camera forward axis, as
+    /// (entity name, view depth). Since ADR 0055 the projection and the
+    /// composite linearizer agree, so the focus distance IS the view depth.
+    fn dof_focus_readout(&self, world: &FlintWorld) -> Option<(String, f32)> {
+        let id = self.dof_focus_entity?;
+        let pos = world.get_world_position(id)?;
+        let name = world.get_name(id).unwrap_or("<unnamed>").to_string();
+        let cam = &self.camera;
+        let fwd = flint_core::Vec3::new(
+            cam.target.x - cam.position.x,
+            cam.target.y - cam.position.y,
+            cam.target.z - cam.position.z,
+        )
+        .normalized();
+        let to_entity = flint_core::Vec3::new(
+            pos.x - cam.position.x,
+            pos.y - cam.position.y,
+            pos.z - cam.position.z,
+        );
+        let z = to_entity.dot(&fwd).clamp(cam.near, cam.far);
+        Some((name, z))
+    }
+
+    /// Drive the renderer's DoF params from the follow state (once per frame
+    /// while F12 DoF follow is on). Only the three dof_* fields are touched;
+    /// writes are diff-gated. A missing focus entity (deleted, or ids
+    /// remapped by a scene reload) leaves the config untouched.
+    fn apply_dof_follow(&mut self) {
+        let focus = {
+            let state = self.state.lock().unwrap();
+            self.dof_focus_readout(&state.world)
+        };
+        let Some((_, focus_z)) = focus else {
+            return;
+        };
+        let Some(renderer) = &mut self.scene_renderer else {
+            return;
+        };
+        // Strength/range are authored in the Rendering & Effects menu's DoF
+        // section; follow owns only the focus distance.
+        let dof_strength = self.render_panel.pp.dof_strength;
+        let dof_range = self.render_panel.pp.dof_focus_range;
+        let config = renderer.post_process_config();
+        if (config.dof_strength - dof_strength).abs() < 1e-4
+            && (config.dof_focus_distance - focus_z).abs() < 1e-4
+            && (config.dof_focus_range - dof_range).abs() < 1e-4
+        {
+            return;
+        }
+        let mut config = config.clone();
+        config.dof_strength = dof_strength;
+        config.dof_focus_distance = focus_z;
+        config.dof_focus_range = dof_range;
+        renderer.set_post_process_config(config);
+    }
+
+    /// Restore DoF params to the active base config (authored scene post if
+    /// enabled, else the viewer default) when F12 follow is switched off.
+    fn restore_base_dof(&mut self) {
+        let scene_post = self.state.lock().unwrap().scene_post.clone();
+        let base = match (&scene_post, self.scene_post_enabled) {
+            (Some(def), true) => Some(post_process_config_from_def(def)),
+            _ => self.default_post_config.clone(),
+        };
+        let (Some(base), Some(renderer)) = (base, self.scene_renderer.as_mut()) else {
+            return;
+        };
+        let mut config = renderer.post_process_config().clone();
+        config.dof_strength = base.dof_strength;
+        config.dof_focus_distance = base.dof_focus_distance;
+        config.dof_focus_range = base.dof_focus_range;
+        renderer.set_post_process_config(config);
+    }
+
+    /// Swap between the scene's authored `[post_process]` and the viewer
+    /// default config (the old F11; now a button in the Rendering & Effects
+    /// menu). No-op with a console note when the scene authors no block.
+    fn toggle_authored_post(&mut self) {
+        let Some(renderer) = &mut self.scene_renderer else {
+            return;
+        };
+        let scene_post = self.state.lock().unwrap().scene_post.clone();
+        match scene_post {
+            None => println!("Scene has no [post_process] block — nothing to toggle"),
+            Some(def) if !self.scene_post_enabled => {
+                renderer.set_post_process_config(post_process_config_from_def(&def));
+                self.scene_post_enabled = true;
+                println!("Scene post-process: ON (authored)");
+            }
+            Some(_) => {
+                if let Some(default) = &self.default_post_config {
+                    renderer.set_post_process_config(default.clone());
+                }
+                self.scene_post_enabled = false;
+                println!("Scene post-process: OFF (viewer default)");
+            }
+        }
+    }
+
+    /// Enable/disable DoF follow (the old F12; now a checkbox in the
+    /// Rendering & Effects menu). On enable, seeds the focus entity from the
+    /// current selection and gives strength a visible floor; on disable,
+    /// restores the active base config's DoF.
+    fn set_dof_follow(&mut self, on: bool) {
+        self.dof_follow = on;
+        if on {
+            if self.dof_focus_entity.is_none() {
+                self.dof_focus_entity = self.scene_tree.selected_entity();
+            }
+            if self.render_panel.pp.dof_strength <= 0.0 {
+                self.render_panel.pp.dof_strength = 0.5;
+            }
+            match self.dof_focus_entity {
+                Some(_) => println!(
+                    "DoF follow: ON — focus tracks the last selected entity \
+                     (tune strength/range in the Rendering & Effects menu)"
+                ),
+                None => println!("DoF follow: ON — select an entity to set the focus target"),
+            }
+        } else {
+            self.restore_base_dof();
+            println!("DoF follow: OFF (base post-process DoF restored)");
+        }
+    }
+
+    /// Rendering & Effects panel (ADR 0053), once per frame: apply edits the
+    /// user made last frame (write-through), else mirror live renderer state
+    /// into the widgets so the panel always displays the truth.
+    fn sync_render_panel(&mut self) {
+        use flint_debug_ui::DebugPanel as _;
+        let Some(renderer) = self.scene_renderer.as_mut() else {
+            return;
+        };
+        let rp = &mut self.render_panel;
+        if rp.is_dirty() {
+            let Some(context) = self.render_context.as_ref() else {
+                return;
+            };
+            let flags = rp.take_flags();
+            if flags.pp_changed {
+                renderer.set_post_process_config(rp.pp.clone());
+                if flags.kuwahara_needs_resources {
+                    renderer.ensure_kuwahara_resources(&context.device, &context.queue);
+                }
+                if flags.fxaa_needs_resources {
+                    renderer.ensure_fxaa_resources(&context.device);
+                }
+            }
+            if flags.shadows_changed {
+                renderer.set_shadows(rp.shadows_enabled);
+            }
+            if flags.shadow_res_changed {
+                renderer.set_shadow_resolution(&context.device, rp.shadow_resolution);
+            }
+            if flags.lighting_reset {
+                renderer.reset_ambient();
+            } else if flags.lighting_changed {
+                renderer.set_ambient(rp.lighting.ambient_sky, rp.lighting.ambient_ground);
+                renderer.set_diffuse_wrap(rp.lighting.diffuse_wrap);
+                renderer.set_oren_nayar(rp.lighting.oren_nayar);
+                renderer.set_sheen(rp.lighting.sheen_color, rp.lighting.sheen_strength);
+            }
+            if flags.mode_changed {
+                renderer.set_debug_mode(rp.debug_mode);
+                let state = self.state.lock().unwrap();
+                renderer.update_from_world(&state.world, &context.device);
+            }
+            if flags.fov_changed {
+                self.camera.fov = rp.fov_deg;
+            }
+            rp.clear_dirty();
+        } else {
+            rp.refresh(
+                renderer.post_process_config(),
+                renderer.debug_state().mode,
+                renderer.shadows_enabled(),
+                renderer.shadow_resolution(),
+                renderer.lighting_levers(),
+                self.camera.fov,
+            );
+        }
+    }
+
     fn animate_camera(&mut self) {
         let now = Instant::now();
         let dt = (now - self.last_frame_time).as_secs_f32().min(0.1);
@@ -584,6 +1000,27 @@ impl ViewerApp {
             let mut yaw_delta = 0.0f32;
             let mut pitch_delta = 0.0f32;
             let mut zoom_factor = 1.0f32;
+
+            // Auto-orbit turntable: continuous yaw until manual orbit input.
+            // While it runs, the orbit centre eases onto the selected entity
+            // so the thing you picked stays framed instead of drifting out.
+            if self.auto_orbit {
+                yaw_delta += self.auto_orbit_speed * dt;
+                if let Some(id) = self.scene_tree.selected_entity() {
+                    let focus = self
+                        .state
+                        .lock()
+                        .ok()
+                        .and_then(|st| st.world.get_world_position(id));
+                    if let Some(p) = focus {
+                        let t = 1.0 - (-6.0 * dt).exp();
+                        self.camera.target.x = lerp(self.camera.target.x, p.x, t);
+                        self.camera.target.y = lerp(self.camera.target.y, p.y, t);
+                        self.camera.target.z = lerp(self.camera.target.z, p.z, t);
+                        self.camera.update_orbit();
+                    }
+                }
+            }
 
             if self.held_orbit_keys.contains(&KeyCode::KeyA) {
                 yaw_delta += speed * dt;
@@ -630,19 +1067,58 @@ impl ViewerApp {
         }
     }
 
-    fn render_egui(&mut self, target_view: &wgpu::TextureView) -> Option<GizmoAction> {
+    fn render_egui(
+        &mut self,
+        target_view: &wgpu::TextureView,
+    ) -> (Option<GizmoAction>, RenderMenuActions) {
+        // DoF follow readout for the Rendering & Effects menu: computed up
+        // front — it borrows all of self, which must end before the field
+        // borrows below.
+        let dof_follow = self.dof_follow;
+        let dof_readout = if dof_follow || self.render_panel_open {
+            let st = self.state.lock().unwrap();
+            Some(self.dof_focus_readout(&st.world))
+        } else {
+            None
+        };
+        let has_scene_post = self.state.lock().unwrap().scene_post.is_some();
+        let scene_post_enabled = self.scene_post_enabled;
+        let show_particles = self.show_particles;
+        let particles_paused = self.particles_paused;
+        let particle_speed = self.particle_speed;
+        let particle_alive = self.particle_alive;
+        let particle_instances = self.particles.sync.instance_count();
+        let particle_emitters = self.particles.sync.emitter_count();
+        let particle_effects: Vec<(String, String)> = {
+            let st = self.state.lock().unwrap();
+            self.particles
+                .sync
+                .instances()
+                .filter_map(|(key, inst)| match (&inst.source, key) {
+                    (
+                        flint_particles::EffectSource::Asset(fx),
+                        flint_particles::InstanceKey::Entity(id),
+                    ) => Some((
+                        st.world.get_name(id).unwrap_or("?").to_string(),
+                        fx.name.clone(),
+                    )),
+                    _ => None,
+                })
+                .collect()
+        };
+
         // Extract references to disjoint fields to satisfy the borrow checker
         let window = match &self.window {
             Some(w) => w.clone(),
-            None => return None,
+            None => return (None, RenderMenuActions::default()),
         };
         let context = match &self.render_context {
             Some(c) => c,
-            None => return None,
+            None => return (None, RenderMenuActions::default()),
         };
         let egui_winit = match &mut self.egui_winit {
             Some(e) => e,
-            None => return None,
+            None => return (None, RenderMenuActions::default()),
         };
 
         let raw_input = egui_winit.take_egui_input(&window);
@@ -665,6 +1141,8 @@ impl ViewerApp {
         let dirty = self.dirty;
         let undo_stack = &self.undo_stack;
         let status_message = &self.status_message;
+        let render_panel = &mut self.render_panel;
+        let render_panel_open = &mut self.render_panel_open;
 
         // Pre-compute render stats snapshot for the overlay (borrows scene_renderer before closure)
         let overlay_stats: Option<flint_render::RenderStats> = if self.show_stats {
@@ -682,6 +1160,7 @@ impl ViewerApp {
         };
 
         let mut gizmo_action = None;
+        let mut menu_actions = RenderMenuActions::default();
         let mut panel_actions: Vec<SplinePanelAction> = Vec::new();
         let mut inspector_edits: Vec<EditAction> = Vec::new();
         let mut gizmo_edits: Vec<EditAction> = Vec::new();
@@ -797,6 +1276,106 @@ impl ViewerApp {
                                 });
                         }
                     });
+            }
+
+            // Rendering & Effects menu (F4, ADR 0053): the shared panel body
+            // plus two viewer-only sections (authored-post toggle, DoF
+            // follow). Side effects that need &mut self are deferred through
+            // menu_actions and handled after the egui frame.
+            if *render_panel_open {
+                let mut open = true;
+                egui::Window::new("Rendering & Effects")
+                    .default_pos(egui::pos2(240.0, 60.0))
+                    .default_width(340.0)
+                    .vscroll(true)
+                    .open(&mut open)
+                    .show(ctx, |ui| {
+                        render_panel.ui_contents(ui);
+                        ui.separator();
+                        egui::CollapsingHeader::new("Authored post")
+                            .default_open(false)
+                            .show(ui, |ui| {
+                                if has_scene_post {
+                                    ui.label(if scene_post_enabled {
+                                        "Active: scene [post_process]"
+                                    } else {
+                                        "Active: viewer default"
+                                    });
+                                    let label = if scene_post_enabled {
+                                        "Switch to viewer default"
+                                    } else {
+                                        "Apply authored [post_process]"
+                                    };
+                                    if ui.button(label).clicked() {
+                                        menu_actions.authored_post_clicked = true;
+                                    }
+                                } else {
+                                    ui.label("Scene has no [post_process] block");
+                                }
+                            });
+                        egui::CollapsingHeader::new("DoF follow")
+                            .default_open(false)
+                            .show(ui, |ui| {
+                                let mut follow = dof_follow;
+                                if ui
+                                    .checkbox(&mut follow, "Focus tracks last selected entity")
+                                    .changed()
+                                {
+                                    menu_actions.dof_follow = Some(follow);
+                                }
+                                match &dof_readout {
+                                    Some(Some((name, z))) => {
+                                        ui.label(format!("Focus: {}", name));
+                                        ui.label(format!("Focus distance {:.2}", z));
+                                    }
+                                    _ => {
+                                        ui.label("No focus target — select an entity.");
+                                    }
+                                }
+                            });
+                        // Particles (ADR 0068): the viewer simulates live.
+                        egui::CollapsingHeader::new("Particles")
+                            .default_open(false)
+                            .show(ui, |ui| {
+                                let mut show = show_particles;
+                                if ui.checkbox(&mut show, "Simulate & draw").changed() {
+                                    menu_actions.particles_show = Some(show);
+                                }
+                                let mut paused = particles_paused;
+                                if ui.checkbox(&mut paused, "Pause").changed() {
+                                    menu_actions.particles_pause = Some(paused);
+                                }
+                                let mut speed = particle_speed;
+                                if ui
+                                    .add(egui::Slider::new(&mut speed, 0.0..=4.0).text("Speed"))
+                                    .changed()
+                                {
+                                    menu_actions.particles_speed = Some(speed);
+                                }
+                                if ui.button("Restart all").clicked() {
+                                    menu_actions.particles_restart = true;
+                                }
+                                ui.label(format!(
+                                    "{} alive · {} instance{} · {} emitter{}",
+                                    particle_alive,
+                                    particle_instances,
+                                    if particle_instances == 1 { "" } else { "s" },
+                                    particle_emitters,
+                                    if particle_emitters == 1 { "" } else { "s" },
+                                ));
+                                for (entity, fx) in &particle_effects {
+                                    ui.horizontal(|ui| {
+                                        ui.label(format!("{entity} → {fx}"));
+                                        ui.weak(format!(
+                                            "flint edit particles/{fx}.particles.toml"
+                                        ));
+                                    });
+                                }
+                            });
+                    });
+                if !open {
+                    *render_panel_open = false;
+                }
             }
 
             // Transform gizmo for selected entity (non-editor mode only)
@@ -978,7 +1557,7 @@ impl ViewerApp {
 
         self.egui_renderer = Some(egui_renderer);
 
-        gizmo_action
+        (gizmo_action, menu_actions)
     }
 
     /// Apply pending inspector edits to the world and push undo
@@ -1310,6 +1889,10 @@ impl ViewerApp {
                     {
                         let mut state = self.state.lock().unwrap();
                         state.world = new_world;
+                        state.scene_post = scene_file.post_process.clone();
+                        // Refresh authored camera too; applied on the next
+                        // Space reset (the live camera is never yanked).
+                        state.scene_camera = scene_file.camera.clone();
                     }
 
                     if let (Some(context), Some(renderer)) =
@@ -1325,6 +1908,31 @@ impl ViewerApp {
                             &config,
                         );
                         renderer.update_from_world(&state.world, &context.device);
+
+                        // Particles: effects may have changed on disk too
+                        // (the watcher covers the scene dir recursively).
+                        self.particles.clear();
+                        flint_particles::load_particle_effects_from_world(
+                            &state.scene_path,
+                            &mut self.particles,
+                        );
+                        self.particles.sync.sync_from_world(&state.world);
+                        let dirs = flint_particles::texture_search_dirs(&state.scene_path);
+                        flint_render::load_particle_textures(
+                            renderer,
+                            &context.device,
+                            &context.queue,
+                            &self.particles.sync,
+                            &dirs,
+                        );
+
+                        // Re-derive the authored post-process so [post_process]
+                        // edits hot-reload like the rest of the scene.
+                        if self.scene_post_enabled {
+                            if let Some(def) = &state.scene_post {
+                                renderer.set_post_process_config(post_process_config_from_def(def));
+                            }
+                        }
                     }
 
                     {
@@ -1605,18 +2213,31 @@ impl ApplicationHandler for ViewerApp {
                                 self.save();
                                 return;
                             }
-                            // W = Translate gizmo mode
-                            KeyCode::KeyW if self.modifiers.is_empty() => {
+                            // W/E/R = gizmo mode shortcuts, but ONLY while an
+                            // entity is selected (the gizmo doesn't exist
+                            // otherwise). With no selection they fall through
+                            // to the keyboard-orbit tracker — previously E
+                            // (zoom in) was swallowed here on the initial
+                            // press and only started zooming once OS key
+                            // repeat kicked in.
+                            KeyCode::KeyW
+                                if self.modifiers.is_empty()
+                                    && self.scene_tree.selected_entity().is_some() =>
+                            {
                                 self.transform_gizmo.mode = GizmoMode::Translate;
                                 return;
                             }
-                            // E = Rotate gizmo mode
-                            KeyCode::KeyE if self.modifiers.is_empty() => {
+                            KeyCode::KeyE
+                                if self.modifiers.is_empty()
+                                    && self.scene_tree.selected_entity().is_some() =>
+                            {
                                 self.transform_gizmo.mode = GizmoMode::Rotate;
                                 return;
                             }
-                            // R = Scale gizmo mode
-                            KeyCode::KeyR if self.modifiers.is_empty() => {
+                            KeyCode::KeyR
+                                if self.modifiers.is_empty()
+                                    && self.scene_tree.selected_entity().is_some() =>
+                            {
                                 self.transform_gizmo.mode = GizmoMode::Scale;
                                 return;
                             }
@@ -1667,10 +2288,24 @@ impl ApplicationHandler for ViewerApp {
                 // Track WASD/QE held state for keyboard orbit
                 if let PhysicalKey::Code(code) = event.physical_key {
                     match code {
-                        KeyCode::KeyW | KeyCode::KeyA | KeyCode::KeyS | KeyCode::KeyD
-                        | KeyCode::KeyQ | KeyCode::KeyE => {
+                        KeyCode::KeyW
+                        | KeyCode::KeyA
+                        | KeyCode::KeyS
+                        | KeyCode::KeyD
+                        | KeyCode::KeyQ
+                        | KeyCode::KeyE => {
                             if event.state == ElementState::Pressed {
-                                self.held_orbit_keys.insert(code);
+                                // W/E double as gizmo-mode shortcuts while an
+                                // entity is selected; keep key-repeat events
+                                // from leaking them into orbit in that state.
+                                let gizmo_key = matches!(code, KeyCode::KeyW | KeyCode::KeyE);
+                                let gizmo_owns = gizmo_key
+                                    && !is_editor
+                                    && self.scene_tree.selected_entity().is_some();
+                                if !gizmo_owns {
+                                    self.held_orbit_keys.insert(code);
+                                    self.auto_orbit = false;
+                                }
                             } else {
                                 self.held_orbit_keys.remove(&code);
                             }
@@ -1689,22 +2324,25 @@ impl ApplicationHandler for ViewerApp {
 
                         PhysicalKey::Code(KeyCode::Space) if !is_editor => {
                             self.camera = Camera::new();
-                            self.camera.update_orbit();
                             if let Some(context) = &self.render_context {
                                 self.camera.aspect = context.aspect_ratio();
                             }
+                            // Back to the authored framing (viewer default if
+                            // the scene has no [camera] block)
+                            self.seed_camera_from_scene();
+                            self.camera.update_orbit();
                         }
-                        PhysicalKey::Code(KeyCode::F1) => {
-                            if let Some(renderer) = &mut self.scene_renderer {
-                                let next = renderer.debug_state().mode.next();
-                                renderer.set_debug_mode(next);
-                                println!("Debug mode: {}", next.label());
-
-                                if let Some(context) = &self.render_context {
-                                    let state = self.state.lock().unwrap();
-                                    renderer.update_from_world(&state.world, &context.device);
-                                }
-                            }
+                        PhysicalKey::Code(KeyCode::KeyO) if !is_editor => {
+                            self.auto_orbit = !self.auto_orbit;
+                            println!("Auto-orbit: {}", if self.auto_orbit { "ON" } else { "OFF" });
+                        }
+                        PhysicalKey::Code(KeyCode::BracketRight) if !is_editor => {
+                            self.auto_orbit_speed = (self.auto_orbit_speed * 1.5).clamp(0.1, 5.0);
+                            println!("Auto-orbit speed: {:.2} rad/s", self.auto_orbit_speed);
+                        }
+                        PhysicalKey::Code(KeyCode::BracketLeft) if !is_editor => {
+                            self.auto_orbit_speed = (self.auto_orbit_speed / 1.5).clamp(0.1, 5.0);
+                            println!("Auto-orbit speed: {:.2} rad/s", self.auto_orbit_speed);
                         }
                         PhysicalKey::Code(KeyCode::F2) => {
                             self.show_stats = !self.show_stats;
@@ -1720,59 +2358,13 @@ impl ApplicationHandler for ViewerApp {
                                 }
                             }
                         }
+                        // Rendering & Effects menu (ADR 0053): the one home
+                        // for every render/post debug control the old
+                        // F1/F4-F12 keys used to flip blindly, plus their
+                        // non-binary parameters, the authored-post toggle,
+                        // and DoF follow.
                         PhysicalKey::Code(KeyCode::F4) => {
-                            if let Some(renderer) = &mut self.scene_renderer {
-                                let on = renderer.toggle_shadows();
-                                println!("Shadows: {}", if on { "ON" } else { "OFF" });
-                            }
-                        }
-                        PhysicalKey::Code(KeyCode::F5) => {
-                            if let Some(renderer) = &mut self.scene_renderer {
-                                let mut config = renderer.post_process_config().clone();
-                                config.bloom_enabled = !config.bloom_enabled;
-                                println!("Bloom: {}", if config.bloom_enabled { "ON" } else { "OFF" });
-                                renderer.set_post_process_config(config);
-                            }
-                        }
-                        PhysicalKey::Code(KeyCode::F6) => {
-                            if let Some(renderer) = &mut self.scene_renderer {
-                                let mut config = renderer.post_process_config().clone();
-                                config.enabled = !config.enabled;
-                                println!("Post-processing: {}", if config.enabled { "ON" } else { "OFF" });
-                                renderer.set_post_process_config(config);
-                            }
-                        }
-                        PhysicalKey::Code(KeyCode::F7) => {
-                            if let Some(renderer) = &mut self.scene_renderer {
-                                let mut config = renderer.post_process_config().clone();
-                                config.ssao_enabled = !config.ssao_enabled;
-                                println!("SSAO: {}", if config.ssao_enabled { "ON" } else { "OFF" });
-                                renderer.set_post_process_config(config);
-                            }
-                        }
-                        PhysicalKey::Code(KeyCode::F8) => {
-                            if let Some(renderer) = &mut self.scene_renderer {
-                                let mut config = renderer.post_process_config().clone();
-                                config.fog_enabled = !config.fog_enabled;
-                                println!("Fog: {}", if config.fog_enabled { "ON" } else { "OFF" });
-                                renderer.set_post_process_config(config);
-                            }
-                        }
-                        PhysicalKey::Code(KeyCode::F9) => {
-                            if let Some(renderer) = &mut self.scene_renderer {
-                                let mut config = renderer.post_process_config().clone();
-                                config.dither_enabled = !config.dither_enabled;
-                                println!("Dither: {}", if config.dither_enabled { "ON" } else { "OFF" });
-                                renderer.set_post_process_config(config);
-                            }
-                        }
-                        PhysicalKey::Code(KeyCode::F10) => {
-                            if let Some(renderer) = &mut self.scene_renderer {
-                                let mut config = renderer.post_process_config().clone();
-                                config.volumetric_enabled = !config.volumetric_enabled;
-                                println!("Volumetric: {}", if config.volumetric_enabled { "ON" } else { "OFF" });
-                                renderer.set_post_process_config(config);
-                            }
+                            self.render_panel_open = !self.render_panel_open;
                         }
                         _ => {}
                     }
@@ -1821,6 +2413,7 @@ impl ApplicationHandler for ViewerApp {
                             self.camera.orbit_vertical(-dy * 0.01);
                             self.camera_snap_target = None;
                             self.camera.orthographic = false;
+                            self.auto_orbit = false;
                         }
 
                         if self.right_mouse_pressed {
@@ -1897,14 +2490,13 @@ fn render_stats_overlay(ctx: &egui::Context, stats: &flint_render::RenderStats) 
             egui::Frame::none()
                 .fill(egui::Color32::from_rgba_unmultiplied(0, 0, 0, 209))
                 .stroke(egui::Stroke::new(
-                    1.0,
+                    1.0f32,
                     egui::Color32::from_rgba_unmultiplied(255, 255, 255, 38),
                 ))
                 .rounding(egui::Rounding::same(4.0))
                 .inner_margin(egui::Margin::same(10.0))
                 .show(ui, |ui| {
-                    ui.style_mut().override_font_id =
-                        Some(egui::FontId::monospace(11.0));
+                    ui.style_mut().override_font_id = Some(egui::FontId::monospace(11.0));
                     ui.set_min_width(180.0);
 
                     ui.colored_label(

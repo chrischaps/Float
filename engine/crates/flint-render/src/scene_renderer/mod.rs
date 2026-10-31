@@ -2,8 +2,10 @@
 
 mod extract;
 mod helpers;
+mod particles;
 mod render_passes;
 
+pub use particles::load_particle_textures;
 use render_passes::RenderPhase;
 
 use helpers::{identity_matrix, mat4_inv_transpose};
@@ -15,10 +17,10 @@ use crate::context::RenderContext;
 use crate::debug::{DebugMode, DebugState};
 use crate::gpu_mesh::MeshCache;
 use crate::grass_pipeline::{
-    GrassComputeUniforms, GrassEntityPosition, GrassInstanceGpu, GrassPipeline,
-    GrassRenderUniforms, MAX_GRASS_ENTITIES,
+    check_grass_mask_patch, GrassComputeUniforms, GrassEntityPosition, GrassGround, GrassHeight, GrassInstanceGpu,
+    GrassCountReadback, GrassDrawArgs, GrassPipeline, GrassRenderUniforms, MAX_GRASS_ENTITIES,
 };
-use crate::particle_pipeline::{ParticleDrawCall, ParticleDrawData, ParticlePipeline};
+use crate::particle_pipeline::{ParticleDrawCall, ParticlePipeline};
 use crate::pipeline::{
     BlendMode, DirectionalLight, LightUniforms, MaterialUniforms, PointLight, RenderPipeline,
     SpotLight, TransformUniforms, MAX_DIRECTIONAL_LIGHTS, MAX_POINT_LIGHTS, MAX_SPOT_LIGHTS,
@@ -32,15 +34,21 @@ use crate::skinned_pipeline::SkinnedPipeline;
 use crate::skybox_pipeline::{SkyboxPipeline, SkyboxUniforms};
 use crate::sprite2d_pipeline::{Sprite2dInstanceGpu, Sprite2dPipeline};
 use crate::terrain_pipeline::{TerrainDrawCall, TerrainPipeline, TerrainUniforms};
-use crate::texture_cache::TextureCache;
+use crate::texture_cache::{open_image, TextureCache};
 use flint_core::components as comp;
 use flint_core::toml_util::toml_f32;
+use flint_core::vfs;
 use flint_core::{Transform, Vec3};
 use flint_ecs::FlintWorld;
 use flint_import::ImportResult;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::Arc;
 use wgpu::util::DeviceExt;
+
+/// Default main-pass clear colour (linear RGBA), matching the historical
+/// dark slate background.
+pub const DEFAULT_CLEAR_COLOR: [f32; 4] = [0.1, 0.1, 0.15, 1.0];
 
 /// Visual representation for an archetype
 #[derive(Clone)]
@@ -62,20 +70,130 @@ impl Default for ArchetypeVisual {
 
 /// A single draw call with its own GPU resources
 #[allow(dead_code)]
-struct DrawCall {
-    vertex_buffer: wgpu::Buffer,
-    index_buffer: wgpu::Buffer,
+pub(super) struct DrawCall {
+    // GPU handles are `Arc`s so the per-entity caches below can hand the
+    // same buffers and bind groups to every frame's draw list (wgpu 23
+    // resources are not `Clone`).
+    vertex_buffer: Arc<wgpu::Buffer>,
+    index_buffer: Arc<wgpu::Buffer>,
     index_count: u32,
     is_wireframe: bool,
-    transform_buffer: wgpu::Buffer,
-    transform_bind_group: wgpu::BindGroup,
-    material_buffer: wgpu::Buffer, // kept alive for bind group
-    material_bind_group: wgpu::BindGroup,
+    /// Whether the draw goes into the shadow cascades: the entity's
+    /// `material.cast_shadows`, true unless it says otherwise (ADR 0100).
+    casts_shadow: bool,
+    transform_buffer: Arc<wgpu::Buffer>,
+    transform_bind_group: Arc<wgpu::BindGroup>,
+    material_buffer: Arc<wgpu::Buffer>, // kept alive for bind group
+    material_bind_group: Arc<wgpu::BindGroup>,
     model: [[f32; 4]; 4],
     model_inv_transpose: [[f32; 4]; 4],
     entity_id: Option<flint_core::EntityId>,
     blend_mode: BlendMode,
     sort_depth: f32,
+    /// World-space bounds for frustum culling. `None` draws are never culled.
+    world_aabb: Option<([f32; 3], [f32; 3])>,
+}
+
+/// Transform + material GPU resources of one draw of one entity, kept
+/// across frames. `update_from_world` used to rebuild every draw call from
+/// scratch each frame (buffers, bind groups, even a private copy of the
+/// vertex data), which cost more CPU than the draws themselves once a scene
+/// had a few hundred entities. The transform buffer is rewritten every frame
+/// by `update_per_frame_uniforms` anyway; the material side is rebuilt only
+/// when `material_key` (uniforms + texture identity) changes.
+pub(super) struct CachedDrawBinds {
+    pub transform_buffer: Arc<wgpu::Buffer>,
+    pub transform_bind_group: Arc<wgpu::BindGroup>,
+    pub material_buffer: Arc<wgpu::Buffer>,
+    pub material_bind_group: Arc<wgpu::BindGroup>,
+    pub material_key: u64,
+    /// `extract_frame` of the last frame that used this entry; stale entries
+    /// (despawned entities, swapped models) are evicted after extraction.
+    pub touched: u64,
+}
+
+/// One material's uniform buffer and bind group, shared by every draw whose
+/// `material_key` matches. A city is thousands of entities but only a few
+/// hundred looks. Sharing began as the fix for wgpu 23's DX12 sampler heap
+/// (2048 slots, every bind group's samplers copied in), which one bind group
+/// per entity ran dry at about 512 entities (Capitol #525). Since #577 a
+/// material bind group holds no samplers at all (they share the light
+/// group's `material_sampler`), so the number of looks has no DX12 cap;
+/// sharing still saves a buffer and a bind group per entity. The buffer's
+/// per-frame fields (debug mode, tonemapping) are the same for every draw,
+/// so sharing it is safe.
+pub(super) struct SharedMaterial {
+    pub buffer: Arc<wgpu::Buffer>,
+    pub bind_group: Arc<wgpu::BindGroup>,
+    pub touched: u64,
+}
+
+/// The per-draw binds and the shared materials they point at.
+#[derive(Default)]
+pub(super) struct DrawBindCache {
+    pub draws: HashMap<(flint_core::EntityId, u32), CachedDrawBinds>,
+    pub materials: HashMap<u64, SharedMaterial>,
+}
+
+impl DrawBindCache {
+    pub fn clear(&mut self) {
+        self.draws.clear();
+        self.materials.clear();
+    }
+
+    /// Drop the entries and materials no draw used in `frame`.
+    pub fn retain_frame(&mut self, frame: u64) {
+        self.draws.retain(|_, c| c.touched == frame);
+        self.materials.retain(|_, m| m.touched == frame);
+    }
+}
+
+/// One uploaded procedural box, shared by every `bounds` entity with the
+/// same size/colour/wireframe (a tiled park is mostly identical boxes).
+pub(super) struct CachedBoxMesh {
+    pub vertex_buffer: Arc<wgpu::Buffer>,
+    pub index_buffer: Arc<wgpu::Buffer>,
+    pub index_count: u32,
+}
+
+/// Whether `draw` may be inside `frustum`. Draws without bounds always are.
+pub(super) fn draw_visible(draw: &DrawCall, frustum: &crate::frustum::Frustum) -> bool {
+    draw.world_aabb
+        .map_or(true, |(min, max)| frustum.aabb_visible(min, max))
+}
+
+/// The world-space AABB enclosing a local AABB under `model` (column-major),
+/// by Arvo's method: exact for the transformed box, never too small.
+pub(super) fn transform_aabb(
+    model: &[[f32; 4]; 4],
+    min: [f32; 3],
+    max: [f32; 3],
+) -> ([f32; 3], [f32; 3]) {
+    let mut out_min = [model[3][0], model[3][1], model[3][2]];
+    let mut out_max = out_min;
+    for row in 0..3 {
+        for col in 0..3 {
+            let a = model[col][row] * min[col];
+            let b = model[col][row] * max[col];
+            out_min[row] += a.min(b);
+            out_max[row] += a.max(b);
+        }
+    }
+    (out_min, out_max)
+}
+
+/// FNV-1a over a few byte slices: a cheap, stable key for the draw caches.
+pub(super) fn hash_parts(parts: &[&[u8]]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for part in parts {
+        for b in part.iter() {
+            h ^= *b as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        h ^= 0xff;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
 }
 
 /// A draw call for a skinned mesh (has bone bind group)
@@ -89,23 +207,56 @@ struct SkinnedDrawCall {
     material_buffer: wgpu::Buffer,
     material_bind_group: wgpu::BindGroup,
     bone_bind_group: wgpu::BindGroup,
+    /// Unique-edge index buffer for wireframe debug modes (shares the
+    /// skinned vertex buffer, so the lines follow the animated pose).
+    wire_index_buffer: Option<wgpu::Buffer>,
+    wire_index_count: u32,
     model: [[f32; 4]; 4],
     model_inv_transpose: [[f32; 4]; 4],
     entity_id: Option<flint_core::EntityId>,
     blend_mode: BlendMode,
     sort_depth: f32,
+    /// As [`DrawCall::casts_shadow`].
+    casts_shadow: bool,
 }
 
 /// Configuration for creating a SceneRenderer
 pub struct RendererConfig {
     /// Show the ground-plane grid (useful for debug/inspection modes)
     pub show_grid: bool,
+    /// MSAA sample count for the scene passes: 1 (off, the default) or 4
+    /// (ADR 0058). Anything else is clamped to 1 with a warning. Post/
+    /// shadow/blit passes stay single-sample; depth consumers read a
+    /// sample-0 resolve.
+    pub sample_count: u32,
 }
 
 impl Default for RendererConfig {
     fn default() -> Self {
-        Self { show_grid: false }
+        Self {
+            show_grid: false,
+            sample_count: 1,
+        }
     }
+}
+
+/// Snapshot of the runtime lighting levers (ambient hemisphere, diffuse
+/// wrap, Oren-Nayar blend, sheen). Values are the active overrides when set,
+/// else the built-in neutral defaults — suitable for seeding UI controls.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LightingLevers {
+    /// Hemisphere ambient, sky half (linear RGB)
+    pub ambient_sky: [f32; 3],
+    /// Hemisphere ambient, ground half (linear RGB)
+    pub ambient_ground: [f32; 3],
+    /// Diffuse terminator wrap (0 = physically sharp / legacy)
+    pub diffuse_wrap: f32,
+    /// Lambert → Oren-Nayar blend (0 = exact legacy shading)
+    pub oren_nayar: f32,
+    /// Charlie-sheen rim tint (linear RGB)
+    pub sheen_color: [f32; 3],
+    /// Sheen strength, 0..~0.3 (0 = exact legacy shading)
+    pub sheen_strength: f32,
 }
 
 /// Renders a FlintWorld to the screen
@@ -115,11 +266,26 @@ pub struct SceneRenderer {
     billboard_pipeline: Option<BillboardPipeline>,
     archetype_visuals: HashMap<String, ArchetypeVisual>,
     mesh_cache: MeshCache,
+    /// Per-(entity, sub-mesh) transform/material resources reused across
+    /// frames; see `CachedDrawBinds`.
+    draw_bind_cache: DrawBindCache,
+    /// Uploaded procedural boxes keyed by size/colour/wireframe.
+    box_mesh_cache: HashMap<u64, CachedBoxMesh>,
+    /// Bumped once per `update_from_world`; stamps cache entries.
+    extract_frame: u64,
+    /// Runtime meshes uploaded as ray targets, by name (ADR 0105).
+    ray_meshes: HashMap<String, Arc<flint_core::ray_mesh::RayMesh>>,
+    /// Where the ray targets stood at the last `update_from_world`.
+    ray_scene: Arc<flint_core::ray_mesh::RayScene>,
     grid_draw: Option<DrawCall>,
     entity_draws: Vec<DrawCall>,
     skinned_entity_draws: Vec<SkinnedDrawCall>,
     transparent_draws: Vec<DrawCall>,
     transparent_skinned_draws: Vec<SkinnedDrawCall>,
+    /// Draws outside the camera frustum in the last `render_to`, set aside
+    /// from `entity_draws` / `transparent_draws` after the shadow pass.
+    culled_entity_draws: Vec<DrawCall>,
+    culled_transparent_draws: Vec<DrawCall>,
     billboard_draws: Vec<crate::billboard_pipeline::BillboardDrawCall>,
     debug_state: DebugState,
     wireframe_overlay_draws: Vec<DrawCall>,
@@ -129,6 +295,15 @@ pub struct SceneRenderer {
     light_buffer: wgpu::Buffer,
     light_bind_group: wgpu::BindGroup,
     light_uniforms: LightUniforms,
+    /// Scene-authored hemisphere ambient override (sky, ground). None keeps
+    /// the built-in default; stored so the zero-light fallback in
+    /// `extract_lights_from_world` cannot stomp it.
+    ambient_override: Option<([f32; 3], [f32; 3])>,
+    /// Scene-authored diffuse terminator wrap. Rides ambient_sky.w encoded as
+    /// (1 + wrap) so legacy writes of 1.0 decode to wrap = 0 in the shader.
+    diffuse_wrap_override: Option<f32>,
+    oren_nayar_override: Option<f32>,
+    sheen_override: Option<([f32; 3], f32)>,
     texture_cache: Option<TextureCache>,
     shadow_pass: Option<ShadowPass>,
     selected_entity: Option<flint_core::EntityId>,
@@ -148,10 +323,16 @@ pub struct SceneRenderer {
     // Grass
     grass_pipeline: Option<GrassPipeline>,
     grass_instance_buffer: Option<wgpu::Buffer>,
+    /// Blades drawn, for stats: read back without waiting, so a frame or
+    /// more behind (ADR 0092). The draws themselves read the GPU's count.
     grass_instance_count: u32,
+    /// The grass compute ran for this render_to, so the draws have arguments
+    grass_drawing: bool,
     grass_max_instances: u32,
-    grass_counter_buffer: Option<wgpu::Buffer>,
-    grass_staging_buffer: Option<wgpu::Buffer>,
+    grass_draw_args_buffer: Option<wgpu::Buffer>,
+    grass_count_readback: Option<GrassCountReadback>,
+    /// Times the frame's phases on the GPU, while timing is on (ADR 0108)
+    gpu_timer: Option<crate::gpu_timer::GpuTimer>,
     grass_compute_uniform_buffer: Option<wgpu::Buffer>,
     grass_compute_uniform_bind_group: Option<wgpu::BindGroup>,
     grass_compute_texture_bind_group: Option<wgpu::BindGroup>,
@@ -166,6 +347,18 @@ pub struct SceneRenderer {
     grass_terrain_width: f32,
     grass_terrain_depth: f32,
     grass_terrain_height_scale: f32,
+    /// Grass grows on a game's ground (ADR 0089), not a terrain's splat map.
+    grass_on_ground: bool,
+    /// A mask weight thins the field in proportion (ground only).
+    grass_scale_by_density: bool,
+    /// The ground's mask and its size in texels, kept so part of it can be
+    /// repainted in place (ADR 0093). `None` for a terrain's grass.
+    grass_mask: Option<(wgpu::Texture, u32, u32)>,
+    /// The config grew past the instance buffer; reallocate before the next dispatch.
+    grass_needs_realloc: bool,
+    /// The grass draw's own view uniforms, so it needs no terrain to borrow them from.
+    grass_transform_buffer: Option<wgpu::Buffer>,
+    grass_transform_bind_group: Option<wgpu::BindGroup>,
     // Procedural sky (replaces the texture skybox when a `sky` component exists)
     sky_pipeline: Option<crate::sky_pipeline::SkyPipeline>,
     sky_uniform_buffer: Option<wgpu::Buffer>,
@@ -178,6 +371,16 @@ pub struct SceneRenderer {
     ocean_uniform_bind_group: Option<wgpu::BindGroup>,
     ocean_transform_buffer: Option<wgpu::Buffer>,
     ocean_transform_bind_group: Option<wgpu::BindGroup>,
+    /// The sea's own body block (group 1, binding 1): its colours, full
+    /// waves, no flow (ADR 0094).
+    ocean_sea_body_buffer: Option<wgpu::Buffer>,
+    /// Water bodies a game set at run time, by its id (ADR 0094).
+    water_bodies: std::collections::BTreeMap<String, crate::water_body::GpuWaterBody>,
+    /// Water bodies from `water_body` components, by entity name, with the
+    /// component they were built from (rebuilt only when it changes). `None`
+    /// when the component didn't describe a mesh; the warning said why.
+    scene_water_bodies:
+        std::collections::BTreeMap<String, (toml::Value, Option<crate::water_body::GpuWaterBody>)>,
     ocean_spectrum: Option<flint_core::ocean::WaveSpectrum>,
     ocean_visuals: crate::ocean_pipeline::OceanVisuals,
     ocean_active: bool,
@@ -200,16 +403,41 @@ pub struct SceneRenderer {
     /// the game clock — the same clock scripts see via total_time(), which is
     /// what keeps script-side ocean_height() queries in sync with the GPU.
     pub ocean_time: f64,
-    // Particles
+    // Particles (ADR 0068)
     particle_pipeline: Option<ParticlePipeline>,
     particle_draws: Vec<ParticleDrawCall>,
+    /// Texture bind groups keyed by texture-cache name ("" = white).
+    particle_texture_bind_groups: HashMap<String, std::sync::Arc<wgpu::BindGroup>>,
+    /// Reused CPU staging for the per-frame instance upload.
+    particle_upload_scratch: Vec<flint_particles::ParticleInstance>,
+    /// Editor/gizmo line overlay, drawn on top regardless of debug mode.
+    debug_overlay_draws: Vec<DrawCall>,
+    /// Depth-tested script lines for the next frame (ADR 0083), and the
+    /// logical-point scale their widths are given in.
+    world_lines: Vec<flint_core::world_line::WorldLine>,
+    world_line_px_per_point: f32,
+    /// Built on the first frame that has lines.
+    world_line_pipeline: Option<crate::world_line_pipeline::WorldLinePipeline>,
+    /// Main-pass clear colour (linear RGBA).
+    clear_color: [f32; 4],
     // 2D sprites
     sprite2d_pipeline: Option<Sprite2dPipeline>,
     sprite2d_batches: Vec<crate::sprite2d_pipeline::Sprite2dBatch>,
+    // MSAA (ADR 0058): 1 = off (default), 4 = on. Scene passes render into
+    // the MSAA color/depth targets and resolve color into the HDR buffer;
+    // depth resolves (sample 0) into the caller's depth view so every
+    // depth consumer stays single-sample and unchanged.
+    sample_count: u32,
+    msaa_color: Option<(wgpu::Texture, wgpu::TextureView, u32, u32)>,
+    msaa_depth: Option<(wgpu::Texture, wgpu::TextureView)>,
+    depth_resolve_pipeline: Option<wgpu::RenderPipeline>,
+    depth_resolve_layout: Option<wgpu::BindGroupLayout>,
     // Post-processing
     postprocess_pipeline: Option<PostProcessPipeline>,
     postprocess_resources: Option<PostProcessResources>,
     postprocess_config: PostProcessConfig,
+    /// The ground fog's map, set by the game (ADR 0106).
+    ground_fog: Option<crate::ground_fog::GroundFogGpu>,
     #[allow(dead_code)]
     surface_format: wgpu::TextureFormat,
     // Parallax: camera offset in world units + orthographic viewport height
@@ -224,6 +452,10 @@ pub struct SceneRenderer {
     pub grass_time: f32,
     /// Set when GPU device is lost (e.g. driver crash); skips all rendering
     device_lost: bool,
+    /// Per-entity bone matrix buffers. The `GpuSkinnedMesh` bone buffer is
+    /// shared by every entity that instances the asset, so entities playing
+    /// different clips need their own storage or the last upload wins.
+    entity_bone_buffers: HashMap<flint_core::EntityId, wgpu::Buffer>,
 }
 
 impl SceneRenderer {
@@ -231,8 +463,9 @@ impl SceneRenderer {
         let surface_format = context.config.format;
         // Scene geometry renders to HDR; the composite pass tonemaps to the surface.
         let scene_format = HDR_FORMAT;
+        let sample_count = Self::resolve_sample_count(config.sample_count);
 
-        let pipeline = RenderPipeline::new(&context.device, scene_format);
+        let pipeline = RenderPipeline::new(&context.device, scene_format, sample_count);
         let archetype_visuals = Self::default_archetype_visuals();
         let texture_cache = TextureCache::new(&context.device, &context.queue);
 
@@ -264,22 +497,26 @@ impl SceneRenderer {
             &pipeline.transform_bind_group_layout,
             &pipeline.material_bind_group_layout,
             &pipeline.light_bind_group_layout,
+            sample_count,
         );
 
-        let billboard_pipeline = BillboardPipeline::new(&context.device, scene_format);
+        let billboard_pipeline =
+            BillboardPipeline::new(&context.device, scene_format, sample_count);
         let terrain_pipeline = TerrainPipeline::new(
             &context.device,
             scene_format,
             &pipeline.transform_bind_group_layout,
             &pipeline.light_bind_group_layout,
+            sample_count,
         );
         let ocean_resources = Self::create_ocean_resources(
             &context.device,
             scene_format,
             &pipeline.transform_bind_group_layout,
             &pipeline.light_bind_group_layout,
+            sample_count,
         );
-        let sky_resources = Self::create_sky_resources(&context.device, scene_format);
+        let sky_resources = Self::create_sky_resources(&context.device, scene_format, sample_count);
 
         // Graceful degradation: wrap in catch_unwind like the Kuwahara pipeline.
         // If compute shaders aren't supported, grass is silently disabled.
@@ -289,6 +526,7 @@ impl SceneRenderer {
                 scene_format,
                 &pipeline.transform_bind_group_layout,
                 &pipeline.light_bind_group_layout,
+                sample_count,
             )
         }))
         .unwrap_or_else(|_| {
@@ -296,9 +534,9 @@ impl SceneRenderer {
             None
         });
 
-        let particle_pipeline = ParticlePipeline::new(&context.device, scene_format);
-        let sprite2d_pipeline = Sprite2dPipeline::new(&context.device, scene_format);
-        let skybox_pipeline = SkyboxPipeline::new(&context.device, scene_format);
+        let particle_pipeline = ParticlePipeline::new(&context.device, scene_format, sample_count);
+        let sprite2d_pipeline = Sprite2dPipeline::new(&context.device, scene_format, sample_count);
+        let skybox_pipeline = SkyboxPipeline::new(&context.device, scene_format, sample_count);
 
         // Create post-processing pipeline and resources
         let postprocess_config = PostProcessConfig::default();
@@ -321,11 +559,19 @@ impl SceneRenderer {
             billboard_pipeline: Some(billboard_pipeline),
             archetype_visuals,
             mesh_cache: MeshCache::new(),
+            draw_bind_cache: DrawBindCache::default(),
+            box_mesh_cache: HashMap::new(),
+            extract_frame: 0,
+            ray_meshes: HashMap::new(),
+            ray_scene: Arc::default(),
+            entity_bone_buffers: HashMap::new(),
             grid_draw,
             entity_draws: Vec::new(),
             skinned_entity_draws: Vec::new(),
             transparent_draws: Vec::new(),
             transparent_skinned_draws: Vec::new(),
+            culled_entity_draws: Vec::new(),
+            culled_transparent_draws: Vec::new(),
             billboard_draws: Vec::new(),
             debug_state: DebugState::default(),
             wireframe_overlay_draws: Vec::new(),
@@ -335,6 +581,10 @@ impl SceneRenderer {
             light_buffer,
             light_bind_group,
             light_uniforms,
+            ambient_override: None,
+            diffuse_wrap_override: None,
+            oren_nayar_override: None,
+            sheen_override: None,
             texture_cache: Some(texture_cache),
             shadow_pass: Some(shadow_pass),
             selected_entity: None,
@@ -352,9 +602,11 @@ impl SceneRenderer {
             grass_pipeline,
             grass_instance_buffer: None,
             grass_instance_count: 0,
+            grass_drawing: false,
             grass_max_instances: 0,
-            grass_counter_buffer: None,
-            grass_staging_buffer: None,
+            grass_draw_args_buffer: None,
+            grass_count_readback: None,
+            gpu_timer: None,
             grass_compute_uniform_buffer: None,
             grass_compute_uniform_bind_group: None,
             grass_compute_texture_bind_group: None,
@@ -369,6 +621,12 @@ impl SceneRenderer {
             grass_terrain_width: 0.0,
             grass_terrain_depth: 0.0,
             grass_terrain_height_scale: 0.0,
+            grass_on_ground: false,
+            grass_scale_by_density: false,
+            grass_mask: None,
+            grass_needs_realloc: false,
+            grass_transform_buffer: None,
+            grass_transform_bind_group: None,
             sky_pipeline: sky_resources.0,
             sky_uniform_buffer: sky_resources.1,
             sky_uniform_bind_group: sky_resources.2,
@@ -379,6 +637,9 @@ impl SceneRenderer {
             ocean_uniform_bind_group: ocean_resources.2,
             ocean_transform_buffer: ocean_resources.3,
             ocean_transform_bind_group: ocean_resources.4,
+            ocean_sea_body_buffer: ocean_resources.5,
+            water_bodies: std::collections::BTreeMap::new(),
+            scene_water_bodies: std::collections::BTreeMap::new(),
             ocean_spectrum: None,
             ocean_visuals: crate::ocean_pipeline::OceanVisuals::default(),
             ocean_active: false,
@@ -395,11 +656,24 @@ impl SceneRenderer {
             ocean_time: 0.0,
             particle_pipeline: Some(particle_pipeline),
             particle_draws: Vec::new(),
+            particle_texture_bind_groups: HashMap::new(),
+            particle_upload_scratch: Vec::new(),
+            debug_overlay_draws: Vec::new(),
+            world_lines: Vec::new(),
+            world_line_px_per_point: 1.0,
+            world_line_pipeline: None,
+            clear_color: DEFAULT_CLEAR_COLOR,
             sprite2d_pipeline: Some(sprite2d_pipeline),
             sprite2d_batches: Vec::new(),
+            sample_count,
+            msaa_color: None,
+            msaa_depth: None,
+            depth_resolve_pipeline: None,
+            depth_resolve_layout: None,
             postprocess_pipeline: Some(postprocess_pipeline),
             postprocess_resources: Some(postprocess_resources),
             postprocess_config,
+            ground_fog: None,
             surface_format,
             camera_offset: [0.0, 0.0],
             ortho_height: 10.0,
@@ -416,13 +690,14 @@ impl SceneRenderer {
     fn create_sky_resources(
         device: &wgpu::Device,
         scene_format: wgpu::TextureFormat,
+        sample_count: u32,
     ) -> (
         Option<crate::sky_pipeline::SkyPipeline>,
         Option<wgpu::Buffer>,
         Option<wgpu::BindGroup>,
     ) {
         let pipeline = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            crate::sky_pipeline::SkyPipeline::new(device, scene_format)
+            crate::sky_pipeline::SkyPipeline::new(device, scene_format, sample_count)
         }));
         let pipeline = match pipeline {
             Ok(p) => p,
@@ -457,12 +732,14 @@ impl SceneRenderer {
         scene_format: wgpu::TextureFormat,
         transform_layout: &wgpu::BindGroupLayout,
         light_layout: &wgpu::BindGroupLayout,
+        sample_count: u32,
     ) -> (
         Option<crate::ocean_pipeline::OceanPipeline>,
         Option<wgpu::Buffer>,
         Option<wgpu::BindGroup>,
         Option<wgpu::Buffer>,
         Option<wgpu::BindGroup>,
+        Option<wgpu::Buffer>,
     ) {
         let pipeline = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             crate::ocean_pipeline::OceanPipeline::new(
@@ -470,13 +747,14 @@ impl SceneRenderer {
                 scene_format,
                 transform_layout,
                 light_layout,
+                sample_count,
             )
         }));
         let pipeline = match pipeline {
             Ok(p) => p,
             Err(_) => {
                 tracing::warn!("Ocean pipeline creation failed — ocean disabled");
-                return (None, None, None, None, None);
+                return (None, None, None, None, None, None);
             }
         };
 
@@ -486,12 +764,24 @@ impl SceneRenderer {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let sea_body_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Ocean Sea Body Buffer"),
+            size: std::mem::size_of::<crate::water_body::WaterBodyUniformsGpu>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         let uniform_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             layout: &pipeline.ocean_bind_group_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: uniform_buffer.as_entire_binding(),
-            }],
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: uniform_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: sea_body_buffer.as_entire_binding(),
+                },
+            ],
             label: Some("Ocean Uniform Bind Group"),
         });
 
@@ -516,6 +806,7 @@ impl SceneRenderer {
             Some(uniform_bind_group),
             Some(transform_buffer),
             Some(transform_bind_group),
+            Some(sea_body_buffer),
         )
     }
 
@@ -525,7 +816,9 @@ impl SceneRenderer {
         if self.ocean_grab_dummy_bind_group.is_some() {
             return;
         }
-        let Some(op) = &self.ocean_pipeline else { return };
+        let Some(op) = &self.ocean_pipeline else {
+            return;
+        };
         let dummy_color = crate::ocean_pipeline::create_dummy_grab_texture(
             device,
             HDR_FORMAT,
@@ -559,7 +852,9 @@ impl SceneRenderer {
     /// Called only on the ocean+postprocess path; cheap when size unchanged.
     fn ensure_ocean_grab_resources(&mut self, device: &wgpu::Device, width: u32, height: u32) {
         self.ensure_ocean_grab_dummy(device);
-        let Some(op) = &self.ocean_pipeline else { return };
+        let Some(op) = &self.ocean_pipeline else {
+            return;
+        };
 
         if self.ocean_grab_size == (width, height) && self.ocean_grab_bind_group.is_some() {
             return;
@@ -587,119 +882,23 @@ impl SceneRenderer {
         let color = make(HDR_FORMAT, "Ocean Grab Color");
         let depth = make(wgpu::TextureFormat::R32Float, "Ocean Grab Depth");
 
-        self.ocean_grab_bind_group =
-            Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
-                layout: &op.grab_bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&color.1),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::TextureView(&depth.1),
-                    },
-                ],
-                label: Some("Ocean Grab Bind Group"),
-            }));
+        self.ocean_grab_bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
+            layout: &op.grab_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&color.1),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&depth.1),
+                },
+            ],
+            label: Some("Ocean Grab Bind Group"),
+        }));
         self.ocean_grab_color = Some(color);
         self.ocean_grab_depth = Some(depth);
         self.ocean_grab_size = (width, height);
-    }
-
-    /// Upload particle instance data from the simulation and create draw calls.
-    /// Called each frame after ParticleSystem::update().
-    pub fn update_particles(&mut self, device: &wgpu::Device, draw_data: Vec<ParticleDrawData>) {
-        self.particle_draws.clear();
-
-        let pp = match &self.particle_pipeline {
-            Some(pp) => pp,
-            None => return,
-        };
-
-        for data in &draw_data {
-            if data.instances.is_empty() {
-                continue;
-            }
-
-            // Create storage buffer with instance data
-            let instance_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("Particle Instance Buffer"),
-                contents: bytemuck::cast_slice(data.instances),
-                usage: wgpu::BufferUsages::STORAGE,
-            });
-
-            // Create instance bind group
-            let instance_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                layout: &pp.instance_bind_group_layout,
-                entries: &[wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: instance_buffer.as_entire_binding(),
-                }],
-                label: Some("Particle Instance Bind Group"),
-            });
-
-            // Resolve texture (use white fallback if none specified)
-            let texture_bind_group = if !data.texture.is_empty() {
-                if let Some(tc) = &self.texture_cache {
-                    if let Some(tex) = tc.get(data.texture) {
-                        device.create_bind_group(&wgpu::BindGroupDescriptor {
-                            layout: &pp.texture_bind_group_layout,
-                            entries: &[
-                                wgpu::BindGroupEntry {
-                                    binding: 0,
-                                    resource: wgpu::BindingResource::TextureView(&tex.view),
-                                },
-                                wgpu::BindGroupEntry {
-                                    binding: 1,
-                                    resource: wgpu::BindingResource::Sampler(&tex.sampler),
-                                },
-                            ],
-                            label: Some("Particle Texture Bind Group"),
-                        })
-                    } else {
-                        self.create_white_particle_texture_bind_group(device, pp)
-                    }
-                } else {
-                    self.create_white_particle_texture_bind_group(device, pp)
-                }
-            } else {
-                self.create_white_particle_texture_bind_group(device, pp)
-            };
-
-            self.particle_draws.push(ParticleDrawCall {
-                instance_buffer,
-                instance_count: data.instances.len() as u32,
-                texture_bind_group,
-                instance_bind_group,
-                additive: data.additive,
-            });
-        }
-    }
-
-    fn create_white_particle_texture_bind_group(
-        &self,
-        device: &wgpu::Device,
-        pp: &ParticlePipeline,
-    ) -> wgpu::BindGroup {
-        if let Some(tc) = &self.texture_cache {
-            device.create_bind_group(&wgpu::BindGroupDescriptor {
-                layout: &pp.texture_bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&tc.default_white.view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::Sampler(&tc.default_white.sampler),
-                    },
-                ],
-                label: Some("Particle White Texture Bind Group"),
-            })
-        } else {
-            panic!("TextureCache required for particle rendering");
-        }
     }
 
     /// Load terrain chunks and create GPU resources for terrain rendering.
@@ -730,7 +929,7 @@ impl SceneRenderer {
         // Load splat map
         if !splat_path.is_empty() {
             let path = scene_dir.join(splat_path);
-            if path.exists() {
+            if vfs::exists(&path) {
                 let _ = tc.load_file(device, queue, "terrain_splat", &path);
             }
         }
@@ -739,7 +938,7 @@ impl SceneRenderer {
         for (i, layer_path) in layer_paths.iter().enumerate() {
             if !layer_path.is_empty() {
                 let path = scene_dir.join(layer_path);
-                if path.exists() {
+                if vfs::exists(&path) {
                     let name = format!("terrain_layer{}", i);
                     let _ = tc.load_file(device, queue, &name, &path);
                 }
@@ -889,8 +1088,16 @@ impl SceneRenderer {
                 transform_bind_group,
                 model,
                 model_inv_transpose,
-                aabb_min: [chunk.aabb_min[0] + tx, chunk.aabb_min[1] + ty, chunk.aabb_min[2] + tz],
-                aabb_max: [chunk.aabb_max[0] + tx, chunk.aabb_max[1] + ty, chunk.aabb_max[2] + tz],
+                aabb_min: [
+                    chunk.aabb_min[0] + tx,
+                    chunk.aabb_min[1] + ty,
+                    chunk.aabb_min[2] + tz,
+                ],
+                aabb_max: [
+                    chunk.aabb_max[0] + tx,
+                    chunk.aabb_max[1] + ty,
+                    chunk.aabb_max[2] + tz,
+                ],
             });
         }
 
@@ -972,8 +1179,16 @@ impl SceneRenderer {
                 transform_bind_group,
                 model,
                 model_inv_transpose,
-                aabb_min: [chunk.aabb_min[0] + tx, chunk.aabb_min[1] + ty, chunk.aabb_min[2] + tz],
-                aabb_max: [chunk.aabb_max[0] + tx, chunk.aabb_max[1] + ty, chunk.aabb_max[2] + tz],
+                aabb_min: [
+                    chunk.aabb_min[0] + tx,
+                    chunk.aabb_min[1] + ty,
+                    chunk.aabb_min[2] + tz,
+                ],
+                aabb_max: [
+                    chunk.aabb_max[0] + tx,
+                    chunk.aabb_max[1] + ty,
+                    chunk.aabb_max[2] + tz,
+                ],
             });
         }
     }
@@ -1023,7 +1238,7 @@ impl SceneRenderer {
                 let name = format!("terrain_layer{}", i);
                 tc.remove_texture(&name);
                 let path = spec_dir.join(layer_path);
-                if path.exists() {
+                if vfs::exists(&path) {
                     let _ = tc.load_file(device, queue, &name, &path);
                 }
             }
@@ -1137,12 +1352,186 @@ impl SceneRenderer {
         terrain_depth: f32,
         height_scale: f32,
     ) {
+        if self.grass_pipeline.is_none() {
+            return;
+        }
+        let (_, hm_view) = upload_grass_texture(
+            device,
+            queue,
+            "Grass Heightmap Texture",
+            wgpu::TextureFormat::R32Float,
+            bytemuck::cast_slice(heightmap_data),
+            4,
+            heightmap_width,
+            heightmap_depth,
+        );
+        let (_, splat_view) = upload_grass_texture(
+            device,
+            queue,
+            "Grass Splat Texture",
+            wgpu::TextureFormat::Rgba8Unorm,
+            splat_data,
+            4,
+            splat_width,
+            splat_height,
+        );
+        self.install_grass(
+            device,
+            config,
+            &hm_view,
+            &splat_view,
+            terrain_offset,
+            terrain_width,
+            terrain_depth,
+            height_scale,
+            None,
+        );
+    }
+
+    /// Grow grass on a game's own ground instead of a Flint terrain
+    /// (ADR 0089): a density mask and a height over a world rectangle.
+    ///
+    /// Replaces whatever grass is loaded, a terrain's included, and can be
+    /// called again whenever the ground changes. `config` is used as for a
+    /// terrain, except that `density_layer` and `density_source` don't
+    /// apply: the mask is the density. Does nothing, and returns `Ok`, when
+    /// the device has no compute grass (see `has_grass_pipeline`).
+    pub fn set_grass_ground(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        config: &flint_terrain::GrassConfig,
+        ground: &GrassGround,
+    ) -> Result<(), String> {
+        ground.validate()?;
+        if self.grass_pipeline.is_none() {
+            return Ok(());
+        }
+        let flat;
+        let (heights, hm_w, hm_d) = match ground.height {
+            GrassHeight::Flat(y) => {
+                flat = [y];
+                (&flat[..], 1, 1)
+            }
+            GrassHeight::Map {
+                heights,
+                width,
+                depth,
+            } => (heights, width, depth),
+        };
+        let (_, hm_view) = upload_grass_texture(
+            device,
+            queue,
+            "Grass Ground Height Texture",
+            wgpu::TextureFormat::R32Float,
+            bytemuck::cast_slice(heights),
+            4,
+            hm_w,
+            hm_d,
+        );
+        let (mask, mask_view) = upload_grass_texture(
+            device,
+            queue,
+            "Grass Ground Mask Texture",
+            wgpu::TextureFormat::R8Unorm,
+            ground.mask,
+            1,
+            ground.mask_width,
+            ground.mask_height,
+        );
+        // The heights are world y: offset 0, scale 1.
+        self.install_grass(
+            device,
+            config,
+            &hm_view,
+            &mask_view,
+            [ground.origin[0], 0.0, ground.origin[1]],
+            ground.size[0],
+            ground.size[1],
+            1.0,
+            Some(ground.scale_by_mask),
+        );
+        self.grass_mask = Some((mask, ground.mask_width, ground.mask_height));
+        Ok(())
+    }
+
+    /// Repaint part of the grass ground's mask in place (ADR 0093): the
+    /// `width × height` texels at (`x`, `y`), from `bytes` (one a texel,
+    /// row by row toward +Z). The buffers and bind groups stay as they
+    /// are, so a small clearing costs a small upload, not a reinstall.
+    ///
+    /// Errs when no ground was set with `set_grass_ground` (a terrain's
+    /// grass has no mask to repaint), or when the rectangle runs off the
+    /// mask or `bytes` is the wrong length. On a device with no compute
+    /// grass it does nothing, as `set_grass_ground` does.
+    pub fn update_grass_mask(
+        &mut self,
+        queue: &wgpu::Queue,
+        x: u32,
+        y: u32,
+        width: u32,
+        height: u32,
+        bytes: &[u8],
+    ) -> Result<(), String> {
+        if self.grass_pipeline.is_none() {
+            return Ok(());
+        }
+        let Some((mask, mask_width, mask_height)) = &self.grass_mask else {
+            return Err("no grass ground to repaint: set one with set_grass_ground".into());
+        };
+        check_grass_mask_patch(*mask_width, *mask_height, x, y, width, height, bytes.len())?;
+        if width == 0 || height == 0 {
+            return Ok(());
+        }
+        queue.write_texture(
+            wgpu::ImageCopyTexture {
+                texture: mask,
+                mip_level: 0,
+                origin: wgpu::Origin3d { x, y, z: 0 },
+                aspect: wgpu::TextureAspect::All,
+            },
+            bytes,
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(width),
+                rows_per_image: Some(height),
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+        Ok(())
+    }
+
+    /// Whether this device runs the compute grass at all.
+    pub fn has_grass_pipeline(&self) -> bool {
+        self.grass_pipeline.is_some()
+    }
+
+    /// Build the grass buffers and bind groups over ground textures already
+    /// uploaded. `ground` is `None` for a terrain (its splat layer is the
+    /// density), or `Some(scale_by_mask)` for a game's R8 mask.
+    #[allow(clippy::too_many_arguments)]
+    fn install_grass(
+        &mut self,
+        device: &wgpu::Device,
+        config: &flint_terrain::GrassConfig,
+        hm_view: &wgpu::TextureView,
+        splat_view: &wgpu::TextureView,
+        terrain_offset: [f32; 3],
+        terrain_width: f32,
+        terrain_depth: f32,
+        height_scale: f32,
+        ground: Option<bool>,
+    ) {
         let grass_pipeline = match &self.grass_pipeline {
             Some(p) => p,
             None => return,
         };
 
-        let max_instances = config.max_instances(terrain_width, terrain_depth);
+        let max_instances = config.instance_capacity(terrain_width, terrain_depth);
         let instance_buffer_size =
             (max_instances as u64) * std::mem::size_of::<GrassInstanceGpu>() as u64;
 
@@ -1154,23 +1543,8 @@ impl SceneRenderer {
             mapped_at_creation: false,
         });
 
-        // Atomic counter buffer (u32)
-        let counter_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Grass Counter Buffer"),
-            size: 4,
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_SRC
-                | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        // Staging buffer for reading counter back to CPU
-        let staging_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Grass Staging Buffer"),
-            size: 4,
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
+        // Indirect draw arguments; the compute pass counts blades into them (ADR 0092)
+        let counter_buffer = create_grass_draw_args_buffer(device);
 
         // Compute uniform buffer
         let compute_uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
@@ -1189,78 +1563,6 @@ impl SceneRenderer {
             label: Some("Grass Compute Uniform Bind Group"),
         });
 
-        // Upload heightmap as R32Float texture
-        let hm_texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("Grass Heightmap Texture"),
-            size: wgpu::Extent3d {
-                width: heightmap_width,
-                height: heightmap_depth,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::R32Float,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-
-        queue.write_texture(
-            wgpu::ImageCopyTexture {
-                texture: &hm_texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            bytemuck::cast_slice(heightmap_data),
-            wgpu::ImageDataLayout {
-                offset: 0,
-                bytes_per_row: Some(heightmap_width * 4),
-                rows_per_image: Some(heightmap_depth),
-            },
-            wgpu::Extent3d {
-                width: heightmap_width,
-                height: heightmap_depth,
-                depth_or_array_layers: 1,
-            },
-        );
-
-        // Upload splat map as RGBA8 texture
-        let splat_texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("Grass Splat Texture"),
-            size: wgpu::Extent3d {
-                width: splat_width,
-                height: splat_height,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-
-        queue.write_texture(
-            wgpu::ImageCopyTexture {
-                texture: &splat_texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            splat_data,
-            wgpu::ImageDataLayout {
-                offset: 0,
-                bytes_per_row: Some(splat_width * 4),
-                rows_per_image: Some(splat_height),
-            },
-            wgpu::Extent3d {
-                width: splat_width,
-                height: splat_height,
-                depth_or_array_layers: 1,
-            },
-        );
-
         // Heightmap uses nearest (non-filtering) sampler since R32Float is not filterable
         let nearest_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("Grass Nearest Sampler"),
@@ -1276,15 +1578,12 @@ impl SceneRenderer {
             ..Default::default()
         });
 
-        let hm_view = hm_texture.create_view(&Default::default());
-        let splat_view = splat_texture.create_view(&Default::default());
-
         let compute_texture_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             layout: &grass_pipeline.compute_texture_layout,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&hm_view),
+                    resource: wgpu::BindingResource::TextureView(hm_view),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
@@ -1292,7 +1591,7 @@ impl SceneRenderer {
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: wgpu::BindingResource::TextureView(&splat_view),
+                    resource: wgpu::BindingResource::TextureView(splat_view),
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
@@ -1361,8 +1660,8 @@ impl SceneRenderer {
         self.grass_instance_buffer = Some(instance_buffer);
         self.grass_instance_count = 0;
         self.grass_max_instances = max_instances;
-        self.grass_counter_buffer = Some(counter_buffer);
-        self.grass_staging_buffer = Some(staging_buffer);
+        self.grass_draw_args_buffer = Some(counter_buffer);
+        self.grass_count_readback = Some(GrassCountReadback::new(device));
         self.grass_compute_uniform_buffer = Some(compute_uniform_buffer);
         self.grass_compute_uniform_bind_group = Some(compute_uniform_bind_group);
         self.grass_compute_texture_bind_group = Some(compute_texture_bind_group);
@@ -1376,6 +1675,28 @@ impl SceneRenderer {
         self.grass_terrain_width = terrain_width;
         self.grass_terrain_depth = terrain_depth;
         self.grass_terrain_height_scale = height_scale;
+        self.grass_on_ground = ground.is_some();
+        self.grass_scale_by_density = ground.unwrap_or(false);
+        self.grass_mask = None;
+        self.grass_needs_realloc = false;
+        if self.grass_transform_bind_group.is_none() {
+            let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Grass Transform Buffer"),
+                size: std::mem::size_of::<TransformUniforms>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                layout: &self.pipeline.transform_bind_group_layout,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: buffer.as_entire_binding(),
+                }],
+                label: Some("Grass Transform Bind Group"),
+            });
+            self.grass_transform_buffer = Some(buffer);
+            self.grass_transform_bind_group = Some(bind_group);
+        }
 
         tracing::info!(
             "Grass loaded: max {} instances, {:.1}MB buffer",
@@ -1389,8 +1710,8 @@ impl SceneRenderer {
         self.grass_instance_buffer = None;
         self.grass_instance_count = 0;
         self.grass_max_instances = 0;
-        self.grass_counter_buffer = None;
-        self.grass_staging_buffer = None;
+        self.grass_draw_args_buffer = None;
+        self.grass_count_readback = None;
         self.grass_compute_uniform_buffer = None;
         self.grass_compute_uniform_bind_group = None;
         self.grass_compute_texture_bind_group = None;
@@ -1401,12 +1722,65 @@ impl SceneRenderer {
         self.grass_entity_buffer = None;
         self.grass_entity_count = 0;
         self.grass_config = None;
+        self.grass_on_ground = false;
+        self.grass_scale_by_density = false;
+        self.grass_mask = None;
+        self.grass_needs_realloc = false;
+    }
+
+    /// The blades the grass's last compute pass kept, read back from the
+    /// GPU (ADR 0098). It waits for the GPU, so it's for tests and tools,
+    /// never for a frame. Empty with no grass loaded.
+    pub fn read_grass_blades(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+    ) -> Vec<GrassInstanceGpu> {
+        let (Some(instances), Some(args)) =
+            (&self.grass_instance_buffer, &self.grass_draw_args_buffer)
+        else {
+            return Vec::new();
+        };
+        let read = |buffer: &wgpu::Buffer, offset: u64, size: u64| -> Vec<u8> {
+            let staging = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Grass Blade Read-back"),
+                size,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let mut encoder = device.create_command_encoder(&Default::default());
+            encoder.copy_buffer_to_buffer(buffer, offset, &staging, 0, size);
+            queue.submit([encoder.finish()]);
+            staging.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+            device.poll(wgpu::Maintain::Wait);
+            let bytes = staging.slice(..).get_mapped_range().to_vec();
+            staging.unmap();
+            bytes
+        };
+        let count = read(args, GrassDrawArgs::INSTANCE_COUNT_OFFSET, 4);
+        let count = u32::from_le_bytes([count[0], count[1], count[2], count[3]])
+            .min(self.grass_max_instances);
+        if count == 0 {
+            return Vec::new();
+        }
+        let stride = std::mem::size_of::<GrassInstanceGpu>();
+        read(instances, 0, count as u64 * stride as u64)
+            .chunks_exact(stride)
+            .map(bytemuck::pod_read_unaligned)
+            .collect()
     }
 
     /// Update grass config without buffer reallocation.
     /// Compute and render passes read `grass_config` fresh each frame to build
     /// uniforms, so changes take effect on the next `render()` call.
+    /// If the new config needs more instances than the buffer holds (a
+    /// higher density or a longer `max_distance`), the buffer is
+    /// reallocated before the next dispatch.
     pub fn set_grass_config(&mut self, config: flint_terrain::GrassConfig) {
+        let capacity = config.instance_capacity(self.grass_terrain_width, self.grass_terrain_depth);
+        if self.grass_instance_buffer.is_some() && capacity > self.grass_max_instances {
+            self.grass_needs_realloc = true;
+        }
         self.grass_config = Some(config);
     }
 
@@ -1423,7 +1797,8 @@ impl SceneRenderer {
             None => return,
         };
 
-        let max_instances = config.max_instances(self.grass_terrain_width, self.grass_terrain_depth);
+        let max_instances =
+            config.instance_capacity(self.grass_terrain_width, self.grass_terrain_depth);
         let instance_buffer_size =
             (max_instances as u64) * std::mem::size_of::<GrassInstanceGpu>() as u64;
 
@@ -1435,58 +1810,44 @@ impl SceneRenderer {
             mapped_at_creation: false,
         });
 
-        // Reallocate counter buffer
-        let counter_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Grass Counter Buffer"),
-            size: 4,
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_DST
-                | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-
-        // Reallocate staging buffer
-        let staging_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Grass Staging Buffer"),
-            size: 4,
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
+        // Indirect draw arguments; the compute pass counts blades into them (ADR 0092)
+        let counter_buffer = create_grass_draw_args_buffer(device);
 
         // Recreate compute storage bind group (binds instance buffer at binding 0)
-        let compute_storage_bind_group =
-            device.create_bind_group(&wgpu::BindGroupDescriptor {
-                layout: &grass_pipeline.compute_storage_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: instance_buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: counter_buffer.as_entire_binding(),
-                    },
-                ],
-                label: Some("Grass Compute Storage Bind Group"),
-            });
+        let compute_storage_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            layout: &grass_pipeline.compute_storage_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: instance_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: counter_buffer.as_entire_binding(),
+                },
+            ],
+            label: Some("Grass Compute Storage Bind Group"),
+        });
 
         // Recreate render instance bind group (binds instance buffer at binding 0)
-        let entity_buffer = self.grass_entity_buffer.as_ref().expect("grass entity buffer");
-        let render_instance_bind_group =
-            device.create_bind_group(&wgpu::BindGroupDescriptor {
-                layout: &grass_pipeline.render_instance_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: instance_buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: entity_buffer.as_entire_binding(),
-                    },
-                ],
-                label: Some("Grass Render Instance Bind Group"),
-            });
+        let entity_buffer = self
+            .grass_entity_buffer
+            .as_ref()
+            .expect("grass entity buffer");
+        let render_instance_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            layout: &grass_pipeline.render_instance_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: instance_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: entity_buffer.as_entire_binding(),
+                },
+            ],
+            label: Some("Grass Render Instance Bind Group"),
+        });
 
         // Update stored state
         // Note: grass_compute_texture_bind_group, compute_uniform_bind_group,
@@ -1495,11 +1856,12 @@ impl SceneRenderer {
         self.grass_instance_buffer = Some(instance_buffer);
         self.grass_instance_count = 0;
         self.grass_max_instances = max_instances;
-        self.grass_counter_buffer = Some(counter_buffer);
-        self.grass_staging_buffer = Some(staging_buffer);
+        self.grass_draw_args_buffer = Some(counter_buffer);
+        self.grass_count_readback = Some(GrassCountReadback::new(device));
         self.grass_compute_storage_bind_group = Some(compute_storage_bind_group);
         self.grass_render_instance_bind_group = Some(render_instance_bind_group);
         self.grass_config = Some(config);
+        self.grass_needs_realloc = false;
 
         tracing::info!(
             "Grass reloaded: max {} instances, {:.1}MB buffer",
@@ -1540,6 +1902,8 @@ impl SceneRenderer {
     /// Used by the preview command when drag-and-dropping a replacement model.
     pub fn clear_model_data(&mut self) {
         self.mesh_cache.clear();
+        self.draw_bind_cache.clear();
+        self.box_mesh_cache.clear();
         if let Some(tc) = &mut self.texture_cache {
             tc.clear_user_textures();
         }
@@ -1547,11 +1911,16 @@ impl SceneRenderer {
         self.skinned_entity_draws.clear();
         self.transparent_draws.clear();
         self.transparent_skinned_draws.clear();
+        self.culled_entity_draws.clear();
+        self.culled_transparent_draws.clear();
         self.billboard_draws.clear();
         self.sprite2d_batches.clear();
         self.wireframe_overlay_draws.clear();
         self.normal_arrow_draws.clear();
         self.skeleton_overlay_draws.clear();
+        self.debug_overlay_draws.clear();
+        self.particle_draws.clear();
+        self.particle_texture_bind_groups.clear();
         self.bitmap_font_cache.clear();
     }
 
@@ -1567,8 +1936,9 @@ impl SceneRenderer {
         let surface_format = format;
         // Scene geometry renders to HDR; composite tonemaps to the readback surface.
         let scene_format = HDR_FORMAT;
+        let sample_count = Self::resolve_sample_count(config.sample_count);
 
-        let pipeline = RenderPipeline::new(device, scene_format);
+        let pipeline = RenderPipeline::new(device, scene_format, sample_count);
         let archetype_visuals = Self::default_archetype_visuals();
         let texture_cache = TextureCache::new(device, queue);
 
@@ -1600,6 +1970,7 @@ impl SceneRenderer {
             &pipeline.transform_bind_group_layout,
             &pipeline.material_bind_group_layout,
             &pipeline.light_bind_group_layout,
+            sample_count,
         );
 
         let terrain_pipeline = TerrainPipeline::new(
@@ -1607,6 +1978,7 @@ impl SceneRenderer {
             scene_format,
             &pipeline.transform_bind_group_layout,
             &pipeline.light_bind_group_layout,
+            sample_count,
         );
 
         let grass_pipeline = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -1615,6 +1987,7 @@ impl SceneRenderer {
                 scene_format,
                 &pipeline.transform_bind_group_layout,
                 &pipeline.light_bind_group_layout,
+                sample_count,
             )
         }))
         .unwrap_or_else(|_| {
@@ -1622,17 +1995,19 @@ impl SceneRenderer {
             None
         });
 
-        let billboard_pipeline = BillboardPipeline::new(device, scene_format);
-        let sprite2d_pipeline = Sprite2dPipeline::new(device, scene_format);
-        let skybox_pipeline = SkyboxPipeline::new(device, scene_format);
+        let billboard_pipeline = BillboardPipeline::new(device, scene_format, sample_count);
+        let sprite2d_pipeline = Sprite2dPipeline::new(device, scene_format, sample_count);
+        let particle_pipeline = ParticlePipeline::new(device, scene_format, sample_count);
+        let skybox_pipeline = SkyboxPipeline::new(device, scene_format, sample_count);
 
         let ocean_resources = Self::create_ocean_resources(
             device,
             scene_format,
             &pipeline.transform_bind_group_layout,
             &pipeline.light_bind_group_layout,
+            sample_count,
         );
-        let sky_resources = Self::create_sky_resources(device, scene_format);
+        let sky_resources = Self::create_sky_resources(device, scene_format, sample_count);
 
         // Create post-processing pipeline and resources for headless
         let postprocess_config = PostProcessConfig::default();
@@ -1651,11 +2026,19 @@ impl SceneRenderer {
             billboard_pipeline: Some(billboard_pipeline),
             archetype_visuals,
             mesh_cache: MeshCache::new(),
+            draw_bind_cache: DrawBindCache::default(),
+            box_mesh_cache: HashMap::new(),
+            extract_frame: 0,
+            ray_meshes: HashMap::new(),
+            ray_scene: Arc::default(),
+            entity_bone_buffers: HashMap::new(),
             grid_draw,
             entity_draws: Vec::new(),
             skinned_entity_draws: Vec::new(),
             transparent_draws: Vec::new(),
             transparent_skinned_draws: Vec::new(),
+            culled_entity_draws: Vec::new(),
+            culled_transparent_draws: Vec::new(),
             billboard_draws: Vec::new(),
             debug_state: DebugState::default(),
             wireframe_overlay_draws: Vec::new(),
@@ -1665,6 +2048,10 @@ impl SceneRenderer {
             light_buffer,
             light_bind_group,
             light_uniforms,
+            ambient_override: None,
+            diffuse_wrap_override: None,
+            oren_nayar_override: None,
+            sheen_override: None,
             texture_cache: Some(texture_cache),
             shadow_pass: Some(shadow_pass),
             selected_entity: None,
@@ -1682,9 +2069,11 @@ impl SceneRenderer {
             grass_pipeline,
             grass_instance_buffer: None,
             grass_instance_count: 0,
+            grass_drawing: false,
             grass_max_instances: 0,
-            grass_counter_buffer: None,
-            grass_staging_buffer: None,
+            grass_draw_args_buffer: None,
+            grass_count_readback: None,
+            gpu_timer: None,
             grass_compute_uniform_buffer: None,
             grass_compute_uniform_bind_group: None,
             grass_compute_texture_bind_group: None,
@@ -1699,6 +2088,12 @@ impl SceneRenderer {
             grass_terrain_width: 0.0,
             grass_terrain_depth: 0.0,
             grass_terrain_height_scale: 0.0,
+            grass_on_ground: false,
+            grass_scale_by_density: false,
+            grass_mask: None,
+            grass_needs_realloc: false,
+            grass_transform_buffer: None,
+            grass_transform_bind_group: None,
             sky_pipeline: sky_resources.0,
             sky_uniform_buffer: sky_resources.1,
             sky_uniform_bind_group: sky_resources.2,
@@ -1709,6 +2104,9 @@ impl SceneRenderer {
             ocean_uniform_bind_group: ocean_resources.2,
             ocean_transform_buffer: ocean_resources.3,
             ocean_transform_bind_group: ocean_resources.4,
+            ocean_sea_body_buffer: ocean_resources.5,
+            water_bodies: std::collections::BTreeMap::new(),
+            scene_water_bodies: std::collections::BTreeMap::new(),
             ocean_spectrum: None,
             ocean_visuals: crate::ocean_pipeline::OceanVisuals::default(),
             ocean_active: false,
@@ -1723,13 +2121,28 @@ impl SceneRenderer {
             ocean_grab_this_frame: false,
             ocean_camera_near_far: (0.1, 1000.0),
             ocean_time: 0.0,
-            particle_pipeline: None, // No particles in headless mode
+            // Headless particles (ADR 0068): zero instances until a caller
+            // steps a ParticleSystem, so existing pixel gates are unchanged.
+            particle_pipeline: Some(particle_pipeline),
             particle_draws: Vec::new(),
+            particle_texture_bind_groups: HashMap::new(),
+            particle_upload_scratch: Vec::new(),
+            debug_overlay_draws: Vec::new(),
+            world_lines: Vec::new(),
+            world_line_px_per_point: 1.0,
+            world_line_pipeline: None,
+            clear_color: DEFAULT_CLEAR_COLOR,
             sprite2d_pipeline: Some(sprite2d_pipeline),
             sprite2d_batches: Vec::new(),
+            sample_count,
+            msaa_color: None,
+            msaa_depth: None,
+            depth_resolve_pipeline: None,
+            depth_resolve_layout: None,
             postprocess_pipeline: Some(postprocess_pipeline),
             postprocess_resources: Some(postprocess_resources),
             postprocess_config,
+            ground_fog: None,
             surface_format,
             camera_offset: [0.0, 0.0],
             ortho_height: 10.0,
@@ -1759,32 +2172,12 @@ impl SceneRenderer {
             .upload_imported(device, name, import_result, default_color);
 
         // Upload textures referenced by materials, namespaced by asset name
-        if let Some(cache) = &mut self.texture_cache {
-            for texture in &import_result.textures {
-                let namespaced = format!("{}::{}", name, texture.name);
-                cache.upload(device, queue, &namespaced, texture);
-            }
-        }
+        let both = self.upload_model_textures(device, queue, name, import_result);
 
         // Patch material texture references on cached meshes to use namespaced names
-        self.namespace_mesh_textures(name, name);
-    }
-
-    /// Point the cached meshes under `cache_key` at the textures `load_model`
-    /// uploaded for `asset_name` (namespaced `asset::texture`). Node-expanded
-    /// models cache each node under its own key (`asset/node`) and must call
-    /// this too, or every texture lookup misses and falls back to white.
-    pub fn namespace_mesh_textures(&mut self, cache_key: &str, asset_name: &str) {
-        let ns = |tex: &mut Option<String>| {
-            if let Some(t) = tex.take() {
-                *tex = Some(format!("{}::{}", asset_name, t));
-            }
-        };
-        if let Some(gpu_meshes) = self.mesh_cache.get_mut(cache_key) {
+        if let Some(gpu_meshes) = self.mesh_cache.get_mut(name) {
             for mesh in gpu_meshes.iter_mut() {
-                ns(&mut mesh.material.base_color_texture);
-                ns(&mut mesh.material.normal_texture);
-                ns(&mut mesh.material.metallic_roughness_texture);
+                namespace_textures(&mut mesh.material, name, &both);
             }
         }
     }
@@ -1814,44 +2207,98 @@ impl SceneRenderer {
         }
 
         // Also upload textures, namespaced by asset name
-        if let Some(cache) = &mut self.texture_cache {
-            for texture in &import_result.textures {
-                let namespaced = format!("{}::{}", name, texture.name);
-                cache.upload(device, queue, &namespaced, texture);
-            }
-        }
+        let both = self.upload_model_textures(device, queue, name, import_result);
 
         // Patch material texture references on cached skinned meshes
         if let Some(gpu_meshes) = self.mesh_cache.get_skinned_mut(name) {
             for mesh in gpu_meshes.iter_mut() {
-                if let Some(ref tex) = mesh.material.base_color_texture {
-                    mesh.material.base_color_texture = Some(format!("{}::{}", name, tex));
-                }
-                if let Some(ref tex) = mesh.material.normal_texture {
-                    mesh.material.normal_texture = Some(format!("{}::{}", name, tex));
-                }
-                if let Some(ref tex) = mesh.material.metallic_roughness_texture {
-                    mesh.material.metallic_roughness_texture = Some(format!("{}::{}", name, tex));
-                }
+                namespace_textures(&mut mesh.material, name, &both);
             }
         }
     }
 
-    /// Update bone matrices for a skinned mesh asset on the GPU
+    /// Upload a model's textures as `<asset>::<texture>`, each in the colour
+    /// space its materials read it in: normal and metallic-roughness maps
+    /// linear, base-colour and emissive maps (and unreferenced textures)
+    /// sRGB. A texture used both ways is uploaded twice, the linear copy as
+    /// `<asset>::<texture>#linear`; returns the names of those, for
+    /// [`namespace_textures`].
+    fn upload_model_textures(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        name: &str,
+        import_result: &ImportResult,
+    ) -> HashSet<String> {
+        let mut colour = HashSet::new();
+        let mut data = HashSet::new();
+        for m in &import_result.materials {
+            colour.extend(m.base_color_texture.iter().chain(&m.emissive_texture));
+            data.extend(m.normal_texture.iter().chain(&m.metallic_roughness_texture));
+        }
+        let mut both = HashSet::new();
+        if let Some(cache) = &mut self.texture_cache {
+            for texture in &import_result.textures {
+                let namespaced = format!("{}::{}", name, texture.name);
+                let is_data = data.contains(&texture.name);
+                if !is_data || colour.contains(&texture.name) {
+                    cache.upload(device, queue, &namespaced, texture, false);
+                }
+                if is_data && colour.contains(&texture.name) {
+                    cache.upload(device, queue, &format!("{namespaced}#linear"), texture, true);
+                    both.insert(texture.name.clone());
+                } else if is_data {
+                    cache.upload(device, queue, &namespaced, texture, true);
+                }
+            }
+        }
+        both
+    }
+
+    /// Upload an entity's bone matrices to the GPU.
+    ///
+    /// Each skinned entity gets its own storage buffer (created on first use),
+    /// so several entities instancing the same asset can play different clips.
+    /// The asset's shared buffer is also written so code paths that draw the
+    /// asset without an entity (previews) keep animating.
     pub fn update_bone_matrices(
         &mut self,
+        device: &wgpu::Device,
         queue: &wgpu::Queue,
+        entity_id: flint_core::EntityId,
         asset_name: &str,
         matrices: &[[[f32; 4]; 4]],
     ) {
         if self.device_lost {
             return;
         }
+        let bytes: &[u8] = bytemuck::cast_slice(matrices);
+        let capacity = crate::skinned_pipeline::MAX_BONES * std::mem::size_of::<[[f32; 4]; 4]>();
+        let buffer = self
+            .entity_bone_buffers
+            .entry(entity_id)
+            .or_insert_with(|| {
+                device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some(&format!(
+                        "{} Bone Buffer (entity {:?})",
+                        asset_name, entity_id
+                    )),
+                    size: capacity as u64,
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                })
+            });
+        queue.write_buffer(buffer, 0, &bytes[..bytes.len().min(capacity)]);
         if let Some(skinned_meshes) = self.mesh_cache.get_skinned_mut(asset_name) {
             for mesh in skinned_meshes.iter_mut() {
-                queue.write_buffer(&mesh.bone_buffer, 0, bytemuck::cast_slice(matrices));
+                queue.write_buffer(&mesh.bone_buffer, 0, bytes);
             }
         }
+    }
+
+    /// Drop per-entity bone buffers (call when a scene is unloaded).
+    pub fn clear_entity_bone_buffers(&mut self) {
+        self.entity_bone_buffers.clear();
     }
 
     /// Load a texture from an image file into the texture cache
@@ -1889,7 +2336,14 @@ impl SceneRenderer {
         }
     }
 
-    /// Load a procedural mesh from raw vertex/index data into the GPU mesh cache
+    /// Create or replace the named mesh from raw vertex/index data.
+    ///
+    /// Any entity whose `model.asset` is `name` draws it from the next
+    /// `update_from_world`. Replacing a mesh frees the old GPU buffers once
+    /// the current frame's draw lists let go of them, so a mesh can be
+    /// rebuilt as often as needed without growing GPU memory. Vertex colours
+    /// are used when `material.use_vertex_color` is set; they are linear,
+    /// so convert sRGB colours with [`crate::srgb_to_linear`].
     pub fn load_procedural_mesh(
         &mut self,
         device: &wgpu::Device,
@@ -1898,8 +2352,43 @@ impl SceneRenderer {
         indices: &[u32],
         material: flint_import::ImportedMaterial,
     ) {
+        self.ray_meshes.remove(name);
         self.mesh_cache
             .upload_procedural(device, name, vertices, indices, material);
+    }
+
+    /// Make the mesh `name` a ray target (ADR 0105): from the next
+    /// `update_from_world`, every entity drawing it places `mesh` in
+    /// [`ray_scene`](Self::ray_scene) at its world matrix. Build `mesh` from
+    /// the positions and indices the mesh was uploaded with. `None` stops it
+    /// being one. Uploading the mesh again, or removing it, also stops it,
+    /// so set it again after each upload.
+    pub fn set_ray_mesh(&mut self, name: &str, mesh: Option<Arc<flint_core::ray_mesh::RayMesh>>) {
+        match mesh {
+            Some(m) => {
+                self.ray_meshes.insert(name.to_string(), m);
+            }
+            None => {
+                self.ray_meshes.remove(name);
+            }
+        }
+    }
+
+    /// The ray targets as the last `update_from_world` found them: each
+    /// entity drawing a mesh made one with [`set_ray_mesh`](Self::set_ray_mesh),
+    /// at its world matrix (ADR 0105). Cast rays through it to find what's
+    /// drawn along a line. A new scene is made each update, so a clone held
+    /// across frames goes on answering for the frame it came from.
+    pub fn ray_scene(&self) -> Arc<flint_core::ray_mesh::RayScene> {
+        self.ray_scene.clone()
+    }
+
+    /// Remove the named mesh. Returns whether it existed. Entities still
+    /// naming it in `model.asset` draw nothing (or their `bounds` box, if
+    /// they have one) until a mesh with that name is uploaded again (ADR 0074).
+    pub fn remove_mesh(&mut self, name: &str) -> bool {
+        self.ray_meshes.remove(name);
+        self.mesh_cache.remove(name)
     }
 
     /// Get a mutable reference to the mesh cache
@@ -1942,7 +2431,11 @@ impl SceneRenderer {
         let billboard_draws = self.billboard_draws.len() as u32;
         let particle_draws = self.particle_draws.len() as u32;
         let sprite_batches = self.sprite2d_batches.len() as u32;
-        let grass_draw_calls = if self.grass_instance_count > 0 { 1u32 } else { 0 };
+        let grass_draw_calls = if self.grass_drawing {
+            1u32
+        } else {
+            0
+        };
 
         let draw_calls = entity_draws
             + skinned_draws
@@ -1976,22 +2469,25 @@ impl SceneRenderer {
         let particle_instances: u32 = self.particle_draws.iter().map(|d| d.instance_count).sum();
         triangles += particle_instances * 2;
         // Sprites: instanced quads (2 triangles per instance)
-        let sprite_instances: u32 =
-            self.sprite2d_batches.iter().map(|b| b.instance_count).sum();
+        let sprite_instances: u32 = self.sprite2d_batches.iter().map(|b| b.instance_count).sum();
         triangles += sprite_instances * 2;
         // Grass: BLADE_INDEX_COUNT indices per instance
         triangles += self.grass_instance_count * BLADE_INDEX_COUNT / 3;
 
-        // Shadow stats: estimate as main pass × CASCADE_COUNT
+        // Shadow stats: estimate as main pass × CASCADE_COUNT, counting only
+        // the draws that cast (ADR 0100)
         let cascade_count = crate::shadow::CASCADE_COUNT as u32;
-        let shadow_entity_draws = entity_draws + skinned_draws + terrain_draws;
+        let casting = self.entity_draws.iter().filter(|d| d.casts_shadow);
+        let casting_skinned = self.skinned_entity_draws.iter().filter(|d| d.casts_shadow);
+        let shadow_entity_draws =
+            (casting.clone().count() + casting_skinned.clone().count()) as u32 + terrain_draws;
         let shadow_draw_calls = shadow_entity_draws * cascade_count;
         let shadow_triangles = {
             let mut t: u32 = 0;
-            for d in &self.entity_draws {
+            for d in casting {
                 t += d.index_count / 3;
             }
-            for d in &self.skinned_entity_draws {
+            for d in casting_skinned {
                 t += d.index_count / 3;
             }
             for d in &self.terrain_draws {
@@ -2004,6 +2500,8 @@ impl SceneRenderer {
             draw_calls,
             triangles,
             entity_draws,
+            culled_draws: (self.culled_entity_draws.len() + self.culled_transparent_draws.len())
+                as u32,
             skinned_draws,
             terrain_draws,
             terrain_total_chunks: self.terrain_total_chunks,
@@ -2016,7 +2514,62 @@ impl SceneRenderer {
             grass_draw_calls,
             shadow_draw_calls,
             shadow_triangles,
+            gpu_passes: self
+                .gpu_timer
+                .as_ref()
+                .map(|t| t.timings().passes.clone())
+                .unwrap_or_default(),
+            gpu_frame_ms: self
+                .gpu_timer
+                .as_ref()
+                .map_or(0.0, |t| t.timings().frame_ms),
             ..Default::default()
+        }
+    }
+
+    /// Time the frame's phases on the GPU, or stop (ADR 0108): the grass
+    /// compute, the shadows, the scene, the post-process chain, its last
+    /// pass (the composite, or FXAA when it's on) and the world lines, each
+    /// a scope, into [`RenderStats::gpu_passes`]. Off by default. The
+    /// device must have been created with `Features::TIMESTAMP_QUERY`
+    /// (Flint's contexts ask for it where the adapter has it); without it
+    /// timing stays off. Returns whether timing is on.
+    ///
+    /// The host ends each frame with
+    /// [`finish_gpu_timings`](Self::finish_gpu_timings), after its last
+    /// timed submission.
+    ///
+    /// [`RenderStats::gpu_passes`]: crate::RenderStats::gpu_passes
+    pub fn set_gpu_timing(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, on: bool) -> bool {
+        if !on {
+            self.gpu_timer = None;
+        } else if self.gpu_timer.is_none() {
+            self.gpu_timer = crate::gpu_timer::GpuTimer::new(device, queue);
+        }
+        self.gpu_timer.is_some()
+    }
+
+    /// Whether the frame's phases are being timed.
+    pub fn gpu_timing(&self) -> bool {
+        self.gpu_timer.is_some()
+    }
+
+    /// The timer, while timing is on, for a host to time its own work (its
+    /// UI, say) in the same frame: [`GpuTimer::begin`] and
+    /// [`GpuTimer::end`] round it.
+    ///
+    /// [`GpuTimer::begin`]: crate::GpuTimer::begin
+    /// [`GpuTimer::end`]: crate::GpuTimer::end
+    pub fn gpu_timer_mut(&mut self) -> Option<&mut crate::gpu_timer::GpuTimer> {
+        self.gpu_timer.as_mut()
+    }
+
+    /// End the frame's GPU timing: pick up the times read back so far and
+    /// send this frame's back. Call once a frame after the last timed
+    /// submission, before presenting. Does nothing while timing is off.
+    pub fn finish_gpu_timings(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
+        if let Some(timer) = &mut self.gpu_timer {
+            timer.finish_frame(device, queue);
         }
     }
 
@@ -2126,7 +2679,7 @@ impl SceneRenderer {
         };
 
         // Load panorama image
-        let img = match image::open(path) {
+        let img = match open_image(path) {
             Ok(img) => img.to_rgba8(),
             Err(e) => {
                 tracing::warn!("Failed to load skybox '{}': {:?}", path.display(), e);
@@ -2230,6 +2783,18 @@ impl SceneRenderer {
         }
     }
 
+    /// Whether shadow rendering is currently enabled
+    pub fn shadows_enabled(&self) -> bool {
+        self.shadow_pass.as_ref().is_some_and(|sp| sp.enabled)
+    }
+
+    /// Current shadow map resolution per cascade
+    pub fn shadow_resolution(&self) -> u32 {
+        self.shadow_pass
+            .as_ref()
+            .map_or(crate::shadow::DEFAULT_SHADOW_RESOLUTION, |sp| sp.resolution)
+    }
+
     fn default_archetype_visuals() -> HashMap<String, ArchetypeVisual> {
         let mut archetype_visuals = HashMap::new();
 
@@ -2316,6 +2881,7 @@ impl SceneRenderer {
     // ── Slim update_from_world: dispatch loop calling extraction helpers ──
 
     /// Update meshes from the world state
+    #[profiling::function]
     pub fn update_from_world(&mut self, world: &FlintWorld, device: &wgpu::Device) {
         if self.device_lost {
             return;
@@ -2324,10 +2890,13 @@ impl SceneRenderer {
         self.skinned_entity_draws.clear();
         self.transparent_draws.clear();
         self.transparent_skinned_draws.clear();
+        self.culled_entity_draws.clear();
+        self.culled_transparent_draws.clear();
         self.billboard_draws.clear();
         self.sprite2d_batches.clear();
         self.wireframe_overlay_draws.clear();
         self.normal_arrow_draws.clear();
+        self.extract_frame = self.extract_frame.wrapping_add(1);
 
         // Extract lights from scene entities
         self.extract_lights_from_world(world);
@@ -2335,7 +2904,8 @@ impl SceneRenderer {
         // Extract ocean params (regenerates the wave spectrum only on change)
         self.extract_ocean_from_world(world);
         self.extract_ocean_contact_from_world(world);
-        if self.ocean_active {
+        self.extract_water_bodies_from_world(world, device);
+        if self.water_active() {
             // Ocean always binds group 3; make sure the placeholder exists
             // even on paths where the grab pass never runs.
             self.ensure_ocean_grab_dummy(device);
@@ -2344,8 +2914,8 @@ impl SceneRenderer {
         // Extract procedural sky params (+ optional ambient override)
         self.extract_sky_from_world(world);
 
-        let need_overlay =
-            self.debug_state.mode == DebugMode::WireframeOverlay || self.debug_state.mode == DebugMode::WireframeOnly;
+        let need_overlay = self.debug_state.mode == DebugMode::WireframeOverlay
+            || self.debug_state.mode == DebugMode::WireframeOnly;
         let need_normals = self.debug_state.show_normals;
         let arrow_length = self.debug_state.normal_arrow_length;
 
@@ -2355,6 +2925,9 @@ impl SceneRenderer {
         // Temporarily take texture_cache to avoid borrow conflicts
         let tex_cache = self.texture_cache.take();
         let tex_cache_ref = tex_cache.as_ref().unwrap();
+
+        // The ray targets, placed afresh (ADR 0105).
+        let mut ray_scene = flint_core::ray_mesh::RayScene::new();
 
         for entity in world.all_entities() {
             let archetype = entity.archetype.as_deref().unwrap_or("unknown");
@@ -2384,6 +2957,10 @@ impl SceneRenderer {
                 });
 
             if let Some(asset_name) = &model_asset {
+                if let Some(mesh) = self.ray_meshes.get(asset_name) {
+                    ray_scene.add(entity.id, mesh.clone(), model_matrix);
+                }
+
                 // Check for skinned meshes first
                 if self.extract_skinned_entity(
                     device,
@@ -2392,6 +2969,7 @@ impl SceneRenderer {
                     entity.id,
                     asset_name,
                     model_matrix,
+                    need_overlay,
                 ) {
                     continue;
                 }
@@ -2467,8 +3045,149 @@ impl SceneRenderer {
         // Sort & batch sprite2d instances
         self.batch_sprite2d_instances(device, tex_cache_ref, sprite2d_collected);
 
+        // Drop cached resources nothing used this frame (despawned entities,
+        // entities that changed shape/model).
+        let frame = self.extract_frame;
+        self.draw_bind_cache.retain_frame(frame);
+        self.ray_scene = Arc::new(ray_scene);
+
         // Put texture cache back
         self.texture_cache = tex_cache;
+    }
+
+    /// Transform + material resources for one draw of `key`, created on
+    /// first use and reused afterwards; the material side is looked up again
+    /// when `material_key` changes, and shared with every other draw of the
+    /// same key (see `SharedMaterial`). Free-standing over the cache and pipeline so
+    /// callers holding other `self` fields borrowed can still use it.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn cached_binds<'a>(
+        cache: &'a mut DrawBindCache,
+        frame: u64,
+        device: &wgpu::Device,
+        pipeline: &RenderPipeline,
+        key: (flint_core::EntityId, u32),
+        transform_uniforms: &TransformUniforms,
+        material_uniforms: &MaterialUniforms,
+        material_key: u64,
+        base_color: &wgpu::TextureView,
+        normal: &wgpu::TextureView,
+        metallic_roughness: &wgpu::TextureView,
+        emissive: &wgpu::TextureView,
+    ) -> &'a CachedDrawBinds {
+        let shared = cache.materials.entry(material_key).or_insert_with(|| {
+            let (b, bg) = Self::create_material_bind_with_textures(
+                device,
+                pipeline,
+                material_uniforms,
+                base_color,
+                normal,
+                metallic_roughness,
+                emissive,
+            );
+            SharedMaterial {
+                buffer: Arc::new(b),
+                bind_group: Arc::new(bg),
+                touched: frame,
+            }
+        });
+        shared.touched = frame;
+        let (mb, mbg) = (shared.buffer.clone(), shared.bind_group.clone());
+        let entry = cache.draws.entry(key).or_insert_with(|| {
+            let (tb, tbg) = Self::create_transform_bind(device, pipeline, transform_uniforms);
+            CachedDrawBinds {
+                transform_buffer: Arc::new(tb),
+                transform_bind_group: Arc::new(tbg),
+                material_buffer: mb.clone(),
+                material_bind_group: mbg.clone(),
+                material_key,
+                touched: frame,
+            }
+        });
+        if entry.material_key != material_key {
+            entry.material_buffer = mb;
+            entry.material_bind_group = mbg;
+            entry.material_key = material_key;
+        }
+        entry.touched = frame;
+        entry
+    }
+
+    /// The uploaded box for `key`, building it with `build` on a miss.
+    pub(super) fn cached_box_mesh<'a>(
+        cache: &'a mut HashMap<u64, CachedBoxMesh>,
+        device: &wgpu::Device,
+        key: u64,
+        build: impl FnOnce() -> crate::primitives::Mesh,
+    ) -> &'a CachedBoxMesh {
+        cache.entry(key).or_insert_with(|| {
+            let mesh = build();
+            let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("Box Vertex Buffer (cached)"),
+                contents: bytemuck::cast_slice(&mesh.vertices),
+                usage: wgpu::BufferUsages::VERTEX,
+            });
+            let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("Box Index Buffer (cached)"),
+                contents: bytemuck::cast_slice(&mesh.indices),
+                usage: wgpu::BufferUsages::INDEX,
+            });
+            CachedBoxMesh {
+                vertex_buffer: Arc::new(vertex_buffer),
+                index_buffer: Arc::new(index_buffer),
+                index_count: mesh.indices.len() as u32,
+            }
+        })
+    }
+
+    /// A draw call over cached geometry and cached binds.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn draw_from_cache(
+        vertex_buffer: &Arc<wgpu::Buffer>,
+        index_buffer: &Arc<wgpu::Buffer>,
+        index_count: u32,
+        is_wireframe: bool,
+        binds: &CachedDrawBinds,
+        model: [[f32; 4]; 4],
+        model_inv_transpose: [[f32; 4]; 4],
+        entity_id: flint_core::EntityId,
+        blend_mode: BlendMode,
+    ) -> DrawCall {
+        DrawCall {
+            vertex_buffer: vertex_buffer.clone(),
+            index_buffer: index_buffer.clone(),
+            index_count,
+            is_wireframe,
+            casts_shadow: true,
+            transform_buffer: binds.transform_buffer.clone(),
+            transform_bind_group: binds.transform_bind_group.clone(),
+            material_buffer: binds.material_buffer.clone(),
+            material_bind_group: binds.material_bind_group.clone(),
+            model,
+            model_inv_transpose,
+            entity_id: Some(entity_id),
+            blend_mode,
+            sort_depth: 0.0,
+            world_aabb: None,
+        }
+    }
+
+    /// Move opaque and transparent draws whose world bounds miss the camera
+    /// frustum into the culled lists. Wireframe draws and draws without
+    /// bounds always stay (ADR 0074).
+    fn cull_draws_to_camera(&mut self) {
+        let Some(frustum) = &self.camera_frustum else {
+            return;
+        };
+        let split = |draws: &mut Vec<DrawCall>, culled: &mut Vec<DrawCall>| {
+            let (keep, cull): (Vec<_>, Vec<_>) = draws
+                .drain(..)
+                .partition(|d| d.is_wireframe || draw_visible(d, frustum));
+            *draws = keep;
+            culled.extend(cull);
+        };
+        split(&mut self.entity_draws, &mut self.culled_entity_draws);
+        split(&mut self.transparent_draws, &mut self.culled_transparent_draws);
     }
 
     // ── Draw call factory methods ──
@@ -2500,121 +3219,21 @@ impl SceneRenderer {
             Self::create_material_bind(device, pipeline, &material_uniforms, texture_cache);
 
         DrawCall {
-            vertex_buffer,
-            index_buffer,
+            vertex_buffer: Arc::new(vertex_buffer),
+            index_buffer: Arc::new(index_buffer),
             index_count: mesh.indices.len() as u32,
             is_wireframe,
-            transform_buffer,
-            transform_bind_group,
-            material_buffer,
-            material_bind_group,
+            casts_shadow: true,
+            transform_buffer: Arc::new(transform_buffer),
+            transform_bind_group: Arc::new(transform_bind_group),
+            material_buffer: Arc::new(material_buffer),
+            material_bind_group: Arc::new(material_bind_group),
             model: transform_uniforms.model,
             model_inv_transpose: transform_uniforms.model_inv_transpose,
             entity_id: None,
             blend_mode: BlendMode::Alpha,
             sort_depth: 0.0,
-        }
-    }
-
-    /// Create a draw call for a procedural mesh with explicit texture bindings.
-    fn create_textured_draw_call(
-        device: &wgpu::Device,
-        pipeline: &RenderPipeline,
-        mesh: &crate::primitives::Mesh,
-        transform_uniforms: TransformUniforms,
-        material_uniforms: MaterialUniforms,
-        base_color_view: &wgpu::TextureView,
-        base_color_sampler: &wgpu::Sampler,
-        normal_view: &wgpu::TextureView,
-        normal_sampler: &wgpu::Sampler,
-        mr_view: &wgpu::TextureView,
-        mr_sampler: &wgpu::Sampler,
-    ) -> DrawCall {
-        let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Textured Vertex Buffer"),
-            contents: bytemuck::cast_slice(&mesh.vertices),
-            usage: wgpu::BufferUsages::VERTEX,
-        });
-
-        let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Textured Index Buffer"),
-            contents: bytemuck::cast_slice(&mesh.indices),
-            usage: wgpu::BufferUsages::INDEX,
-        });
-
-        let (transform_buffer, transform_bind_group) =
-            Self::create_transform_bind(device, pipeline, &transform_uniforms);
-        let (material_buffer, material_bind_group) = Self::create_material_bind_with_textures(
-            device,
-            pipeline,
-            &material_uniforms,
-            base_color_view,
-            base_color_sampler,
-            normal_view,
-            normal_sampler,
-            mr_view,
-            mr_sampler,
-        );
-
-        DrawCall {
-            vertex_buffer,
-            index_buffer,
-            index_count: mesh.indices.len() as u32,
-            is_wireframe: false,
-            transform_buffer,
-            transform_bind_group,
-            material_buffer,
-            material_bind_group,
-            model: transform_uniforms.model,
-            model_inv_transpose: transform_uniforms.model_inv_transpose,
-            entity_id: None,
-            blend_mode: BlendMode::Alpha,
-            sort_depth: 0.0,
-        }
-    }
-
-    /// Create a draw call for an imported mesh that already has GPU buffers.
-    fn create_imported_draw_call(
-        device: &wgpu::Device,
-        pipeline: &RenderPipeline,
-        gpu_mesh: &crate::gpu_mesh::GpuMesh,
-        transform_uniforms: TransformUniforms,
-        material_uniforms: MaterialUniforms,
-        base_color_view: &wgpu::TextureView,
-        base_color_sampler: &wgpu::Sampler,
-        normal_view: &wgpu::TextureView,
-        normal_sampler: &wgpu::Sampler,
-        mr_view: &wgpu::TextureView,
-        mr_sampler: &wgpu::Sampler,
-    ) -> DrawCall {
-        let (transform_buffer, transform_bind_group) =
-            Self::create_transform_bind(device, pipeline, &transform_uniforms);
-        let (material_buffer, material_bind_group) = Self::create_material_bind_with_textures(
-            device,
-            pipeline,
-            &material_uniforms,
-            base_color_view,
-            base_color_sampler,
-            normal_view,
-            normal_sampler,
-            mr_view,
-            mr_sampler,
-        );
-
-        DrawCall {
-            vertex_buffer: gpu_mesh.create_vertex_buffer_copy(device),
-            index_buffer: gpu_mesh.create_index_buffer_copy(device),
-            index_count: gpu_mesh.index_count,
-            is_wireframe: false,
-            transform_buffer,
-            transform_bind_group,
-            material_buffer,
-            material_bind_group,
-            model: transform_uniforms.model,
-            model_inv_transpose: transform_uniforms.model_inv_transpose,
-            entity_id: None,
-            blend_mode: BlendMode::Alpha,
-            sort_depth: 0.0,
+            world_aabb: None,
         }
     }
 
@@ -2652,11 +3271,9 @@ impl SceneRenderer {
             pipeline,
             uniforms,
             &texture_cache.default_white.view,
-            &texture_cache.default_white.sampler,
             &texture_cache.default_normal.view,
-            &texture_cache.default_normal.sampler,
             &texture_cache.default_metallic_roughness.view,
-            &texture_cache.default_metallic_roughness.sampler,
+            &texture_cache.default_white.view,
         )
     }
 
@@ -2665,11 +3282,9 @@ impl SceneRenderer {
         pipeline: &RenderPipeline,
         uniforms: &MaterialUniforms,
         base_color_view: &wgpu::TextureView,
-        base_color_sampler: &wgpu::Sampler,
         normal_view: &wgpu::TextureView,
-        normal_sampler: &wgpu::Sampler,
         mr_view: &wgpu::TextureView,
-        mr_sampler: &wgpu::Sampler,
+        emissive_view: &wgpu::TextureView,
     ) -> (wgpu::Buffer, wgpu::BindGroup) {
         let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Material Uniform Buffer"),
@@ -2689,24 +3304,16 @@ impl SceneRenderer {
                     resource: wgpu::BindingResource::TextureView(base_color_view),
                 },
                 wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::Sampler(base_color_sampler),
-                },
-                wgpu::BindGroupEntry {
                     binding: 3,
                     resource: wgpu::BindingResource::TextureView(normal_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: wgpu::BindingResource::Sampler(normal_sampler),
                 },
                 wgpu::BindGroupEntry {
                     binding: 5,
                     resource: wgpu::BindingResource::TextureView(mr_view),
                 },
                 wgpu::BindGroupEntry {
-                    binding: 6,
-                    resource: wgpu::BindingResource::Sampler(mr_sampler),
+                    binding: 7,
+                    resource: wgpu::BindingResource::TextureView(emissive_view),
                 },
             ],
             label: Some("Material Bind Group"),
@@ -2760,6 +3367,10 @@ impl SceneRenderer {
                     binding: 3,
                     resource: shadow_pass.shadow_uniforms_buffer.as_entire_binding(),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::Sampler(&pipeline.material_sampler),
+                },
             ],
             label: Some("Light Bind Group"),
         });
@@ -2778,7 +3389,9 @@ impl SceneRenderer {
             let ocean_comp = world
                 .get_components(entity_id)
                 .and_then(|components| components.get(comp::OCEAN).cloned());
-            let Some(ocean_comp) = ocean_comp else { continue };
+            let Some(ocean_comp) = ocean_comp else {
+                continue;
+            };
 
             let params = flint_core::ocean::OceanParams::from_component(&ocean_comp);
             let needs_regen = self
@@ -2789,11 +3402,177 @@ impl SceneRenderer {
             if needs_regen {
                 self.ocean_spectrum = Some(flint_core::ocean::WaveSpectrum::generate(&params));
             }
-            self.ocean_visuals =
-                crate::ocean_pipeline::OceanVisuals::from_component(&ocean_comp);
+            self.ocean_visuals = crate::ocean_pipeline::OceanVisuals::from_component(&ocean_comp);
             self.ocean_active = self.ocean_pipeline.is_some();
             break; // one ocean per scene
         }
+    }
+
+    // ── Water bodies (ADR 0094) ──
+
+    /// Whether any water draws this frame: the sea, or a body.
+    pub(crate) fn water_active(&self) -> bool {
+        self.ocean_active || self.has_water_bodies()
+    }
+
+    fn has_water_bodies(&self) -> bool {
+        self.ocean_pipeline.is_some()
+            && (!self.water_bodies.is_empty()
+                || self.scene_water_bodies.values().any(|(_, b)| b.is_some()))
+    }
+
+    /// Every body to draw this frame: the scene's, then the game's.
+    pub(crate) fn water_bodies_to_draw(
+        &self,
+    ) -> impl Iterator<Item = &crate::water_body::GpuWaterBody> {
+        self.scene_water_bodies
+            .values()
+            .filter_map(|(_, b)| b.as_ref())
+            .chain(self.water_bodies.values())
+    }
+
+    fn build_water_body(
+        &self,
+        device: &wgpu::Device,
+        label: &str,
+        mesh: &crate::water_body::WaterBodyMesh,
+        look: crate::water_body::WaterBodyLook,
+    ) -> Result<crate::water_body::GpuWaterBody, String> {
+        let (Some(op), Some(ocean_buf)) = (&self.ocean_pipeline, &self.ocean_uniform_buffer) else {
+            return Err("this device has no ocean pipeline".into());
+        };
+        mesh.validate()?;
+        if mesh.indices.is_empty() {
+            return Err("water body has no triangles".into());
+        }
+        Ok(crate::water_body::GpuWaterBody::new(
+            device,
+            &op.ocean_bind_group_layout,
+            ocean_buf,
+            label,
+            mesh,
+            look,
+        ))
+    }
+
+    /// Build the bodies `water_body` components describe. A body is rebuilt
+    /// only when its component changes, and dropped with its entity.
+    fn extract_water_bodies_from_world(&mut self, world: &FlintWorld, device: &wgpu::Device) {
+        let mut seen = std::collections::BTreeSet::new();
+        for &entity_id in world.entities_with_component(comp::WATER_BODY) {
+            let Some(components) = world.get_components(entity_id) else {
+                continue;
+            };
+            let Some(value) = components.get(comp::WATER_BODY) else {
+                continue;
+            };
+            let name = world
+                .get_name(entity_id)
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("{entity_id:?}"));
+            seen.insert(name.clone());
+            if self
+                .scene_water_bodies
+                .get(&name)
+                .is_some_and(|(v, _)| v == value)
+            {
+                continue;
+            }
+            let look = crate::water_body::WaterBodyLook::from_component(value);
+            let body = crate::water_body::mesh_from_component(value)
+                .and_then(|mesh| self.build_water_body(device, &name, &mesh, look));
+            let body = match body {
+                Ok(b) => Some(b),
+                Err(e) => {
+                    tracing::warn!("water_body `{name}`: {e}");
+                    None
+                }
+            };
+            self.scene_water_bodies.insert(name, (value.clone(), body));
+        }
+        self.scene_water_bodies
+            .retain(|name, _| seen.contains(name));
+
+        // Bodies take the sea's look and waves; a scene with bodies and no
+        // ocean gets the default ocean's.
+        if !self.ocean_active && self.has_water_bodies() && self.ocean_spectrum.is_none() {
+            self.ocean_spectrum = Some(flint_core::ocean::WaveSpectrum::generate(
+                &flint_core::ocean::OceanParams::default(),
+            ));
+        }
+    }
+
+    /// Lay a ground fog on the floors of `fog`'s map (ADR 0106), replacing
+    /// any set: a fog with a floor of its own under each texel, so a mist
+    /// can fill hollows at many heights. How it looks (its density, colour,
+    /// falloff and steps) is the post-process config's `ground_fog_*`, and
+    /// it shows only while `ground_fog_density` is over 0. Errs when the
+    /// map is bad, and keeps what was set; a map with no fog on it clears it.
+    pub fn set_ground_fog(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        fog: &crate::ground_fog::GroundFog,
+    ) -> Result<(), String> {
+        self.ground_fog = crate::ground_fog::GroundFogGpu::new(device, queue, fog)?;
+        Ok(())
+    }
+
+    /// Remove the ground fog. Returns whether one was set.
+    pub fn clear_ground_fog(&mut self) -> bool {
+        self.ground_fog.take().is_some()
+    }
+
+    /// Whether a ground fog is set (with fog somewhere on its map).
+    pub fn has_ground_fog(&self) -> bool {
+        self.ground_fog.is_some()
+    }
+
+    /// Draw water on a game's own mesh (ADR 0094): a lake at its level, a
+    /// river down a valley. It shades as the sea does, with the body's own
+    /// tint, wave scale and flow, and the sea's (or the default ocean's)
+    /// foam, refraction and reflection. Replaces any body set with this
+    /// `id`. Errs when the mesh's indices are bad or it has no triangles.
+    pub fn set_water_body(
+        &mut self,
+        device: &wgpu::Device,
+        id: &str,
+        mesh: &crate::water_body::WaterBodyMesh,
+        look: crate::water_body::WaterBodyLook,
+    ) -> Result<(), String> {
+        let body = self.build_water_body(device, id, mesh, look)?;
+        self.water_bodies.insert(id.to_string(), body);
+        if !self.ocean_active && self.ocean_spectrum.is_none() {
+            self.ocean_spectrum = Some(flint_core::ocean::WaveSpectrum::generate(
+                &flint_core::ocean::OceanParams::default(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Change a body's look and keep its mesh. Returns whether it existed.
+    pub fn set_water_body_look(
+        &mut self,
+        id: &str,
+        look: crate::water_body::WaterBodyLook,
+    ) -> bool {
+        match self.water_bodies.get_mut(id) {
+            Some(b) => {
+                b.look = look;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Remove the body set with `id`. Returns whether it existed.
+    pub fn remove_water_body(&mut self, id: &str) -> bool {
+        self.water_bodies.remove(id).is_some()
+    }
+
+    /// Remove every body a game set (the scene's own stay).
+    pub fn clear_water_bodies(&mut self) {
+        self.water_bodies.clear();
     }
 
     // ── Contact foam extraction ──
@@ -2805,9 +3584,15 @@ impl SceneRenderer {
         use flint_core::toml_util::{toml_f32, toml_vec3};
         self.ocean_contact = None;
         for &entity_id in world.entities_with_component(comp::OCEAN_CONTACT) {
-            let Some(components) = world.get_components(entity_id) else { continue };
-            let Some(contact) = components.get(comp::OCEAN_CONTACT) else { continue };
-            let Some(tf) = components.get(comp::TRANSFORM) else { continue };
+            let Some(components) = world.get_components(entity_id) else {
+                continue;
+            };
+            let Some(contact) = components.get(comp::OCEAN_CONTACT) else {
+                continue;
+            };
+            let Some(tf) = components.get(comp::TRANSFORM) else {
+                continue;
+            };
 
             let pos = tf.get("position").and_then(toml_vec3).unwrap_or([0.0; 3]);
             let rot = tf.get("rotation").and_then(toml_vec3).unwrap_or([0.0; 3]);
@@ -2870,6 +3655,89 @@ impl SceneRenderer {
     // ── Light extraction ──
 
     /// Extract light entities from the world and update the light uniform buffer
+    /// Override the hemisphere ambient colors (linear RGB). Scenes set this
+    /// via `[environment] ambient_sky / ambient_ground`; when never called,
+    /// the built-in default ambient is byte-identical to prior behavior.
+    pub fn set_ambient(&mut self, sky: [f32; 3], ground: [f32; 3]) {
+        self.ambient_override = Some((sky, ground));
+        self.apply_ambient_override();
+    }
+
+    /// Clear any scene-authored ambient override, restoring the built-in
+    /// default (needed on scene transitions so an old scene's ambient never
+    /// leaks into a scene that doesn't author one).
+    pub fn reset_ambient(&mut self) {
+        self.ambient_override = None;
+        self.diffuse_wrap_override = None;
+        self.oren_nayar_override = None;
+        self.sheen_override = None;
+        let [sr, sg, sb] = LightUniforms::DEFAULT_AMBIENT_SKY;
+        let [gr, gg, gb] = LightUniforms::DEFAULT_AMBIENT_GROUND;
+        self.light_uniforms.ambient_sky = [sr, sg, sb, 1.0];
+        self.light_uniforms.ambient_ground = [gr, gg, gb, 1.0];
+        self.light_uniforms.sheen_color_strength = [0.0; 4];
+    }
+
+    /// Soften the diffuse terminator (0 = physically sharp / legacy shading).
+    /// Scenes set this via `[environment] diffuse_wrap`.
+    pub fn set_diffuse_wrap(&mut self, wrap: f32) {
+        self.diffuse_wrap_override = Some(wrap.max(0.0));
+        self.apply_ambient_override();
+    }
+
+    /// Blend the diffuse term from Lambert toward the Fujii Oren-Nayar
+    /// approximation (0 = exact legacy shading, 1 = full Oren-Nayar; sigma
+    /// comes from material roughness). Scenes set this via
+    /// `[environment] oren_nayar` (ADR 0048).
+    pub fn set_oren_nayar(&mut self, blend: f32) {
+        self.oren_nayar_override = Some(blend.max(0.0));
+        self.apply_ambient_override();
+    }
+
+    /// Tinted Charlie-sheen rim: `color` is a linear RGB tint, `strength`
+    /// 0..~0.3 (0 = exact legacy shading). Scenes set this via
+    /// `[environment] sheen_color / sheen_strength` (ADR 0048).
+    pub fn set_sheen(&mut self, color: [f32; 3], strength: f32) {
+        self.sheen_override = Some((color, strength.max(0.0)));
+        self.apply_ambient_override();
+    }
+
+    /// Snapshot of the current lighting-lever state (overrides if set, else
+    /// the built-in neutral defaults). Read by the render debug panel.
+    pub fn lighting_levers(&self) -> LightingLevers {
+        let (ambient_sky, ambient_ground) = self.ambient_override.unwrap_or((
+            LightUniforms::DEFAULT_AMBIENT_SKY,
+            LightUniforms::DEFAULT_AMBIENT_GROUND,
+        ));
+        let (sheen_color, sheen_strength) = self.sheen_override.unwrap_or(([0.0; 3], 0.0));
+        LightingLevers {
+            ambient_sky,
+            ambient_ground,
+            diffuse_wrap: self.diffuse_wrap_override.unwrap_or(0.0),
+            oren_nayar: self.oren_nayar_override.unwrap_or(0.0),
+            sheen_color,
+            sheen_strength,
+        }
+    }
+
+    fn apply_ambient_override(&mut self) {
+        if let Some((sky, ground)) = self.ambient_override {
+            self.light_uniforms.ambient_sky = [sky[0], sky[1], sky[2], 1.0];
+            self.light_uniforms.ambient_ground = [ground[0], ground[1], ground[2], 1.0];
+        }
+        if let Some(wrap) = self.diffuse_wrap_override {
+            // Shader decodes wrap = ambient_sky.w - 1.0
+            self.light_uniforms.ambient_sky[3] = 1.0 + wrap;
+        }
+        if let Some(oren) = self.oren_nayar_override {
+            // Shader decodes oren = ambient_ground.w - 1.0
+            self.light_uniforms.ambient_ground[3] = 1.0 + oren;
+        }
+        if let Some((color, strength)) = self.sheen_override {
+            self.light_uniforms.sheen_color_strength = [color[0], color[1], color[2], strength];
+        }
+    }
+
     fn extract_lights_from_world(&mut self, world: &FlintWorld) {
         let mut dir_count = 0u32;
         let mut point_count = 0u32;
@@ -2878,7 +3746,24 @@ impl SceneRenderer {
         let mut points = [PointLight::default(); MAX_POINT_LIGHTS];
         let mut spots = [SpotLight::default(); MAX_SPOT_LIGHTS];
 
-        for &entity_id in world.entities_with_component(comp::LIGHT) {
+        // Deterministic iteration: the component index is a HashSet whose
+        // order changes per process, which silently reassigned the one
+        // shadow-casting directional slot (index 0) between runs. Sort by
+        // entity name (then id) so light order is stable and authored.
+        let mut light_entities: Vec<_> = world
+            .entities_with_component(comp::LIGHT)
+            .iter()
+            .copied()
+            .collect();
+        light_entities.sort_by(|a, b| {
+            world
+                .get_name(*a)
+                .unwrap_or("")
+                .cmp(world.get_name(*b).unwrap_or(""))
+                .then(a.cmp(b))
+        });
+
+        for entity_id in light_entities {
             let light_component = world
                 .get_components(entity_id)
                 .and_then(|components| components.get(comp::LIGHT).cloned());
@@ -2904,13 +3789,21 @@ impl SceneRenderer {
                             let volumetric_color =
                                 Self::extract_light_vec3(&light, "volumetric_color")
                                     .unwrap_or(color);
+                            // Apparent source angular size, authored in
+                            // degrees (sun ~0.5, softbox 2-5); drives PCSS
+                            // penumbra (ADR 0056). Stored in radians.
+                            let angular_size = light
+                                .get("angular_size")
+                                .and_then(toml_f32)
+                                .unwrap_or(0.0)
+                                .to_radians();
                             directionals[dir_count as usize] = DirectionalLight {
                                 direction,
                                 volumetric_intensity,
                                 color,
                                 intensity,
                                 volumetric_color,
-                                _pad1: 0.0,
+                                angular_size,
                             };
                             dir_count += 1;
                         }
@@ -2924,11 +3817,17 @@ impl SceneRenderer {
                                 .or_else(|| light.get("radius"))
                                 .and_then(toml_f32)
                                 .unwrap_or(10.0);
+                            let source_radius =
+                                light.get("source_radius").and_then(toml_f32).unwrap_or(0.0);
                             points[point_count as usize] = PointLight {
                                 position: [light_pos.x, light_pos.y, light_pos.z],
                                 radius,
                                 color,
                                 intensity,
+                                source_radius,
+                                _pad0: 0.0,
+                                _pad1: 0.0,
+                                _pad2: 0.0,
                             };
                             point_count += 1;
                         }
@@ -2948,6 +3847,8 @@ impl SceneRenderer {
                                 light.get("inner_angle").and_then(toml_f32).unwrap_or(0.3);
                             let outer_angle =
                                 light.get("outer_angle").and_then(toml_f32).unwrap_or(0.5);
+                            let source_radius =
+                                light.get("source_radius").and_then(toml_f32).unwrap_or(0.0);
                             spots[spot_count as usize] = SpotLight {
                                 position: [light_pos.x, light_pos.y, light_pos.z],
                                 radius,
@@ -2956,7 +3857,7 @@ impl SceneRenderer {
                                 color,
                                 outer_angle,
                                 intensity,
-                                _pad0: 0.0,
+                                source_radius,
                                 _pad1: 0.0,
                                 _pad2: 0.0,
                             };
@@ -2968,9 +3869,19 @@ impl SceneRenderer {
             }
         }
 
+        // Strongest directional casts the shadows: only index 0 gets CSM, so
+        // put the highest-intensity directional first (sun over fill),
+        // independent of entity naming. Stable sort keeps name order on ties.
+        directionals[..dir_count as usize].sort_by(|a, b| {
+            b.intensity
+                .partial_cmp(&a.intensity)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
         // If no lights found in scene, use defaults
         if dir_count == 0 && point_count == 0 && spot_count == 0 {
             self.light_uniforms = LightUniforms::default_scene_lights();
+            self.apply_ambient_override();
         } else {
             self.light_uniforms.directional_lights = directionals;
             self.light_uniforms.point_lights = points;
@@ -3032,6 +3943,37 @@ impl SceneRenderer {
             height,
             self.postprocess_config.kuwahara_enabled,
         ));
+        // The recreated resources drop the FXAA intermediate; re-allocate it
+        // at the new size when the pass is active (ADR 0050).
+        self.ensure_fxaa_resources(device);
+    }
+
+    /// Ensure FXAA GPU resources exist (call after enabling FXAA at runtime
+    /// and after resize). No-op when `fxaa` is disabled — the default-off
+    /// path allocates nothing (ADR 0050, Kuwahara lazy pattern).
+    pub fn ensure_fxaa_resources(&mut self, device: &wgpu::Device) {
+        if !self.postprocess_config.fxaa_enabled {
+            return;
+        }
+        if let Some(pp) = &mut self.postprocess_pipeline {
+            if pp.fxaa.is_none() {
+                pp.fxaa = Some(crate::postprocess::FxaaPipeline::new(
+                    device,
+                    self.surface_format,
+                ));
+            }
+        }
+        if let Some(resources) = &mut self.postprocess_resources {
+            if resources.fxaa.is_none() {
+                let (w, h) = (resources.width, resources.height);
+                resources.fxaa = Some(crate::postprocess::FxaaResources::new(
+                    device,
+                    w,
+                    h,
+                    self.surface_format,
+                ));
+            }
+        }
     }
 
     /// Get the current post-processing configuration.
@@ -3087,9 +4029,168 @@ impl SceneRenderer {
         }
     }
 
+    /// Validate the configured MSAA sample count (ADR 0058): 1 or 4;
+    /// anything else clamps to 1 with a warning.
+    fn resolve_sample_count(requested: u32) -> u32 {
+        match requested {
+            1 | 4 => requested,
+            other => {
+                tracing::warn!(
+                    "Unsupported MSAA sample count {} - falling back to 1 (supported: 1, 4)",
+                    other
+                );
+                1
+            }
+        }
+    }
+
+    /// Lazily (re)create the MSAA color+depth targets at the given size.
+    fn ensure_msaa_targets(&mut self, device: &wgpu::Device, width: u32, height: u32) {
+        if let Some((_, _, w, h)) = &self.msaa_color {
+            if *w == width && *h == height {
+                return;
+            }
+        }
+        let color = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("MSAA Scene Color"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: self.sample_count,
+            dimension: wgpu::TextureDimension::D2,
+            format: HDR_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let color_view = color.create_view(&wgpu::TextureViewDescriptor::default());
+        let depth = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("MSAA Scene Depth"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: self.sample_count,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Depth32Float,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let depth_view = depth.create_view(&wgpu::TextureViewDescriptor::default());
+        self.msaa_color = Some((color, color_view, width, height));
+        self.msaa_depth = Some((depth, depth_view));
+    }
+
+    /// Lazily create the sample-0 depth-resolve pipeline (ADR 0058).
+    fn ensure_depth_resolve_pipeline(&mut self, device: &wgpu::Device) {
+        if self.depth_resolve_pipeline.is_some() {
+            return;
+        }
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Depth Resolve Shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("../depth_resolve.wgsl").into()),
+        });
+        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Depth Resolve Bind Group Layout"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Depth,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: true,
+                },
+                count: None,
+            }],
+        });
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Depth Resolve Pipeline Layout"),
+            bind_group_layouts: &[&layout],
+            push_constant_ranges: &[],
+        });
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Depth Resolve Pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_fullscreen"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_resolve"),
+                targets: &[],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: true,
+                depth_compare: wgpu::CompareFunction::Always,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+        self.depth_resolve_layout = Some(layout);
+        self.depth_resolve_pipeline = Some(pipeline);
+    }
+
+    /// Copy sample 0 of the MSAA depth into a single-sample depth view via
+    /// a fullscreen frag-depth pass, so SSAO/DoF/fog/volumetric/ocean-grab
+    /// consumers stay unchanged (ADR 0058).
+    fn resolve_depth_into(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        target_depth_view: &wgpu::TextureView,
+    ) {
+        let (pipeline, layout) = match (&self.depth_resolve_pipeline, &self.depth_resolve_layout) {
+            (Some(p), Some(l)) => (p, l),
+            _ => return,
+        };
+        let msaa_depth_view = match &self.msaa_depth {
+            Some((_, v)) => v,
+            None => return,
+        };
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Depth Resolve Bind Group"),
+            layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(msaa_depth_view),
+            }],
+        });
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("Depth Resolve Pass"),
+            color_attachments: &[],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: target_depth_view,
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(1.0),
+                    store: wgpu::StoreOp::Store,
+                }),
+                stencil_ops: None,
+            }),
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        });
+        pass.set_pipeline(pipeline);
+        pass.set_bind_group(0, &bind_group, &[]);
+        pass.draw(0..3, 0..1);
+    }
+
     // ── Slim render_to: orchestrates shadow → uniforms → main pass → postprocess ──
 
     /// Render the scene to an arbitrary texture view with explicit device/queue/depth
+    #[profiling::function]
     pub fn render_to(
         &mut self,
         device: &wgpu::Device,
@@ -3101,8 +4202,23 @@ impl SceneRenderer {
         if self.device_lost {
             return;
         }
+        // Taken for the frame, so the phases can be scoped while self is
+        // borrowed; put back at the end (ADR 0108).
+        let mut gpu_timer = self.gpu_timer.take();
+        let clear_color = wgpu::Color {
+            r: self.clear_color[0] as f64,
+            g: self.clear_color[1] as f64,
+            b: self.clear_color[2] as f64,
+            a: self.clear_color[3] as f64,
+        };
         let view_proj = camera.view_projection_matrix();
         self.camera_frustum = Some(crate::frustum::Frustum::from_view_projection(&view_proj));
+
+        // Draws an earlier render_to culled (another camera, same extract)
+        // come back for the shadow pass and this camera's test.
+        self.entity_draws.append(&mut self.culled_entity_draws);
+        self.transparent_draws
+            .append(&mut self.culled_transparent_draws);
 
         // Count visible terrain chunks for stats
         self.terrain_visible_chunks = if let Some(ref frustum) = self.camera_frustum {
@@ -3125,8 +4241,51 @@ impl SceneRenderer {
             bytemuck::cast_slice(&[self.light_uniforms]),
         );
 
-        // Shadow pass: render depth from light perspective
+        // Grass compute (ADR 0092): scatters this camera's blades, culled to
+        // its view, and counts them into the indirect draw arguments. It goes
+        // before the shadow pass so the cascades cast this frame's blades.
+        // Nothing waits on it: the draws read the count on the GPU, and the
+        // stats get it a frame or so late.
+        self.grass_drawing = false;
+        if self.grass_needs_realloc {
+            if let Some(config) = self.grass_config.clone() {
+                self.reload_grass_config(device, config);
+            }
+        }
+        if self.grass_config.as_ref().is_some_and(|c| c.enabled) {
+            let mut compute_encoder =
+                device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("Grass Compute Encoder"),
+                });
+            let grass_time = self.grass_time;
+            let scope = gpu_timer
+                .as_mut()
+                .map(|t| t.begin(&mut compute_encoder, "Grass"));
+            self.dispatch_grass_compute(device, queue, &mut compute_encoder, camera, grass_time);
+            if let (Some(timer), Some(scope)) = (gpu_timer.as_mut(), scope) {
+                timer.end(&mut compute_encoder, scope);
+            }
+            queue.submit(std::iter::once(compute_encoder.finish()));
+            if let Some(readback) = &mut self.grass_count_readback {
+                readback.start_map();
+            }
+        } else {
+            self.grass_instance_count = 0;
+        }
+
+        // Shadow pass: render depth from light perspective. It sees every
+        // draw (culled per cascade), since a caster outside the view can
+        // still shadow what's in it.
+        let scope = gpu_timer
+            .as_mut()
+            .map(|t| t.begin_submit(device, queue, "Shadows"));
         self.render_shadow_pass(device, queue, camera, camera_pos);
+        if let (Some(timer), Some(scope)) = (gpu_timer.as_mut(), scope) {
+            timer.end_submit(device, queue, scope);
+        }
+
+        // Set aside draws outside the camera frustum for the rest of the frame.
+        self.cull_draws_to_camera();
 
         // All scene pipelines target Rgba16Float, so we always render to the HDR
         // buffer and composite to sRGB.
@@ -3143,7 +4302,8 @@ impl SceneRenderer {
 
         // Grab-pass refraction runs only with an active ocean + postprocess
         // (the HDR buffer is what gets snapshotted) in normal render mode.
-        self.ocean_grab_this_frame = self.ocean_active
+        // Water bodies refract through the same grab (ADR 0094).
+        self.ocean_grab_this_frame = self.water_active()
             && has_postprocess
             && !wireframe_only
             && self.ocean_pipeline.is_some();
@@ -3169,17 +4329,19 @@ impl SceneRenderer {
             camera,
         );
 
-        // Grass compute: dispatch in a separate encoder+submit so we can read back
-        // the instance count before the render pass needs it.
-        if self.grass_config.as_ref().is_some_and(|c| c.enabled) {
-            let mut compute_encoder =
-                device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("Grass Compute Encoder"),
-                });
-            let grass_time = self.grass_time;
-            self.dispatch_grass_compute(device, queue, &mut compute_encoder, camera, grass_time);
-            queue.submit(std::iter::once(compute_encoder.finish()));
-            self.read_grass_instance_count(device);
+        // MSAA (ADR 0058): scene passes draw into MSAA color/depth and
+        // resolve color into the HDR buffer; depth resolves (sample 0) into
+        // the caller's depth view after each opaque phase so every existing
+        // depth consumer stays single-sample. Requires the HDR chain (both
+        // constructors always build it).
+        let msaa_active = self.sample_count > 1 && has_postprocess;
+        if msaa_active {
+            let (w, h) = {
+                let res = self.postprocess_resources.as_ref().unwrap();
+                (res.width, res.height)
+            };
+            self.ensure_msaa_targets(device, w, h);
+            self.ensure_depth_resolve_pipeline(device);
         }
 
         // Choose render target: HDR buffer or direct to surface
@@ -3189,29 +4351,37 @@ impl SceneRenderer {
             target_view
         };
 
+        // Scene-pass attachments: MSAA views with a color resolve when
+        // active, the plain single-sample pair otherwise.
+        let (pass_color_view, pass_resolve_target, pass_depth_view) = if msaa_active {
+            (
+                &self.msaa_color.as_ref().unwrap().1,
+                Some(scene_target_view),
+                &self.msaa_depth.as_ref().unwrap().1,
+            )
+        } else {
+            (scene_target_view, None, depth_view)
+        };
+
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("Render Encoder"),
         });
+        let scene_scope = gpu_timer.as_mut().map(|t| t.begin(&mut encoder, "Scene"));
 
         if !self.ocean_grab_this_frame {
             // Single-pass path (unchanged for scenes without an ocean).
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Render Pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: scene_target_view,
-                    resolve_target: None,
+                    view: pass_color_view,
+                    resolve_target: pass_resolve_target,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.1,
-                            g: 0.1,
-                            b: 0.15,
-                            a: 1.0,
-                        }),
+                        load: wgpu::LoadOp::Clear(clear_color),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: depth_view,
+                    view: pass_depth_view,
                     depth_ops: Some(wgpu::Operations {
                         load: wgpu::LoadOp::Clear(1.0),
                         store: wgpu::StoreOp::Store,
@@ -3229,6 +4399,9 @@ impl SceneRenderer {
                 RenderPhase::All,
             );
             drop(render_pass);
+            if msaa_active {
+                self.resolve_depth_into(device, &mut encoder, depth_view);
+            }
         } else {
             // ── Grab-pass split: opaque scene → snapshot → ocean + rest ──
             // Pass A: sky + all opaque geometry (including the legs).
@@ -3236,20 +4409,15 @@ impl SceneRenderer {
                 let mut pass_a = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("Render Pass A (pre-ocean)"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: scene_target_view,
-                        resolve_target: None,
+                        view: pass_color_view,
+                        resolve_target: pass_resolve_target,
                         ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(wgpu::Color {
-                                r: 0.1,
-                                g: 0.1,
-                                b: 0.15,
-                                a: 1.0,
-                            }),
+                            load: wgpu::LoadOp::Clear(clear_color),
                             store: wgpu::StoreOp::Store,
                         },
                     })],
                     depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                        view: depth_view,
+                        view: pass_depth_view,
                         depth_ops: Some(wgpu::Operations {
                             load: wgpu::LoadOp::Clear(1.0),
                             store: wgpu::StoreOp::Store,
@@ -3266,6 +4434,12 @@ impl SceneRenderer {
                     camera,
                     RenderPhase::PreOcean,
                 );
+            }
+
+            // With MSAA, the grab blit below reads the caller's single-sample
+            // depth view — resolve the opaque depth into it first (ADR 0058).
+            if msaa_active {
+                self.resolve_depth_into(device, &mut encoder, depth_view);
             }
 
             // Blit: snapshot opaque color + depth into sampleable copies.
@@ -3321,15 +4495,15 @@ impl SceneRenderer {
                 let mut pass_b = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("Render Pass B (ocean + transparents)"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: scene_target_view,
-                        resolve_target: None,
+                        view: pass_color_view,
+                        resolve_target: pass_resolve_target,
                         ops: wgpu::Operations {
                             load: wgpu::LoadOp::Load,
                             store: wgpu::StoreOp::Store,
                         },
                     })],
                     depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                        view: depth_view,
+                        view: pass_depth_view,
                         depth_ops: Some(wgpu::Operations {
                             load: wgpu::LoadOp::Load,
                             store: wgpu::StoreOp::Store,
@@ -3347,13 +4521,212 @@ impl SceneRenderer {
                     RenderPhase::PostOcean,
                 );
             }
+
+            // Final depth resolve so postprocess (SSAO/DoF/fog/volumetric)
+            // sees the complete frame's depth (ADR 0058).
+            if msaa_active {
+                self.resolve_depth_into(device, &mut encoder, depth_view);
+            }
         }
 
+        if let (Some(timer), Some(scope)) = (gpu_timer.as_mut(), scene_scope) {
+            timer.end(&mut encoder, scope);
+        }
         queue.submit(std::iter::once(encoder.finish()));
 
         // Composite: always needed to convert HDR → sRGB surface
         if has_postprocess {
-            self.render_postprocess(device, queue, depth_view, target_view, camera);
+            self.render_postprocess(
+                device,
+                queue,
+                depth_view,
+                target_view,
+                camera,
+                gpu_timer.as_mut(),
+            );
+        }
+
+        // World lines (ADR 0083) go over the finished image, tested against
+        // the frame's single-sample depth. Without the HDR chain an MSAA depth
+        // is never resolved, so they're skipped there.
+        if !self.world_lines.is_empty() && (has_postprocess || self.sample_count == 1) {
+            let scope = gpu_timer
+                .as_mut()
+                .map(|t| t.begin_submit(device, queue, "World lines"));
+            self.render_world_lines(device, queue, depth_view, target_view, camera);
+            if let (Some(timer), Some(scope)) = (gpu_timer.as_mut(), scope) {
+                timer.end_submit(device, queue, scope);
+            }
+        }
+        self.gpu_timer = gpu_timer;
+    }
+
+    fn render_world_lines(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        depth_view: &wgpu::TextureView,
+        target_view: &wgpu::TextureView,
+        camera: &Camera,
+    ) {
+        let Some(viewport) = self
+            .postprocess_resources
+            .as_ref()
+            .map(|r| [r.width as f32, r.height as f32])
+        else {
+            return;
+        };
+        let format = self.surface_format;
+        let pipeline = self.world_line_pipeline.get_or_insert_with(|| {
+            crate::world_line_pipeline::WorldLinePipeline::new(device, format)
+        });
+        let view = crate::world_line_pipeline::LineView {
+            view_proj: camera.view_projection_matrix(),
+            eye: camera.position_array(),
+            viewport,
+            px_per_point: self.world_line_px_per_point,
+            linear_output: format.is_srgb(),
+        };
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("World Line Encoder"),
+        });
+        pipeline.draw(
+            device,
+            queue,
+            &mut encoder,
+            target_view,
+            depth_view,
+            &self.world_lines,
+            &view,
+        );
+        queue.submit(std::iter::once(encoder.finish()));
+    }
+}
+
+/// Point a model material's texture references at the names
+/// [`SceneRenderer::upload_model_textures`] gave them: `<asset>::<texture>`,
+/// and for a data map whose texture is also a colour map, the linear copy.
+fn namespace_textures(
+    material: &mut flint_import::ImportedMaterial,
+    asset: &str,
+    both: &HashSet<String>,
+) {
+    let colour = |tex: &mut Option<String>| {
+        if let Some(t) = tex {
+            *t = format!("{asset}::{t}");
+        }
+    };
+    let data = |tex: &mut Option<String>| {
+        if let Some(t) = tex {
+            let suffix = if both.contains(t.as_str()) { "#linear" } else { "" };
+            *t = format!("{asset}::{t}{suffix}");
+        }
+    };
+    colour(&mut material.base_color_texture);
+    colour(&mut material.emissive_texture);
+    data(&mut material.normal_texture);
+    data(&mut material.metallic_roughness_texture);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::transform_aabb;
+
+    fn translate_scale(t: [f32; 3], s: [f32; 3]) -> [[f32; 4]; 4] {
+        [
+            [s[0], 0.0, 0.0, 0.0],
+            [0.0, s[1], 0.0, 0.0],
+            [0.0, 0.0, s[2], 0.0],
+            [t[0], t[1], t[2], 1.0],
+        ]
+    }
+
+    #[test]
+    fn aabb_follows_translation_and_scale() {
+        let m = translate_scale([10.0, 0.0, -5.0], [2.0, 1.0, -3.0]);
+        let (min, max) = transform_aabb(&m, [-1.0, 0.0, 0.0], [1.0, 1.0, 2.0]);
+        assert_eq!(min, [8.0, 0.0, -11.0]);
+        assert_eq!(max, [12.0, 1.0, -5.0]);
+    }
+
+    #[test]
+    fn aabb_encloses_a_rotated_box() {
+        // 45 degrees about Y: a unit box's corners reach sqrt(2) on X and Z.
+        let (s, c) = std::f32::consts::FRAC_PI_4.sin_cos();
+        let m = [
+            [c, 0.0, -s, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [s, 0.0, c, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ];
+        let (min, max) = transform_aabb(&m, [-1.0; 3], [1.0; 3]);
+        let r = 2.0_f32.sqrt();
+        for (got, want) in min.iter().zip([-r, -1.0, -r]) {
+            assert!((got - want).abs() < 1e-5, "{min:?}");
+        }
+        for (got, want) in max.iter().zip([r, 1.0, r]) {
+            assert!((got - want).abs() < 1e-5, "{max:?}");
         }
     }
+}
+
+/// The grass draw's indirect arguments (ADR 0092): the compute pass writes
+/// the instance count, and the draws read the buffer as `INDIRECT`.
+fn create_grass_draw_args_buffer(device: &wgpu::Device) -> wgpu::Buffer {
+    device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("Grass Draw Args"),
+        contents: bytemuck::bytes_of(&GrassDrawArgs::RESET),
+        usage: wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::INDIRECT
+            | wgpu::BufferUsages::COPY_SRC
+            | wgpu::BufferUsages::COPY_DST,
+    })
+}
+
+/// Upload one grass ground texture (heightmap, splat map or mask) and
+/// return it with its view. `bytes_per_texel` is 4 for R32Float and
+/// Rgba8Unorm, 1 for R8Unorm.
+#[allow(clippy::too_many_arguments)]
+fn upload_grass_texture(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    label: &str,
+    format: wgpu::TextureFormat,
+    data: &[u8],
+    bytes_per_texel: u32,
+    width: u32,
+    height: u32,
+) -> (wgpu::Texture, wgpu::TextureView) {
+    let size = wgpu::Extent3d {
+        width,
+        height,
+        depth_or_array_layers: 1,
+    };
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some(label),
+        size,
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    queue.write_texture(
+        wgpu::ImageCopyTexture {
+            texture: &texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        data,
+        wgpu::ImageDataLayout {
+            offset: 0,
+            bytes_per_row: Some(width * bytes_per_texel),
+            rows_per_image: Some(height),
+        },
+        size,
+    );
+    let view = texture.create_view(&Default::default());
+    (texture, view)
 }

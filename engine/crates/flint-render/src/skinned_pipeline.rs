@@ -10,7 +10,12 @@ pub struct SkinnedPipeline {
     pub pipeline: wgpu::RenderPipeline,
     pub outline_pipeline: wgpu::RenderPipeline,
     pub depth_prepass_pipeline: wgpu::RenderPipeline,
+    /// Skinned wireframe lines (LineList, LessEqual + negative bias so the
+    /// edges sit on top of the animated surface).
+    pub wire_line_pipeline: wgpu::RenderPipeline,
     pub transparent_alpha_pipeline: wgpu::RenderPipeline,
+    /// Back-face pass of the alpha pipeline (drawn first).
+    pub transparent_alpha_back_pipeline: wgpu::RenderPipeline,
     pub transparent_additive_pipeline: wgpu::RenderPipeline,
     pub transparent_multiply_pipeline: wgpu::RenderPipeline,
     pub bone_bind_group_layout: wgpu::BindGroupLayout,
@@ -27,6 +32,7 @@ impl SkinnedPipeline {
         transform_bind_group_layout: &wgpu::BindGroupLayout,
         material_bind_group_layout: &wgpu::BindGroupLayout,
         light_bind_group_layout: &wgpu::BindGroupLayout,
+        sample_count: u32,
     ) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Skinned PBR Shader"),
@@ -95,7 +101,10 @@ impl SkinnedPipeline {
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
             }),
-            multisample: wgpu::MultisampleState::default(),
+            multisample: wgpu::MultisampleState {
+                count: sample_count,
+                ..Default::default()
+            },
             multiview: None,
             cache: None,
         });
@@ -141,7 +150,10 @@ impl SkinnedPipeline {
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
             }),
-            multisample: wgpu::MultisampleState::default(),
+            multisample: wgpu::MultisampleState {
+                count: sample_count,
+                ..Default::default()
+            },
             multiview: None,
             cache: None,
         });
@@ -183,15 +195,22 @@ impl SkinnedPipeline {
                     stencil: wgpu::StencilState::default(),
                     bias: wgpu::DepthBiasState::default(),
                 }),
-                multisample: wgpu::MultisampleState::default(),
+                multisample: wgpu::MultisampleState {
+                    count: sample_count,
+                    ..Default::default()
+                },
                 multiview: None,
                 cache: None,
             });
 
-        // Transparent alpha pipeline for skinned meshes
-        let transparent_alpha_pipeline =
+        // Alpha-blended meshes draw in two passes, back faces first (cull front) then
+        // front faces (cull back). Depth write stays off, but with no sort inside one
+        // mesh a single double-sided pass blends its own back faces over its front
+        // faces in index order, which shows as triangular patches on a translucent
+        // sphere. Two passes make every convex translucent object order-independent.
+        let make_transparent_alpha = |label: &str, cull_mode: Option<wgpu::Face>| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some("Skinned Transparent Alpha Pipeline"),
+                label: Some(label),
                 layout: Some(&pipeline_layout),
                 vertex: wgpu::VertexState {
                     module: &shader,
@@ -213,7 +232,7 @@ impl SkinnedPipeline {
                     topology: wgpu::PrimitiveTopology::TriangleList,
                     strip_index_format: None,
                     front_face: wgpu::FrontFace::Ccw,
-                    cull_mode: None,
+                    cull_mode,
                     polygon_mode: wgpu::PolygonMode::Fill,
                     unclipped_depth: false,
                     conservative: false,
@@ -225,10 +244,22 @@ impl SkinnedPipeline {
                     stencil: wgpu::StencilState::default(),
                     bias: wgpu::DepthBiasState::default(),
                 }),
-                multisample: wgpu::MultisampleState::default(),
+                multisample: wgpu::MultisampleState {
+                    count: sample_count,
+                    ..Default::default()
+                },
                 multiview: None,
                 cache: None,
-            });
+            })
+        };
+        let transparent_alpha_back_pipeline = make_transparent_alpha(
+            "Skinned Transparent Alpha Pipeline (back faces)",
+            Some(wgpu::Face::Front),
+        );
+        let transparent_alpha_pipeline = make_transparent_alpha(
+            "Skinned Transparent Alpha Pipeline (front faces)",
+            Some(wgpu::Face::Back),
+        );
 
         // Transparent additive pipeline for skinned meshes
         let transparent_additive_pipeline =
@@ -278,7 +309,10 @@ impl SkinnedPipeline {
                     stencil: wgpu::StencilState::default(),
                     bias: wgpu::DepthBiasState::default(),
                 }),
-                multisample: wgpu::MultisampleState::default(),
+                multisample: wgpu::MultisampleState {
+                    count: sample_count,
+                    ..Default::default()
+                },
                 multiview: None,
                 cache: None,
             });
@@ -331,16 +365,67 @@ impl SkinnedPipeline {
                     stencil: wgpu::StencilState::default(),
                     bias: wgpu::DepthBiasState::default(),
                 }),
-                multisample: wgpu::MultisampleState::default(),
+                multisample: wgpu::MultisampleState {
+                    count: sample_count,
+                    ..Default::default()
+                },
                 multiview: None,
                 cache: None,
             });
+
+        // Wireframe line pipeline for skinned meshes — same skinning vertex
+        // path as the depth prepass, drawn as edge lines with a depth bias so
+        // they follow the animated pose and sit on top of the solid surface.
+        let wire_line_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Skinned Wireframe Line Pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &outline_shader,
+                entry_point: Some("vs_skinned_depth_prepass"),
+                buffers: &[SkinnedVertex::desc()],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &outline_shader,
+                entry_point: Some("fs_wire"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::LineList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: false,
+                depth_compare: wgpu::CompareFunction::LessEqual,
+                stencil: wgpu::StencilState::default(),
+                bias: crate::pipeline::line_depth_bias(),
+            }),
+            multisample: wgpu::MultisampleState {
+                count: sample_count,
+                ..Default::default()
+            },
+            multiview: None,
+            cache: None,
+        });
 
         Self {
             pipeline,
             outline_pipeline,
             depth_prepass_pipeline,
+            wire_line_pipeline,
             transparent_alpha_pipeline,
+            transparent_alpha_back_pipeline,
             transparent_additive_pipeline,
             transparent_multiply_pipeline,
             bone_bind_group_layout,

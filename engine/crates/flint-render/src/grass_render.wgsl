@@ -55,6 +55,13 @@ struct PointLight {
     radius: f32,
     color: vec3<f32>,
     intensity: f32,
+    // Physical source radius (world units); 0 = punctual (ADR 0056).
+    // Struct grew 32 -> 48 B — must match the Rust PointLight in all six
+    // LightUniforms mirrors (light_uniforms_layout test).
+    source_radius: f32,
+    _pad0: f32,
+    _pad1: f32,
+    _pad2: f32,
 };
 
 struct SpotLight {
@@ -80,11 +87,16 @@ struct LightUniforms {
     _pad: u32,
     ambient_sky: vec4<f32>,
     ambient_ground: vec4<f32>,
+    // rgb = sheen tint, w = strength; zero = off (must match LightUniforms in pipeline.rs)
+    sheen_color_strength: vec4<f32>,
 };
 
 struct ShadowUniforms {
     cascade_view_proj: array<mat4x4<f32>, 3>,
     cascade_splits: vec4<f32>,
+    // PCSS (ADR 0057): xyz = per-cascade light-ortho depth range (world
+    // units), w = tan(sun angular size); w = 0 -> legacy 3x3 PCF verbatim.
+    pcss: vec4<f32>,
 };
 
 // Bind group 0: Transform (shared)
@@ -217,7 +229,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         let shadow_uv = shadow_ndc.xy * vec2<f32>(0.5, -0.5) + 0.5;
         var shadow = 1.0;
         if shadow_uv.x >= 0.0 && shadow_uv.x <= 1.0 && shadow_uv.y >= 0.0 && shadow_uv.y <= 1.0 {
-            shadow = textureSampleCompare(shadow_depth, shadow_sampler, shadow_uv, 0, shadow_ndc.z - 0.002);
+            shadow = textureSampleCompareLevel(shadow_depth, shadow_sampler, shadow_uv, 0, shadow_ndc.z - 0.002);
         }
 
         let diffuse = n_dot_l * lights.directional_lights[0].intensity * shadow;

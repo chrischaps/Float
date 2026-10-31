@@ -27,10 +27,20 @@ pub struct PostProcessConfig {
     pub vignette_smoothness: f32,
     pub chromatic_aberration: f32,
     pub radial_blur: f32,
+    pub desaturate: f32,
+    pub dof_strength: f32,
+    pub dof_focus_distance: f32,
+    pub dof_focus_range: f32,
     pub ssao_enabled: bool,
     pub ssao_radius: f32,
     pub ssao_intensity: f32,
     pub ssao_bias: f32,
+    /// Hemisphere samples per pixel, 1..=64 (clamped at upload). 64 is the
+    /// full kernel (the pre-lever behavior); the shader strides through the
+    /// scale-ordered kernel so lower counts keep full radius coverage. SSAO
+    /// is the renderer's heaviest per-pixel pass — 16 is the quality/cost
+    /// sweet spot when the blur pass can hide the extra noise.
+    pub ssao_samples: u32,
     pub fog_enabled: bool,
     pub fog_color: [f32; 3],
     pub fog_density: f32,
@@ -39,6 +49,34 @@ pub struct PostProcessConfig {
     pub fog_height_enabled: bool,
     pub fog_height_falloff: f32,
     pub fog_height_origin: f32,
+    /// Height fog's density at `fog_height_origin` (ADR 0101). It falls by
+    /// e every `1 / fog_height_falloff` metres above the origin, and its
+    /// optical depth along each view ray adds to the distance fog's. 0 (the
+    /// default) adds nothing, so a scene that only turned height fog on
+    /// looks as it did when height fog did nothing.
+    pub fog_height_density: f32,
+    /// Aerial tint (ADR 0101): far things take `fog_tint_color` (linear),
+    /// up to `fog_tint_strength` (0 = off, the default), ramping in over
+    /// `fog_tint_start..fog_tint_end` metres from the camera. It lies under
+    /// the fog, so the farthest things still run into `fog_color`. Rides
+    /// `fog_enabled`, and leaves the sky alone.
+    pub fog_tint_color: [f32; 3],
+    pub fog_tint_strength: f32,
+    pub fog_tint_start: f32,
+    pub fog_tint_end: f32,
+    /// Ground fog (ADR 0106): fog on floors of its own, read from the map
+    /// set with `SceneRenderer::set_ground_fog`, so a mist can fill hollows
+    /// at many heights. Its density per metre at a texel's floor where the
+    /// texel's amount is 1; 0 (the default) is off, as is a renderer with
+    /// no map. Unlit and in `ground_fog_color` (linear), it lies under the
+    /// distance fog and the aerial tint, and rides `enabled`, not
+    /// `fog_enabled`.
+    pub ground_fog_density: f32,
+    pub ground_fog_color: [f32; 3],
+    /// It falls by e every `1 / ground_fog_falloff` metres over the floor.
+    pub ground_fog_falloff: f32,
+    /// Steps each view ray marches through it, 1..=64 (clamped at upload).
+    pub ground_fog_steps: u32,
     pub dither_enabled: bool,
     pub dither_intensity: f32,
     pub volumetric_enabled: bool,
@@ -58,11 +96,26 @@ pub struct PostProcessConfig {
     pub render_mode: u32,
     /// Blend strength for the active render mode (0 = normal view).
     pub mode_mix: f32,
+    /// Animated film grain intensity (0 = off). Hash noise on pixel coords,
+    /// time-quantized to 24 Hz off the shared post `time`; luma-weighted so
+    /// highlights stay clean (ADR 0050).
+    pub film_grain: f32,
+    /// Color grade, ASC-CDL-shaped, applied right after ACES tonemapping:
+    /// pow(max(color * gain + lift, 0), 1/gamma). Neutral = lift 0 /
+    /// gamma 1 / gain 1; neutrality is guarded by a CPU-computed enable
+    /// flag, never by pow(x, 1.0) float identity (ADR 0050).
+    pub grade_lift: [f32; 3],
+    pub grade_gamma: [f32; 3],
+    pub grade_gain: [f32; 3],
     /// Per-mode tuning. Tears (1-4): x = bleed-mask scale, y = mask style
     /// (0 fbm / 1 iris), z = per-mode rate, w = spare. Underwater (5):
     /// x = signed eye depth in meters (+ = submerged; waterline Y =
     /// camera Y + x), y = sea energy 0..1, z = daylight 0..1, w = biolum 0..1.
     pub mode_params: [f32; 4],
+    /// FXAA pass on the final composite output (default off — headless
+    /// pixel-diff gates run single-path without it; ADR 0050, the cheap
+    /// interim for tech-debt #13 until the MSAA workstream).
+    pub fxaa_enabled: bool,
 }
 
 impl Default for PostProcessConfig {
@@ -79,10 +132,15 @@ impl Default for PostProcessConfig {
             vignette_smoothness: 2.0,
             chromatic_aberration: 0.0,
             radial_blur: 0.0,
+            desaturate: 0.0,
+            dof_strength: 0.0,
+            dof_focus_distance: 10.0,
+            dof_focus_range: 5.0,
             ssao_enabled: true,
             ssao_radius: 0.5,
             ssao_intensity: 1.0,
             ssao_bias: 0.025,
+            ssao_samples: 64,
             fog_enabled: false,
             fog_color: [0.7, 0.75, 0.82],
             fog_density: 0.02,
@@ -91,6 +149,15 @@ impl Default for PostProcessConfig {
             fog_height_enabled: false,
             fog_height_falloff: 0.1,
             fog_height_origin: 0.0,
+            fog_height_density: 0.0,
+            fog_tint_color: [0.42, 0.50, 0.65],
+            fog_tint_strength: 0.0,
+            fog_tint_start: 100.0,
+            fog_tint_end: 1000.0,
+            ground_fog_density: 0.0,
+            ground_fog_color: [0.8, 0.82, 0.86],
+            ground_fog_falloff: 0.5,
+            ground_fog_steps: 24,
             dither_enabled: false,
             dither_intensity: 0.03,
             volumetric_enabled: false,
@@ -106,8 +173,81 @@ impl Default for PostProcessConfig {
             render_mode: 0,
             mode_mix: 0.0,
             mode_params: [0.0; 4],
+            film_grain: 0.0,
+            grade_lift: [0.0; 3],
+            grade_gamma: [1.0; 3],
+            grade_gain: [1.0; 3],
+            fxaa_enabled: false,
         }
     }
+}
+
+impl PostProcessConfig {
+    /// True when any grade component deviates from neutral. The shader
+    /// gates the grade block on this (uploaded as grade_enabled) so the
+    /// neutral path is the original code verbatim — pow(x, 1.0) is not
+    /// trusted to be bit-exact across drivers.
+    pub fn grade_active(&self) -> bool {
+        self.grade_lift != [0.0; 3] || self.grade_gamma != [1.0; 3] || self.grade_gain != [1.0; 3]
+    }
+}
+
+/// Convert a `PostProcessDef` (scene TOML) to a `PostProcessConfig` (renderer).
+///
+/// Centralises the field-by-field copy so that new fields are never forgotten.
+/// Lives here (not in the player) so every front end that renders a scene —
+/// player, CLI render, viewer — applies the authored `[post_process]` block
+/// through one function.
+pub fn post_process_config_from_def(pp_def: &flint_scene::PostProcessDef) -> PostProcessConfig {
+    let mut config = PostProcessConfig::default();
+    config.bloom_enabled = pp_def.bloom_enabled;
+    config.bloom_intensity = pp_def.bloom_intensity;
+    config.bloom_threshold = pp_def.bloom_threshold;
+    config.vignette_enabled = pp_def.vignette_enabled;
+    config.vignette_intensity = pp_def.vignette_intensity;
+    config.vignette_smoothness = pp_def.vignette_smoothness;
+    config.exposure = pp_def.exposure;
+    config.ssao_enabled = pp_def.ssao_enabled;
+    config.ssao_radius = pp_def.ssao_radius;
+    config.ssao_intensity = pp_def.ssao_intensity;
+    config.ssao_samples = pp_def.ssao_samples;
+    config.fog_enabled = pp_def.fog_enabled;
+    config.fog_color = pp_def.fog_color;
+    config.fog_density = pp_def.fog_density;
+    config.fog_start = pp_def.fog_start;
+    config.fog_end = pp_def.fog_end;
+    config.fog_height_enabled = pp_def.fog_height_enabled;
+    config.fog_height_falloff = pp_def.fog_height_falloff;
+    config.fog_height_origin = pp_def.fog_height_origin;
+    config.fog_height_density = pp_def.fog_height_density;
+    config.fog_tint_color = pp_def.fog_tint_color;
+    config.fog_tint_strength = pp_def.fog_tint_strength;
+    config.fog_tint_start = pp_def.fog_tint_start;
+    config.fog_tint_end = pp_def.fog_tint_end;
+    config.chromatic_aberration = pp_def.chromatic_aberration;
+    config.radial_blur = pp_def.radial_blur;
+    config.desaturate = pp_def.desaturate;
+    config.dof_strength = pp_def.dof_strength;
+    config.dof_focus_distance = pp_def.dof_focus_distance;
+    config.dof_focus_range = pp_def.dof_focus_range;
+    config.dither_enabled = pp_def.dither_enabled;
+    config.dither_intensity = pp_def.dither_intensity;
+    config.volumetric_enabled = pp_def.volumetric_enabled;
+    config.volumetric_samples = pp_def.volumetric_samples;
+    config.volumetric_density = pp_def.volumetric_density;
+    config.volumetric_max_distance = pp_def.volumetric_max_distance;
+    config.volumetric_decay = pp_def.volumetric_decay;
+    config.kuwahara_enabled = pp_def.kuwahara_enabled;
+    config.kuwahara_radius = pp_def.kuwahara_radius;
+    config.kuwahara_sharpness = pp_def.kuwahara_sharpness;
+    config.kuwahara_hardness = pp_def.kuwahara_hardness;
+    config.kuwahara_anisotropy = pp_def.kuwahara_anisotropy;
+    config.film_grain = pp_def.film_grain;
+    config.grade_lift = pp_def.grade_lift;
+    config.grade_gamma = pp_def.grade_gamma;
+    config.grade_gain = pp_def.grade_gain;
+    config.fxaa_enabled = pp_def.fxaa;
+    config
 }
 
 /// Uniform data for the composite fullscreen pass.
@@ -123,7 +263,9 @@ pub struct PostProcessUniforms {
     pub texel_size: [f32; 2],
     pub chromatic_aberration: f32,
     pub radial_blur: f32,
-    pub _pad: [f32; 2],
+    pub desaturate: f32,
+    /// Film grain intensity (rides the former _pad slot; 0 = off).
+    pub grain_intensity: f32,
     // Fog parameters
     pub fog_color: [f32; 3],
     pub fog_density: f32,
@@ -138,12 +280,49 @@ pub struct PostProcessUniforms {
     pub fog_height_enabled: f32,
     pub dither_intensity: f32,
     pub inv_view_proj: [[f32; 4]; 4],
+    // Depth of field (trailing scalar row — appended after the mat4 so every
+    // pre-existing offset is untouched; WGSL mirror must match field-for-field)
+    pub dof_strength: f32,
+    pub dof_focus_distance: f32,
+    pub dof_focus_range: f32,
+    pub _pad2: f32,
     // Reality-tear render mode (must mirror composite_shader.wgsl)
     pub render_mode: u32,
     pub mode_mix: f32,
     pub mode_time: f32,
     pub _pad_mode: f32,
     pub mode_params: [f32; 4],
+    // Color grade (ADR 0050) — three appended 16-byte rows; grade_enabled is
+    // CPU-computed (see PostProcessConfig::grade_active) so the neutral path
+    // never relies on pow(x, 1.0) float identity.
+    pub grade_lift: [f32; 3],
+    pub grade_enabled: f32,
+    pub grade_gamma: [f32; 3],
+    pub _pad3: f32,
+    pub grade_gain: [f32; 3],
+    pub _pad4: f32,
+    // Aerial tint and height fog density (ADR 0101) — two appended rows.
+    pub fog_tint_color: [f32; 3],
+    pub fog_tint_strength: f32,
+    pub fog_tint_start: f32,
+    pub fog_tint_end: f32,
+    pub fog_height_density: f32,
+    pub _pad5: f32,
+    // Ground fog (ADR 0106) — four appended rows. The box the pass marches
+    // runs from ground_fog_floor_base up to ground_fog_ceiling, over
+    // origin..origin + size in X and Z.
+    pub ground_fog_color: [f32; 3],
+    pub ground_fog_density: f32,
+    pub ground_fog_origin: [f32; 2],
+    pub ground_fog_size: [f32; 2],
+    pub ground_fog_floor_base: f32,
+    pub ground_fog_ceiling: f32,
+    pub ground_fog_falloff: f32,
+    pub ground_fog_steps: f32,
+    pub ground_fog_texel: f32,
+    pub ground_fog_max_lod: f32,
+    pub ground_fog_enabled: f32,
+    pub _pad6: f32,
 }
 
 /// Uniform data for bloom passes (threshold/downsample/upsample).
@@ -195,7 +374,9 @@ pub struct SsaoUniforms {
     pub intensity: f32,
     pub near: f32,
     pub far: f32,
-    pub _pad: f32,
+    /// Hemisphere sample count (rides the former padding slot — layout
+    /// unchanged). The shader treats out-of-range as the full 64.
+    pub sample_count: f32,
 }
 
 /// Uniform data for the SSAO blur pass.
@@ -279,12 +460,10 @@ impl KuwaharaTextures {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: HDR_FORMAT,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                | wgpu::TextureUsages::TEXTURE_BINDING,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
         });
-        let tensor_view =
-            tensor_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let tensor_view = tensor_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
         let tensor_blur_texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("Kuwahara Tensor Blur Texture"),
@@ -297,8 +476,7 @@ impl KuwaharaTextures {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: HDR_FORMAT,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                | wgpu::TextureUsages::TEXTURE_BINDING,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
         });
         let tensor_blur_view =
@@ -315,12 +493,10 @@ impl KuwaharaTextures {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: HDR_FORMAT,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                | wgpu::TextureUsages::TEXTURE_BINDING,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
         });
-        let output_view =
-            output_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let output_view = output_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
         Self {
             tensor_texture,
@@ -339,13 +515,10 @@ impl KuwaharaPipelines {
     /// Create Kuwahara pipelines. Panics if the GPU driver cannot compile
     /// the shaders — callers should use catch_unwind.
     pub fn new(device: &wgpu::Device) -> Self {
-        let kuwahara_tensor_shader =
-            device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some("Kuwahara Tensor Shader"),
-                source: wgpu::ShaderSource::Wgsl(
-                    include_str!("kuwahara_tensor_shader.wgsl").into(),
-                ),
-            });
+        let kuwahara_tensor_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Kuwahara Tensor Shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("kuwahara_tensor_shader.wgsl").into()),
+        });
 
         let tensor_uniform_bgl =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -392,35 +565,34 @@ impl KuwaharaPipelines {
                 push_constant_ranges: &[],
             });
 
-        let tensor_pipeline =
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some("Kuwahara Tensor Pipeline"),
-                layout: Some(&tensor_pipeline_layout),
-                vertex: wgpu::VertexState {
-                    module: &kuwahara_tensor_shader,
-                    entry_point: Some("vs_main"),
-                    buffers: &[],
-                    compilation_options: Default::default(),
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module: &kuwahara_tensor_shader,
-                    entry_point: Some("fs_main"),
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format: HDR_FORMAT,
-                        blend: None,
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                    compilation_options: Default::default(),
-                }),
-                primitive: wgpu::PrimitiveState {
-                    topology: wgpu::PrimitiveTopology::TriangleList,
-                    ..Default::default()
-                },
-                depth_stencil: None,
-                multisample: wgpu::MultisampleState::default(),
-                multiview: None,
-                cache: None,
-            });
+        let tensor_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Kuwahara Tensor Pipeline"),
+            layout: Some(&tensor_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &kuwahara_tensor_shader,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &kuwahara_tensor_shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: HDR_FORMAT,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
 
         let tensor_uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Kuwahara Tensor Uniform Buffer"),
@@ -482,35 +654,34 @@ impl KuwaharaPipelines {
                 push_constant_ranges: &[],
             });
 
-        let tensor_blur_pipeline =
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some("Kuwahara Tensor Blur Pipeline"),
-                layout: Some(&tensor_blur_pipeline_layout),
-                vertex: wgpu::VertexState {
-                    module: &kuwahara_tensor_blur_shader,
-                    entry_point: Some("vs_main"),
-                    buffers: &[],
-                    compilation_options: Default::default(),
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module: &kuwahara_tensor_blur_shader,
-                    entry_point: Some("fs_main"),
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format: HDR_FORMAT,
-                        blend: None,
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                    compilation_options: Default::default(),
-                }),
-                primitive: wgpu::PrimitiveState {
-                    topology: wgpu::PrimitiveTopology::TriangleList,
-                    ..Default::default()
-                },
-                depth_stencil: None,
-                multisample: wgpu::MultisampleState::default(),
-                multiview: None,
-                cache: None,
-            });
+        let tensor_blur_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Kuwahara Tensor Blur Pipeline"),
+            layout: Some(&tensor_blur_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &kuwahara_tensor_blur_shader,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &kuwahara_tensor_blur_shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: HDR_FORMAT,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
 
         let tensor_blur_uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Kuwahara Tensor Blur Uniform Buffer"),
@@ -524,66 +695,63 @@ impl KuwaharaPipelines {
             source: wgpu::ShaderSource::Wgsl(include_str!("kuwahara_shader.wgsl").into()),
         });
 
-        let uniform_bgl =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("Kuwahara Uniform BGL"),
-                entries: &[wgpu::BindGroupLayoutEntry {
+        let uniform_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Kuwahara Uniform BGL"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+
+        let hdr_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Kuwahara HDR BGL"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
                     binding: 0,
                     visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
                     },
                     count: None,
-                }],
-            });
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
 
-        let hdr_bgl =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("Kuwahara HDR BGL"),
-                entries: &[
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Texture {
-                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                            multisampled: false,
-                        },
-                        count: None,
+        let tensor_input_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Kuwahara Tensor Input BGL"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
                     },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 1,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                        count: None,
-                    },
-                ],
-            });
-
-        let tensor_input_bgl =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("Kuwahara Tensor Input BGL"),
-                entries: &[
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Texture {
-                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                            multisampled: false,
-                        },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 1,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                        count: None,
-                    },
-                ],
-            });
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
 
         let kuwahara_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -592,35 +760,34 @@ impl KuwaharaPipelines {
                 push_constant_ranges: &[],
             });
 
-        let pipeline =
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some("Kuwahara Pipeline"),
-                layout: Some(&kuwahara_pipeline_layout),
-                vertex: wgpu::VertexState {
-                    module: &kuwahara_shader,
-                    entry_point: Some("vs_main"),
-                    buffers: &[],
-                    compilation_options: Default::default(),
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module: &kuwahara_shader,
-                    entry_point: Some("fs_main"),
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format: HDR_FORMAT,
-                        blend: None,
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                    compilation_options: Default::default(),
-                }),
-                primitive: wgpu::PrimitiveState {
-                    topology: wgpu::PrimitiveTopology::TriangleList,
-                    ..Default::default()
-                },
-                depth_stencil: None,
-                multisample: wgpu::MultisampleState::default(),
-                multiview: None,
-                cache: None,
-            });
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Kuwahara Pipeline"),
+            layout: Some(&kuwahara_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &kuwahara_shader,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &kuwahara_shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: HDR_FORMAT,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
 
         let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Kuwahara Uniform Buffer"),
@@ -642,6 +809,152 @@ impl KuwaharaPipelines {
             uniform_bgl,
             hdr_bgl,
             tensor_input_bgl,
+            uniform_buffer,
+        }
+    }
+}
+
+/// Intermediate target for the FXAA pass (ADR 0050) — only allocated when
+/// `fxaa_enabled` (Kuwahara lazy pattern). The composite pass renders into
+/// this instead of the swapchain; the FXAA pass then samples it and writes
+/// the real target. Same format as the composite pipeline's baked fragment
+/// target so that pipeline is reused unchanged.
+pub struct FxaaResources {
+    pub texture: wgpu::Texture,
+    pub view: wgpu::TextureView,
+}
+
+impl FxaaResources {
+    pub fn new(
+        device: &wgpu::Device,
+        width: u32,
+        height: u32,
+        format: wgpu::TextureFormat,
+    ) -> Self {
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("FXAA Intermediate Texture"),
+            size: wgpu::Extent3d {
+                width: width.max(1),
+                height: height.max(1),
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        Self { texture, view }
+    }
+}
+
+/// Uniforms for the FXAA pass.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Pod, Zeroable)]
+pub struct FxaaUniforms {
+    pub texel_size: [f32; 2],
+    pub _pad: [f32; 2],
+}
+
+/// FXAA pipeline — only created when enabled (Kuwahara lazy pattern).
+pub struct FxaaPipeline {
+    pub pipeline: wgpu::RenderPipeline,
+    pub uniform_bgl: wgpu::BindGroupLayout,
+    pub texture_bgl: wgpu::BindGroupLayout,
+    pub uniform_buffer: wgpu::Buffer,
+}
+
+impl FxaaPipeline {
+    pub fn new(device: &wgpu::Device, surface_format: wgpu::TextureFormat) -> Self {
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("FXAA Shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("fxaa_shader.wgsl").into()),
+        });
+
+        let uniform_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("FXAA Uniform BGL"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+
+        let texture_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("FXAA Texture BGL"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("FXAA Pipeline Layout"),
+            bind_group_layouts: &[&uniform_bgl, &texture_bgl],
+            push_constant_ranges: &[],
+        });
+
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("FXAA Pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_fxaa"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_fxaa"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: surface_format,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+
+        let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("FXAA Uniform Buffer"),
+            size: std::mem::size_of::<FxaaUniforms>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        Self {
+            pipeline,
+            uniform_bgl,
+            texture_bgl,
             uniform_buffer,
         }
     }
@@ -669,6 +982,8 @@ pub struct PostProcessResources {
     pub volumetric_blur_view: wgpu::TextureView,
     // Kuwahara textures (full resolution, Rgba16Float) — only allocated when enabled
     pub kuwahara: Option<KuwaharaTextures>,
+    // FXAA intermediate (full resolution, surface format) — only allocated when enabled
+    pub fxaa: Option<FxaaResources>,
 }
 
 /// A single level in the bloom mip chain.
@@ -717,6 +1032,8 @@ pub struct PostProcessPipeline {
     pub white_texture_view: wgpu::TextureView,
     // Cached hemisphere kernel (generated once)
     pub ssao_kernel: [[f32; 4]; SSAO_KERNEL_SIZE],
+    // 1x1 clear map bound when no ground fog is set (ADR 0106)
+    pub ground_fog_empty_view: wgpu::TextureView,
     // Volumetric (god rays) pipelines and resources
     pub volumetric_pipeline: wgpu::RenderPipeline,
     pub volumetric_uniform_bgl: wgpu::BindGroupLayout,
@@ -731,6 +1048,8 @@ pub struct PostProcessPipeline {
     pub volumetric_black_view: wgpu::TextureView,
     // Kuwahara filter pipelines and resources — only allocated when enabled
     pub kuwahara: Option<KuwaharaPipelines>,
+    // FXAA pipeline — only created when enabled (ADR 0050)
+    pub fxaa: Option<FxaaPipeline>,
 }
 
 impl PostProcessPipeline {
@@ -874,6 +1193,17 @@ impl PostProcessPipeline {
                         binding: 5,
                         visibility: wgpu::ShaderStages::FRAGMENT,
                         ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                    // The ground fog's map (ADR 0106), read through binding 5
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 6,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
                         count: None,
                     },
                 ],
@@ -1504,35 +1834,34 @@ impl PostProcessPipeline {
                 push_constant_ranges: &[],
             });
 
-        let volumetric_pipeline =
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some("Volumetric Pipeline"),
-                layout: Some(&volumetric_pipeline_layout),
-                vertex: wgpu::VertexState {
-                    module: &volumetric_shader,
-                    entry_point: Some("vs_volumetric"),
-                    buffers: &[],
-                    compilation_options: Default::default(),
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module: &volumetric_shader,
-                    entry_point: Some("fs_volumetric"),
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format: HDR_FORMAT,
-                        blend: None,
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                    compilation_options: Default::default(),
-                }),
-                primitive: wgpu::PrimitiveState {
-                    topology: wgpu::PrimitiveTopology::TriangleList,
-                    ..Default::default()
-                },
-                depth_stencil: None,
-                multisample: wgpu::MultisampleState::default(),
-                multiview: None,
-                cache: None,
-            });
+        let volumetric_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Volumetric Pipeline"),
+            layout: Some(&volumetric_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &volumetric_shader,
+                entry_point: Some("vs_volumetric"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &volumetric_shader,
+                entry_point: Some("fs_volumetric"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: HDR_FORMAT,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
 
         let volumetric_uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Volumetric Uniform Buffer"),
@@ -1544,9 +1873,7 @@ impl PostProcessPipeline {
         // Volumetric blur shader
         let volumetric_blur_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Volumetric Blur Shader"),
-            source: wgpu::ShaderSource::Wgsl(
-                include_str!("volumetric_blur_shader.wgsl").into(),
-            ),
+            source: wgpu::ShaderSource::Wgsl(include_str!("volumetric_blur_shader.wgsl").into()),
         });
 
         // Volumetric blur Group 0: VolumetricBlurUniforms
@@ -1667,6 +1994,24 @@ impl PostProcessPipeline {
         let volumetric_black_view =
             volumetric_black_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
+        // 1x1 clear ground fog map (zero-initialised) for when none is set
+        let ground_fog_empty_view = device
+            .create_texture(&wgpu::TextureDescriptor {
+                label: Some("Ground Fog Empty Map"),
+                size: wgpu::Extent3d {
+                    width: 1,
+                    height: 1,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: crate::ground_fog::FORMAT,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            })
+            .create_view(&wgpu::TextureViewDescriptor::default());
+
         // --- Kuwahara pipelines (only when enabled) ---
         let kuwahara = if kuwahara_enabled {
             Some(KuwaharaPipelines::new(device))
@@ -1713,8 +2058,90 @@ impl PostProcessPipeline {
             volumetric_blur_texture_bgl,
             volumetric_blur_uniform_buffer,
             volumetric_black_view,
+            ground_fog_empty_view,
             kuwahara,
+            // FXAA is created on demand via ensure_fxaa_resources (ADR 0050)
+            fxaa: None,
         }
+    }
+
+    /// Run the FXAA pass: sample the intermediate composite output and write
+    /// the real target. Caller guarantees both `self.fxaa` and
+    /// `resources.fxaa` exist (see SceneRenderer::ensure_fxaa_resources).
+    pub fn run_fxaa(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        resources: &PostProcessResources,
+        target_view: &wgpu::TextureView,
+        timer: Option<&mut crate::gpu_timer::GpuTimer>,
+    ) {
+        let (Some(fxaa), Some(fxaa_res)) = (&self.fxaa, &resources.fxaa) else {
+            return;
+        };
+
+        let uniforms = FxaaUniforms {
+            texel_size: [1.0 / resources.width as f32, 1.0 / resources.height as f32],
+            _pad: [0.0; 2],
+        };
+        queue.write_buffer(&fxaa.uniform_buffer, 0, bytemuck::cast_slice(&[uniforms]));
+
+        let uniform_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("FXAA Uniform BG"),
+            layout: &fxaa.uniform_bgl,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: fxaa.uniform_buffer.as_entire_binding(),
+            }],
+        });
+        let texture_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("FXAA Texture BG"),
+            layout: &fxaa.texture_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&fxaa_res.view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.linear_sampler),
+                },
+            ],
+        });
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("FXAA Encoder"),
+        });
+        // Timed inside this submission, so a wait for the swapchain image
+        // before it runs isn't counted (ADR 0108).
+        let timed = timer.map(|t| {
+            let scope = t.begin(&mut encoder, "FXAA");
+            (t, scope)
+        });
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("FXAA Pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: target_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            pass.set_pipeline(&fxaa.pipeline);
+            pass.set_bind_group(0, &uniform_bg, &[]);
+            pass.set_bind_group(1, &texture_bg, &[]);
+            pass.draw(0..3, 0..1);
+        }
+        if let Some((timer, scope)) = timed {
+            timer.end(&mut encoder, scope);
+        }
+        queue.submit(std::iter::once(encoder.finish()));
     }
 
     /// Run the bloom downsample/upsample chain.
@@ -1958,7 +2385,7 @@ impl PostProcessPipeline {
             intensity: config.ssao_intensity,
             near: camera.near,
             far: camera.far,
-            _pad: 0.0,
+            sample_count: config.ssao_samples.clamp(1, SSAO_KERNEL_SIZE as u32) as f32,
         };
         queue.write_buffer(
             &self.ssao_uniform_buffer,
@@ -2402,9 +2829,7 @@ impl PostProcessPipeline {
                 entries: &[
                     wgpu::BindGroupEntry {
                         binding: 0,
-                        resource: wgpu::BindingResource::TextureView(
-                            &kt.tensor_view,
-                        ),
+                        resource: wgpu::BindingResource::TextureView(&kt.tensor_view),
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
@@ -2452,11 +2877,7 @@ impl PostProcessPipeline {
                 anisotropy: config.kuwahara_anisotropy,
                 _pad: [0.0; 2],
             };
-            queue.write_buffer(
-                &kp.uniform_buffer,
-                0,
-                bytemuck::cast_slice(&[uniforms]),
-            );
+            queue.write_buffer(&kp.uniform_buffer, 0, bytemuck::cast_slice(&[uniforms]));
 
             let uniform_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("Kuwahara Uniform BG"),
@@ -2488,9 +2909,7 @@ impl PostProcessPipeline {
                 entries: &[
                     wgpu::BindGroupEntry {
                         binding: 0,
-                        resource: wgpu::BindingResource::TextureView(
-                            &kt.tensor_blur_view,
-                        ),
+                        resource: wgpu::BindingResource::TextureView(&kt.tensor_blur_view),
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
@@ -2541,6 +2960,8 @@ impl PostProcessPipeline {
         depth_view: &wgpu::TextureView,
         camera: &Camera,
         time: f32,
+        ground_fog: Option<&crate::ground_fog::GroundFogGpu>,
+        timer: Option<&mut crate::gpu_timer::GpuTimer>,
     ) {
         // SSAO: use blurred AO if enabled, white fallback otherwise
         let ssao_view = if config.enabled && config.ssao_enabled {
@@ -2584,9 +3005,17 @@ impl PostProcessPipeline {
                     binding: 5,
                     resource: wgpu::BindingResource::Sampler(&self.linear_sampler),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: wgpu::BindingResource::TextureView(
+                        ground_fog.map_or(&self.ground_fog_empty_view, |g| &g.view),
+                    ),
+                },
             ],
         });
         let effects_on = config.enabled;
+        let ground_fog = ground_fog.filter(|_| effects_on && config.ground_fog_density > 0.0);
+        let falloff = config.ground_fog_falloff.max(1e-3);
         let uniforms = PostProcessUniforms {
             exposure: config.exposure,
             bloom_intensity: if effects_on && config.bloom_enabled {
@@ -2603,9 +3032,12 @@ impl PostProcessPipeline {
             },
             vignette_smoothness: config.vignette_smoothness,
             texel_size: [1.0 / resources.width as f32, 1.0 / resources.height as f32],
+            // chromatic_aberration/radial_blur predate the effects_on gate and
+            // remain ungated; desaturate follows the gated convention.
             chromatic_aberration: config.chromatic_aberration,
             radial_blur: config.radial_blur,
-            _pad: [0.0; 2],
+            desaturate: if effects_on { config.desaturate } else { 0.0 },
+            grain_intensity: if effects_on { config.film_grain } else { 0.0 },
             fog_color: config.fog_color,
             fog_density: config.fog_density,
             fog_start: config.fog_start,
@@ -2627,11 +3059,45 @@ impl PostProcessPipeline {
                 0.0
             },
             inv_view_proj: camera.inverse_view_projection_matrix(),
+            dof_strength: if effects_on { config.dof_strength } else { 0.0 },
+            dof_focus_distance: config.dof_focus_distance,
+            dof_focus_range: config.dof_focus_range.max(0.001),
+            _pad2: 0.0,
             render_mode: if effects_on { config.render_mode } else { 0 },
             mode_mix: if effects_on { config.mode_mix } else { 0.0 },
             mode_time: time,
             _pad_mode: 0.0,
             mode_params: config.mode_params,
+            grade_lift: config.grade_lift,
+            grade_enabled: if effects_on && config.grade_active() {
+                1.0
+            } else {
+                0.0
+            },
+            grade_gamma: config.grade_gamma,
+            _pad3: 0.0,
+            grade_gain: config.grade_gain,
+            _pad4: 0.0,
+            fog_tint_color: config.fog_tint_color,
+            fog_tint_strength: config.fog_tint_strength.max(0.0),
+            fog_tint_start: config.fog_tint_start,
+            // smoothstep needs start < end
+            fog_tint_end: config.fog_tint_end.max(config.fog_tint_start + 1e-3),
+            fog_height_density: config.fog_height_density.max(0.0),
+            _pad5: 0.0,
+            ground_fog_color: config.ground_fog_color,
+            ground_fog_density: config.ground_fog_density.max(0.0),
+            ground_fog_origin: ground_fog.map_or([0.0; 2], |g| g.origin),
+            ground_fog_size: ground_fog.map_or([1.0; 2], |g| g.size),
+            ground_fog_floor_base: ground_fog.map_or(0.0, |g| g.floor_base),
+            // Over the highest floor the fog has thinned to e^-7 by here
+            ground_fog_ceiling: ground_fog.map_or(0.0, |g| g.floor_top + 7.0 / falloff),
+            ground_fog_falloff: falloff,
+            ground_fog_steps: config.ground_fog_steps.clamp(1, 64) as f32,
+            ground_fog_texel: ground_fog.map_or(1.0, |g| g.texel),
+            ground_fog_max_lod: ground_fog.map_or(0.0, |g| (g.mip_count - 1) as f32),
+            ground_fog_enabled: if ground_fog.is_some() { 1.0 } else { 0.0 },
+            _pad6: 0.0,
         };
 
         queue.write_buffer(
@@ -2699,6 +3165,12 @@ impl PostProcessPipeline {
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("Composite Encoder"),
         });
+        // Timed inside this submission, so a wait for the swapchain image
+        // before it runs isn't counted (ADR 0108).
+        let timed = timer.map(|t| {
+            let scope = t.begin(&mut encoder, "Composite");
+            (t, scope)
+        });
 
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -2724,6 +3196,9 @@ impl PostProcessPipeline {
             pass.draw(0..3, 0..1);
         }
 
+        if let Some((timer, scope)) = timed {
+            timer.end(&mut encoder, scope);
+        }
         queue.submit(std::iter::once(encoder.finish()));
     }
 }
@@ -2883,6 +3358,8 @@ impl PostProcessResources {
             volumetric_blur_texture,
             volumetric_blur_view,
             kuwahara,
+            // FXAA intermediate is allocated on demand (ADR 0050)
+            fxaa: None,
         }
     }
 }
@@ -2960,11 +3437,92 @@ mod tests {
     /// The Rust uniform struct must byte-match the WGSL PostProcessUniforms
     /// in composite_shader.wgsl. Layout: 12 scalars + texel_size vec2 +
     /// fog block (through dither_intensity) = 112 bytes, inv_view_proj mat4
-    /// at 112..176, mode scalars (render_mode/mode_mix/mode_time/pad) at
-    /// 176..192, mode_params vec4 at 192..208.
+    /// at 112..176, DoF row (strength/focus/range/pad) at 176..192, mode
+    /// scalars (render_mode/mode_mix/mode_time/pad) at 192..208, mode_params
+    /// vec4 at 208..224, grade rows (lift+enabled / gamma+pad / gain+pad)
+    /// at 224..272 (ADR 0050; grain_intensity reused the former _pad @44),
+    /// fog rows (tint color+strength / tint start+end+height density+pad)
+    /// at 272..304 (ADR 0101), ground fog rows (color+density / origin+size
+    /// / floor base, ceiling, falloff, steps / texel, max lod, enabled, pad)
+    /// at 304..368 (ADR 0106).
     #[test]
     fn composite_uniforms_match_wgsl_layout() {
-        assert_eq!(std::mem::size_of::<PostProcessUniforms>(), 208);
+        assert_eq!(std::mem::size_of::<PostProcessUniforms>(), 368);
         assert_eq!(std::mem::size_of::<PostProcessUniforms>() % 16, 0);
+    }
+
+    /// Grade neutrality is a CPU decision (grade_enabled), never float-math
+    /// identity: defaults must read as inactive.
+    #[test]
+    fn grade_defaults_are_inactive() {
+        let config = PostProcessConfig::default();
+        assert!(!config.grade_active());
+        assert_eq!(config.film_grain, 0.0);
+        let mut warm = config.clone();
+        warm.grade_gain = [1.05, 1.0, 0.95];
+        assert!(warm.grade_active());
+    }
+
+    /// `height_fog_depth` in composite_shader.wgsl, line for line.
+    fn height_fog_depth(c: &PostProcessConfig, eye: [f32; 3], p: [f32; 3]) -> f32 {
+        let dist = (0..3).map(|i| (p[i] - eye[i]).powi(2)).sum::<f32>().sqrt();
+        let k = c.fog_height_falloff.max(1e-5);
+        let at_eye = c.fog_height_density * (-k * (eye[1] - c.fog_height_origin)).min(30.0).exp();
+        let x = (k * (p[1] - eye[1])).max(-30.0);
+        let share = if x.abs() > 1e-3 {
+            (1.0 - (-x).exp()) / x
+        } else {
+            1.0 - 0.5 * x
+        };
+        at_eye * dist * share
+    }
+
+    /// The closed form is the density integrated along the ray (ADR 0101):
+    /// level, climbing, falling and close to level.
+    #[test]
+    fn height_fog_is_its_density_along_the_ray() {
+        let c = PostProcessConfig {
+            fog_height_density: 0.02,
+            fog_height_falloff: 0.15,
+            fog_height_origin: 1.0,
+            ..PostProcessConfig::default()
+        };
+        let eye = [0.0, 6.0, 0.0];
+        let ends: [[f32; 3]; 4] = [
+            [300.0, 6.0, 0.0],
+            [80.0, 40.0, 30.0],
+            [50.0, -3.0, -20.0],
+            [200.0, 6.004, 0.0],
+        ];
+        for p in ends {
+            let steps = 20_000;
+            let dist = (0..3).map(|i| (p[i] - eye[i]).powi(2)).sum::<f32>().sqrt();
+            let density: f32 = (0..steps)
+                .map(|s| {
+                    let t = (s as f32 + 0.5) / steps as f32;
+                    let y = eye[1] + (p[1] - eye[1]) * t;
+                    (-c.fog_height_falloff * (y - c.fog_height_origin)).exp()
+                })
+                .sum::<f32>()
+                / steps as f32;
+            let numeric = c.fog_height_density * density * dist;
+            let closed = height_fog_depth(&c, eye, p);
+            assert!(
+                (closed - numeric).abs() < 1e-3 * numeric,
+                "{p:?}: {closed} vs {numeric}"
+            );
+        }
+        // Thicker toward the origin: the same ray, low and high.
+        let low = height_fog_depth(&c, [0.0, 1.5, 0.0], [100.0, 1.5, 0.0]);
+        let high = height_fog_depth(&c, [0.0, 30.0, 0.0], [100.0, 30.0, 0.0]);
+        assert!(low > 10.0 * high, "{low} vs {high}");
+        // Off by default: a scene that only turned height fog on adds
+        // nothing, and there's no tint.
+        let off = PostProcessConfig {
+            fog_height_falloff: 0.15,
+            ..PostProcessConfig::default()
+        };
+        assert_eq!(height_fog_depth(&off, eye, [300.0, 0.0, 0.0]), 0.0);
+        assert_eq!(off.fog_tint_strength, 0.0);
     }
 }

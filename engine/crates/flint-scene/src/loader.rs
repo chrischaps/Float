@@ -4,8 +4,8 @@ use crate::format::SceneFile;
 use crate::prefab;
 use flint_core::Result;
 use flint_ecs::FlintWorld;
-use flint_schema::SchemaRegistry;
-use std::fs;
+use flint_schema::{validate_component_data, SchemaRegistry};
+use flint_core::vfs;
 use std::path::Path;
 
 /// Load a scene from a TOML file (with prefab expansion)
@@ -14,7 +14,7 @@ pub fn load_scene<P: AsRef<Path>>(
     registry: &SchemaRegistry,
 ) -> Result<(FlintWorld, SceneFile)> {
     let path = path.as_ref();
-    let content = fs::read_to_string(path)?;
+    let content = vfs::read_to_string(path)?;
     let mut scene_file: SceneFile = toml::from_str(&content)?;
 
     // Expand prefab instances into entities before building world
@@ -46,7 +46,7 @@ pub fn reload_scene<P: AsRef<Path>>(
     registry: &SchemaRegistry,
 ) -> Result<SceneFile> {
     let path = path.as_ref();
-    let content = fs::read_to_string(path)?;
+    let content = vfs::read_to_string(path)?;
     let mut scene_file: SceneFile = toml::from_str(&content)?;
 
     // Expand prefab instances
@@ -118,7 +118,28 @@ fn populate_world(
 
         // Set component data
         for (comp_name, comp_data) in &entity_def.components {
+            // Validate against schema (warn, don't fail)
+            if let Some(schema) = registry.get_component(comp_name) {
+                if let Err(e) = validate_component_data(schema, comp_data) {
+                    tracing::warn!("[scene] entity '{}' component '{}': {}", name, comp_name, e);
+                }
+            }
             world.merge_component(id, comp_name, comp_data.clone())?;
+        }
+
+        // Apply component schema defaults for missing fields
+        for comp_name in entity_def.components.keys() {
+            if let Some(schema) = registry.get_component(comp_name) {
+                if let Some(components) = world.get_components_mut(id) {
+                    for (field_name, field_schema) in &schema.fields {
+                        if let Some(default) = &field_schema.default {
+                            if components.get_field(comp_name, field_name).is_none() {
+                                components.set_field(comp_name, field_name, default.clone());
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         // Set parent relationship
@@ -204,7 +225,10 @@ position = [30, 0, 0]
 
         reload_scene_string(scene_b, &mut world, &registry).unwrap();
 
-        assert!(!world.contains_name("alpha"), "alpha should be gone after reload");
+        assert!(
+            !world.contains_name("alpha"),
+            "alpha should be gone after reload"
+        );
         assert!(world.contains_name("beta"), "beta should still exist");
         assert!(world.contains_name("gamma"), "gamma should be added");
         assert_eq!(world.entity_count(), 2);
@@ -319,7 +343,9 @@ skybox = "sky_sunset.hdr"
 "#;
 
         let (_, scene_file) = load_scene_string(scene, &registry).unwrap();
-        let env = scene_file.environment.expect("environment should be present");
+        let env = scene_file
+            .environment
+            .expect("environment should be present");
         assert_eq!(env.skybox, Some("sky_sunset.hdr".into()));
     }
 
@@ -335,14 +361,49 @@ bloom_enabled = true
 bloom_intensity = 0.08
 fog_enabled = true
 fog_density = 0.05
+chromatic_aberration = 0.2
+radial_blur = 0.4
+desaturate = 0.85
+dof_strength = 0.5
+dof_focus_distance = 22.0
+dof_focus_range = 3.5
 "#;
 
         let (_, scene_file) = load_scene_string(scene, &registry).unwrap();
-        let pp = scene_file.post_process.expect("post_process should be present");
+        let pp = scene_file
+            .post_process
+            .expect("post_process should be present");
         assert!(pp.bloom_enabled);
         assert!((pp.bloom_intensity - 0.08).abs() < 0.001);
         assert!(pp.fog_enabled);
         assert!((pp.fog_density - 0.05).abs() < 0.001);
+        assert!((pp.chromatic_aberration - 0.2).abs() < 0.001);
+        assert!((pp.radial_blur - 0.4).abs() < 0.001);
+        assert!((pp.desaturate - 0.85).abs() < 0.001);
+        assert!((pp.dof_strength - 0.5).abs() < 0.001);
+        assert!((pp.dof_focus_distance - 22.0).abs() < 0.001);
+        assert!((pp.dof_focus_range - 3.5).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_post_process_effect_fields_default_to_zero() {
+        let registry = SchemaRegistry::new();
+        let scene = r#"
+[scene]
+name = "PP Defaults"
+
+[post_process]
+bloom_enabled = false
+"#;
+
+        let (_, scene_file) = load_scene_string(scene, &registry).unwrap();
+        let pp = scene_file
+            .post_process
+            .expect("post_process should be present");
+        assert_eq!(pp.chromatic_aberration, 0.0);
+        assert_eq!(pp.radial_blur, 0.0);
+        assert_eq!(pp.desaturate, 0.0);
+        assert_eq!(pp.dof_strength, 0.0);
     }
 
     #[test]

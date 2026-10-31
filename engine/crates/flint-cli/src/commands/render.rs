@@ -11,46 +11,244 @@ use flint_scene::load_scene;
 use flint_schema::SchemaRegistry;
 use std::path::Path;
 
+#[derive(clap::Args)]
 pub struct RenderArgs {
+    /// Path to scene file
+    #[arg(required_unless_present = "list_gpus", default_value = "")]
     pub scene: String,
+
+    /// Output image path
+    #[arg(short, long, default_value = "render.png")]
     pub output: String,
+
+    /// Image width in pixels
+    #[arg(long, default_value = "1920")]
     pub width: u32,
+
+    /// Image height in pixels
+    #[arg(long, default_value = "1080")]
     pub height: u32,
+
+    /// Paths to schemas directories (can specify multiple)
+    #[arg(long, default_value = "schemas", action = clap::ArgAction::Append)]
     pub schemas: Vec<String>,
+
+    /// Camera orbit distance
+    #[arg(long)]
     pub distance: Option<f32>,
+
+    /// Camera horizontal angle in degrees
+    #[arg(long)]
     pub yaw: Option<f32>,
+
+    /// Camera vertical angle in degrees
+    #[arg(long)]
     pub pitch: Option<f32>,
+
+    /// Camera look-at point (comma-separated x,y,z)
+    #[arg(long, value_parser = crate::commands::common_args::parse_vec3)]
     pub target: Option<[f32; 3]>,
+
+    /// Field of view in degrees
+    #[arg(long)]
     pub fov: Option<f32>,
+
+    /// Disable ground grid
+    #[arg(long)]
     pub no_grid: bool,
+
+    /// Debug visualization mode
+    #[arg(long, value_parser = crate::commands::common_args::parse_debug_mode)]
     pub debug_mode: Option<String>,
+
+    /// Enable wireframe overlay on solid geometry
+    #[arg(long)]
     pub wireframe_overlay: bool,
+
+    /// Show face-normal direction arrows
+    #[arg(long)]
     pub show_normals: bool,
+
+    /// Disable tone mapping for raw linear output
+    #[arg(long)]
     pub no_tonemapping: bool,
+
+    /// Disable shadow mapping
+    #[arg(long)]
     pub no_shadows: bool,
+
+    /// Shadow map resolution per cascade (default: 2048, the renderer's
+    /// construction default)
+    #[arg(long, default_value = "2048")]
     pub shadow_resolution: u32,
+
+    /// Disable post-processing (bloom, vignette, tonemapping in composite pass)
+    #[arg(long)]
     pub no_postprocess: bool,
+
+    /// MSAA sample count for the scene passes: 1 (off) or 4 (ADR 0058).
+    /// Default 1 keeps headless pixel gates single-sample.
+    #[arg(long, default_value = "1")]
+    pub msaa: u32,
+
+    /// Bloom intensity (enables bloom; default: 0.04)
+    #[arg(long)]
     pub bloom_intensity: Option<f32>,
+
+    /// Bloom brightness threshold (default: 1.0)
+    #[arg(long)]
     pub bloom_threshold: Option<f32>,
+
+    /// Exposure multiplier (default: 1.0)
+    #[arg(long)]
     pub exposure: Option<f32>,
+
+    /// SSAO sample radius (default: 0.5)
+    #[arg(long)]
     pub ssao_radius: Option<f32>,
+
+    /// SSAO intensity multiplier (default: 1.0, 0 = disabled)
+    #[arg(long)]
     pub ssao_intensity: Option<f32>,
+
+    /// SSAO hemisphere samples per pixel, 1-64 (default: 64; the kernel is
+    /// strided so lower counts keep full radius coverage)
+    #[arg(long)]
+    pub ssao_samples: Option<u32>,
+
+    /// Fog density (enables fog; default: 0.02, 0 = disabled)
+    #[arg(long)]
     pub fog_density: Option<f32>,
+
+    /// Fog color as comma-separated R,G,B (default: 0.7,0.75,0.82)
+    #[arg(long, value_parser = crate::commands::common_args::parse_vec3)]
     pub fog_color: Option<[f32; 3]>,
+
+    /// Fog height falloff (enables height fog; default: 0.1)
+    #[arg(long)]
     pub fog_height_falloff: Option<f32>,
+
+    /// Dither intensity (enables ordered dither; default: 0.03, 0 = disabled)
+    #[arg(long)]
     pub dither_intensity: Option<f32>,
+
+    /// Desaturation toward ash-grey (0 = full color, 1 = fully drained)
+    #[arg(long)]
+    pub desaturate: Option<f32>,
+
+    /// Oren-Nayar diffuse blend (0 = legacy Lambert, 1 = full Oren-Nayar;
+    /// sigma comes from material roughness)
+    #[arg(long)]
+    pub oren_nayar: Option<f32>,
+
+    /// Charlie-sheen rim strength (0 = off; keep <= ~0.3)
+    #[arg(long)]
+    pub sheen_strength: Option<f32>,
+
+    /// Charlie-sheen rim tint as comma-separated R,G,B (default: 1,1,1)
+    #[arg(long, value_parser = crate::commands::common_args::parse_vec3)]
+    pub sheen_color: Option<[f32; 3]>,
+
+    /// Depth-of-field strength (0 = off/sharp, 1 = full defocus)
+    #[arg(long)]
+    pub dof: Option<f32>,
+
+    /// Depth-of-field focus plane distance in world units (default: 10.0)
+    #[arg(long)]
+    pub dof_focus: Option<f32>,
+
+    /// Depth-of-field focus half-width in world units (default: 5.0)
+    #[arg(long)]
+    pub dof_range: Option<f32>,
+
+    /// Volumetric light density (enables god rays; default: 1.0)
+    #[arg(long)]
     pub volumetric_density: Option<f32>,
+
+    /// Volumetric ray-march sample count (default: 32)
+    #[arg(long)]
     pub volumetric_samples: Option<u32>,
+
+    /// Kuwahara filter radius (enables Kuwahara; default: 4)
+    #[arg(long)]
     pub kuwahara_radius: Option<u32>,
+
+    /// Kuwahara sector sharpness (default: 8.0)
+    #[arg(long)]
     pub kuwahara_sharpness: Option<f32>,
+
+    /// Kuwahara sector hardness (default: 8.0)
+    #[arg(long)]
     pub kuwahara_hardness: Option<f32>,
+
+    /// Kuwahara anisotropy strength (0=isotropic, 1=full; default: 1.0)
+    #[arg(long)]
     pub kuwahara_anisotropy: Option<f32>,
+
+    /// Stylized render mode (0=none, 1=matrix, 2=blood, 3=drunk, 4=tron,
+    /// 5=underwater)
+    #[arg(long)]
     pub render_mode: Option<u32>,
+
+    /// Render mode blend strength 0..1 (default: 0.0)
+    #[arg(long)]
     pub mode_mix: Option<f32>,
+
+    /// Render mode params as X,Y,Z,W. Tears 1-4: mask scale, mask style,
+    /// rate, spare. Underwater 5: eye depth m, sea energy, daylight, biolum
+    #[arg(long, value_parser = crate::commands::common_args::parse_vec4)]
     pub mode_params: Option<[f32; 4]>,
+
+    /// Film grain intensity (0 = off; ~0.02-0.05 is subtle)
+    #[arg(long)]
+    pub film_grain: Option<f32>,
+
+    /// Post time in seconds for grain/mode animation (default 0.0 —
+    /// headless renders are deterministic; two renders at the same value
+    /// are identical, different values differ)
+    #[arg(long)]
+    pub grain_time: Option<f32>,
+
+    /// Simulate particle emitters and effects for N seconds at a fixed
+    /// 1/60 s step before capturing (deterministic: same value, same
+    /// pixels). Default: no particles, so existing snapshots are unchanged
+    #[arg(long)]
+    pub particle_time: Option<f32>,
+
+    /// Color grade lift as R,G,B (per-channel add post-ACES; neutral 0,0,0)
+    #[arg(long, value_parser = crate::commands::common_args::parse_vec3)]
+    pub grade_lift: Option<[f32; 3]>,
+
+    /// Color grade gamma as R,G,B (per-channel curve; neutral 1,1,1)
+    #[arg(long, value_parser = crate::commands::common_args::parse_vec3)]
+    pub grade_gamma: Option<[f32; 3]>,
+
+    /// Color grade gain as R,G,B (per-channel multiply; neutral 1,1,1)
+    #[arg(long, value_parser = crate::commands::common_args::parse_vec3)]
+    pub grade_gain: Option<[f32; 3]>,
+
+    /// Enable the FXAA anti-aliasing pass
+    #[arg(long)]
+    pub fxaa: bool,
+    /// GPU adapter to use (case-insensitive substring of the adapter name,
+    /// e.g. "NVIDIA"). Overrides WGPU_ADAPTER_NAME; default prefers the
+    /// high-performance adapter. Use --list-gpus to see names.
+    #[arg(long)]
+    pub gpu: Option<String>,
+
+    /// List available GPU adapters and exit
+    #[arg(long)]
+    pub list_gpus: bool,
 }
 
 pub fn run(args: RenderArgs) -> Result<()> {
+    if args.list_gpus {
+        for a in flint_render::list_adapters() {
+            println!("{a}");
+        }
+        return Ok(());
+    }
+    flint_render::set_gpu_override(args.gpu.clone());
     // Merge explicit schemas with auto-discovered dirs from scene path
     let mut all_schemas = args.schemas.clone();
     for dir in flint_schema::discover_schema_dirs(&args.scene) {
@@ -152,8 +350,37 @@ pub fn run(args: RenderArgs) -> Result<()> {
         ctx.height,
         RendererConfig {
             show_grid: !args.no_grid,
+            sample_count: args.msaa,
         },
     );
+
+    // Scene-authored hemisphere ambient + diffuse wrap (absent = renderer default)
+    if let Some(env) = &scene_file.environment {
+        if env.ambient_sky.is_some() || env.ambient_ground.is_some() {
+            renderer.set_ambient(
+                env.ambient_sky
+                    .unwrap_or(flint_render::LightUniforms::DEFAULT_AMBIENT_SKY),
+                env.ambient_ground
+                    .unwrap_or(flint_render::LightUniforms::DEFAULT_AMBIENT_GROUND),
+            );
+        }
+        if let Some(wrap) = env.diffuse_wrap {
+            renderer.set_diffuse_wrap(wrap);
+        }
+        if let Some(oren) = env.oren_nayar {
+            renderer.set_oren_nayar(oren);
+        }
+        if let Some(strength) = env.sheen_strength {
+            renderer.set_sheen(env.sheen_color.unwrap_or([1.0; 3]), strength);
+        }
+    }
+    // CLI overrides win over scene-authored values
+    if let Some(oren) = args.oren_nayar {
+        renderer.set_oren_nayar(oren);
+    }
+    if let Some(strength) = args.sheen_strength {
+        renderer.set_sheen(args.sheen_color.unwrap_or([1.0; 3]), strength);
+    }
 
     // Load models and textures from the scene
     let config = ModelLoadConfig::from_scene_path(&args.scene);
@@ -194,7 +421,11 @@ pub fn run(args: RenderArgs) -> Result<()> {
     if args.no_shadows {
         renderer.set_shadows(false);
     }
-    if args.shadow_resolution != 1024 {
+    // The renderer constructs at 2048; only recreate the pass when the flag
+    // actually deviates. Historically the flag defaulted to 1024 but the
+    // != 1024 guard meant an explicit 1024 was silently ignored — with the
+    // texel size now uploaded per-resolution (ADR 0049) the flag is real.
+    if args.shadow_resolution != 2048 {
         renderer.set_shadow_resolution(&ctx.device, args.shadow_resolution);
     }
 
@@ -229,6 +460,9 @@ pub fn run(args: RenderArgs) -> Result<()> {
                 pp_config.ssao_enabled = false;
             }
         }
+        if let Some(samples) = args.ssao_samples {
+            pp_config.ssao_samples = samples.clamp(1, 64);
+        }
         if let Some(density) = args.fog_density {
             pp_config.fog_density = density;
             pp_config.fog_enabled = density > 0.0;
@@ -243,6 +477,18 @@ pub fn run(args: RenderArgs) -> Result<()> {
         if let Some(intensity) = args.dither_intensity {
             pp_config.dither_intensity = intensity;
             pp_config.dither_enabled = intensity > 0.0;
+        }
+        if let Some(desaturate) = args.desaturate {
+            pp_config.desaturate = desaturate;
+        }
+        if let Some(strength) = args.dof {
+            pp_config.dof_strength = strength;
+        }
+        if let Some(distance) = args.dof_focus {
+            pp_config.dof_focus_distance = distance;
+        }
+        if let Some(range) = args.dof_range {
+            pp_config.dof_focus_range = range;
         }
         if let Some(mode) = args.render_mode {
             pp_config.render_mode = mode;
@@ -278,9 +524,31 @@ pub fn run(args: RenderArgs) -> Result<()> {
             pp_config.kuwahara_anisotropy = anisotropy;
             pp_config.kuwahara_enabled = true;
         }
+        if let Some(grain) = args.film_grain {
+            pp_config.film_grain = grain;
+        }
+        if let Some(lift) = args.grade_lift {
+            pp_config.grade_lift = lift;
+        }
+        if let Some(gamma) = args.grade_gamma {
+            pp_config.grade_gamma = gamma;
+        }
+        if let Some(gain) = args.grade_gain {
+            pp_config.grade_gain = gain;
+        }
+        if args.fxaa {
+            pp_config.fxaa_enabled = true;
+        }
 
         renderer.set_post_process_config(pp_config);
         renderer.ensure_kuwahara_resources(&ctx.device, &ctx.queue);
+        renderer.ensure_fxaa_resources(&ctx.device);
+    }
+
+    // Post time for grain/mode animation. Headless renders leave this 0.0 so
+    // PNG snapshots stay deterministic; --grain-time pins an explicit frame.
+    if let Some(t) = args.grain_time {
+        renderer.ocean_time = t as f64;
     }
 
     // Load terrain (if any)
@@ -291,7 +559,38 @@ pub fn run(args: RenderArgs) -> Result<()> {
     renderer.ortho_height = camera.ortho_height;
     renderer.aspect_ratio = camera.aspect;
 
+    // Two-bone IK (ADR 0070): pose authored chains before the single frame.
+    flint_animation::IkPass::new().run(&mut world);
+
     renderer.update_from_world(&world, &ctx.device);
+
+    // Particles (ADR 0068): fixed-step, fixed-seed simulation so a snapshot
+    // at a given --particle-time is reproducible run to run.
+    if let Some(seconds) = args.particle_time {
+        use flint_runtime::RuntimeSystem;
+        let mut particles = flint_particles::ParticleSystem::new();
+        flint_particles::load_particle_effects_from_world(&args.scene, &mut particles);
+        particles
+            .initialize(&mut world)
+            .context("Failed to initialize particles")?;
+        let dirs = flint_particles::texture_search_dirs(&args.scene);
+        flint_render::load_particle_textures(
+            &mut renderer,
+            &ctx.device,
+            &ctx.queue,
+            &particles.sync,
+            &dirs,
+        );
+        particles.simulate_to(&world, seconds.max(0.0), 1.0 / 60.0);
+        particles.pack(Some(camera.position_array()));
+        renderer.update_particles_from(&ctx.device, &ctx.queue, &particles.sync);
+        println!(
+            "Particles: {} alive across {} emitter(s) at t = {:.2}s",
+            particles.sync.total_alive(),
+            particles.sync.emitter_count(),
+            seconds
+        );
+    }
 
     // Render
     renderer.render_to(
@@ -435,46 +734,7 @@ fn load_terrain_for_render(
         );
 
         // Load grass if enabled
-        let grass_config = {
-            let mut gc = flint_terrain::GrassConfig::default();
-            if let Some(enabled) = terrain_comp.get("grass.enabled") {
-                if enabled.as_bool().unwrap_or(false) {
-                    gc.enabled = true;
-                    gc.density = get_f32("grass.density", gc.density);
-                    gc.max_distance = get_f32("grass.max_distance", gc.max_distance);
-                    gc.fade_start = get_f32("grass.fade_start", gc.fade_start);
-                    gc.blade_width = get_f32("grass.blade_width", gc.blade_width);
-                    gc.blade_height = get_f32("grass.blade_height", gc.blade_height);
-                    gc.height_variation =
-                        get_f32("grass.height_variation", gc.height_variation);
-                    gc.wind_speed = get_f32("grass.wind_speed", gc.wind_speed);
-                    gc.wind_strength = get_f32("grass.wind_strength", gc.wind_strength);
-                    gc.bend_radius = get_f32("grass.bend_radius", gc.bend_radius);
-                    gc.bend_strength = get_f32("grass.bend_strength", gc.bend_strength);
-                    gc.density_threshold =
-                        get_f32("grass.density_threshold", gc.density_threshold);
-                    gc.density_layer =
-                        get_i32("grass.density_layer", gc.density_layer as i32) as u32;
-                    gc.dry_amount = get_f32("grass.dry_amount", gc.dry_amount);
-
-                    if let Some(v) = terrain_comp.get("grass.color_base").and_then(toml_vec3) {
-                        gc.color_base = v;
-                    }
-                    if let Some(v) = terrain_comp.get("grass.color_tip").and_then(toml_vec3) {
-                        gc.color_tip = v;
-                    }
-                    if let Some(v) = terrain_comp.get("grass.color_dry").and_then(toml_vec3) {
-                        gc.color_dry = v;
-                    }
-                    if let Some(v) =
-                        terrain_comp.get("grass.wind_direction").and_then(toml_vec3)
-                    {
-                        gc.wind_direction = v;
-                    }
-                }
-            }
-            gc
-        };
+        let grass_config = flint_terrain::GrassConfig::from_component(terrain_comp, false);
 
         if grass_config.enabled {
             let hm_data = heightmap.clone_heights();
@@ -525,10 +785,7 @@ fn load_terrain_for_render(
                     grass_config.density, grass_config.max_distance
                 );
             } else {
-                println!(
-                    "[grass] Warning: splat map not found at {:?}",
-                    splat_path
-                );
+                println!("[grass] Warning: splat map not found at {:?}", splat_path);
             }
         }
 
@@ -539,5 +796,10 @@ fn load_terrain_for_render(
             terrain.chunks.len()
         );
         break; // Only one terrain for now
+    }
+
+    // Grass on a mesh ground (ADR 0089), as the player loads it
+    if flint_player::load_scene_grass_ground(world, scene_path, device, queue, renderer) {
+        println!("[grass] Enabled on grass_ground");
     }
 }

@@ -1,0 +1,14 @@
+# What `flint bundle .` packs for the web player (Flint#98, #102).
+# Flint's docs/design/web.md explains the format and the defaults.
+name = "float"
+scene = "scenes/float.scene.toml"
+schemas = ["engine/schemas", "schemas"]
+# mixamo_spike names mixamo_body.glb, which is not in the repo; the snap_
+# scenes are kept, as fixtures a page can open with ?scene=.
+exclude = ["scenes/mixamo_spike.scene.toml"]
+[late]
+# Fetched first, in this order (Flint#124): the two beds that play from the
+# first second, 328 KB, so the sea is there at Begin on a slow line. The
+# songs and one-shots follow in the 6.7 MB part.
+ambience = ["audio/ocean_loop.ogg", "audio/wind_light.ogg"]
+audio =["**/*.ogg", "**/*.wav", "**/*.mp3", "**/*.flac"]

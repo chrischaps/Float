@@ -6,16 +6,51 @@ use flint_schema::SchemaRegistry;
 use std::path::Path;
 use winit::event_loop::{ControlFlow, EventLoop};
 
+#[derive(clap::Args)]
 pub struct PlayArgs {
+    /// Path to scene file
+    #[arg(required_unless_present = "list_gpus", default_value = "")]
     pub scene: String,
+
+    /// Paths to schemas directories (can specify multiple)
+    #[arg(long, default_value = "schemas", action = clap::ArgAction::Append)]
     pub schemas: Vec<String>,
+
+    /// Launch in fullscreen mode
+    #[arg(long)]
     pub fullscreen: bool,
+
+    /// Optional input config overlay path
+    #[arg(long)]
     pub input_config: Option<String>,
+
+    /// Initial music bus volume (linear, 0.0 = muted, 1.0 = full)
+    #[arg(long, default_value_t = 1.0)]
     pub music_volume: f64,
+
+    /// Initial SFX bus volume (linear, 0.0 = muted, 1.0 = full)
+    #[arg(long, default_value_t = 1.0)]
     pub sfx_volume: f64,
+
+    /// GPU adapter to use (case-insensitive substring of the adapter name,
+    /// e.g. "NVIDIA"). Overrides WGPU_ADAPTER_NAME; default prefers the
+    /// high-performance adapter. Use --list-gpus to see names.
+    #[arg(long)]
+    pub gpu: Option<String>,
+
+    /// List available GPU adapters and exit
+    #[arg(long)]
+    pub list_gpus: bool,
 }
 
 pub fn run(args: PlayArgs) -> Result<()> {
+    if args.list_gpus {
+        for a in flint_render::list_adapters() {
+            println!("{a}");
+        }
+        return Ok(());
+    }
+    flint_render::set_gpu_override(args.gpu.clone());
     // Merge explicit schemas with auto-discovered dirs from scene path
     let mut all_schemas = args.schemas.clone();
     for dir in flint_schema::discover_schema_dirs(&args.scene) {
@@ -50,8 +85,9 @@ pub fn run(args: PlayArgs) -> Result<()> {
     println!("  Space    - Jump");
     println!("  Shift    - Sprint");
     println!("  Escape   - Release cursor / Exit");
-    println!("  F1       - Cycle debug mode");
-    println!("  F4       - Toggle shadows");
+    println!("  F2       - Rendering stats overlay");
+    println!("  F3       - Scene debug panels");
+    println!("  F4       - Rendering & Effects menu");
     println!("  F11      - Toggle fullscreen");
 
     // Create and run the event loop
@@ -65,6 +101,8 @@ pub fn run(args: PlayArgs) -> Result<()> {
         args.input_config,
         scene_file.scene.input_config.clone(),
     );
+
+    app.scene_preload_audio = scene_file.scene.preload_audio;
 
     // Apply initial mixer bus volumes from CLI
     app.audio
