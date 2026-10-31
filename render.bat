@@ -25,10 +25,10 @@ echo Rendering underwater moment (render mode 5, fixture scene)...
 
 echo Rendering body from the eye (bind pose: hands on thighs) -- day, dusk, night...
 set EYE=--distance 0.55 --pitch 55 --yaw 180 --target 0,0.36,1.25
-%FLINT% render %SCENE% %SCHEMAS% %QUICK% --output snapshotsody_eye_day.png %EYE%
-%FLINT% render scenes\snap_body_dusk.scene.toml %SCHEMAS% %QUICK% --output snapshotsody_eye_dusk.png %EYE%
-%FLINT% render scenes\snap_body_night.scene.toml %SCHEMAS% %QUICK% --output snapshotsody_eye_night.png %EYE%
-%FLINT% render %SCENE% %SCHEMAS% %QUICK% --output snapshotsody_hand_side.png --distance 0.45 --pitch 5 --yaw 90 --target 0.15,0.45,1.15
+%FLINT% render %SCENE% %SCHEMAS% %QUICK% --output snapshots\body_eye_day.png %EYE%
+%FLINT% render scenes\snap_body_dusk.scene.toml %SCHEMAS% %QUICK% --output snapshots\body_eye_dusk.png %EYE%
+%FLINT% render scenes\snap_body_night.scene.toml %SCHEMAS% %QUICK% --output snapshots\body_eye_night.png %EYE%
+%FLINT% render %SCENE% %SCHEMAS% %QUICK% --output snapshots\body_hand_side.png --distance 0.45 --pitch 5 --yaw 90 --target 0.15,0.45,1.15
 
 if /i "%~1"=="quick" goto :done
 
