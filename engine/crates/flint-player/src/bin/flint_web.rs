@@ -14,12 +14,37 @@
 //! it couldn't find at start.
 //!
 //! Query string (all optional):
-//!   bundle=<url>    a .flintpack, relative to the page
+//!   game=<id>       a game on play.chaps.dev (#103): the bundle at
+//!                   games/<id>/<id>.flintpack, which the site's deploy packs
+//!   bundle=<url>    a .flintpack, relative to the page (wins over game)
 //!   scene=<path>    with bundle: a scene inside it instead of the manifest's;
 //!                   without: a scene TOML fetched from <url> (default: the
 //!                   first-light demo, which needs no other files)
 //!   msaa=1|4        scene-pass MSAA (ADR 0058)
+//!   scale=<f>|auto  the 3D scene's render scale (#122). By default it is
+//!                   drawn at no more than DPR 1.5 (`WEB_DPR_CAP`) and the
+//!                   HUD at the full DPR; a number from 0.25 to 1 draws at
+//!                   that scale instead, whatever the DPR (`scale=1` is
+//!                   native); `auto` keeps the cap and steps under it when
+//!                   frames run over budget for seconds
 //!   width=, height= fix the canvas to this many CSS pixels instead of the page
+//!   frame_step=<s>  step game time exactly s per frame (`--frame-step`)
+//!   hold_at=<s>     stop game time at s seconds, for a screenshot of an
+//!                   exact moment (with frame_step; `PlayerApp::hold_at`)
+//!   perf=1|cpu      the perf readout in a corner (#120): frame times over
+//!                   the last 10 s, each phase's CPU time, each pass's GPU
+//!                   time where the adapter has timestamp-query (`cpu`
+//!                   leaves GPU timing off), and a line to copy
+//!   fps=30|60|auto|native  which refreshes are drawn (#140). A rate is
+//!                   drawn as a whole number of refreshes (30 is every
+//!                   other at 60 Hz, every fourth at 120); `auto` draws
+//!                   every refresh while the frames hold it and drops to
+//!                   the rate they do hold when they don't; `native` draws
+//!                   every refresh unpaced. Default: `auto` where the
+//!                   primary pointer is a finger, `native` elsewhere
+//!   loop=poll       run winit's loop flat out (`ControlFlow::Poll`), as
+//!                   before #121, to compare against; the default draws once
+//!                   per `requestAnimationFrame`
 //!
 //! Build and serve from `crates/flint-player`:
 //!   trunk serve            # http://127.0.0.1:8080
@@ -61,7 +86,18 @@ mod web {
         bundle: Option<String>,
         scene: Option<String>,
         msaa: u32,
+        render_scale: flint_player::RenderScaleSetting,
         size: Option<(u32, u32)>,
+        frame_step: Option<f64>,
+        hold_at: Option<f64>,
+        /// `Some(gpu)`: show the perf readout, timing the GPU too when true.
+        perf: Option<bool>,
+        /// `loop=poll`: the old flat-out loop, for comparison (#121).
+        poll: bool,
+        /// `touch=always|never`: the on-screen touch controls (#133).
+        touch: flint_runtime::TouchControlsMode,
+        /// `fps=`: which refreshes are drawn (#140).
+        fps: flint_player::FrameRateSetting,
     }
 
     impl WebArgs {
@@ -71,13 +107,54 @@ mod web {
                 .and_then(|q| web_sys::UrlSearchParams::new_with_str(&q).ok());
             let get = |key: &str| params.as_ref().and_then(|p| p.get(key));
             let num = |key: &str| get(key).and_then(|v| v.parse::<u32>().ok());
+            let secs = |key: &str| {
+                get(key)
+                    .and_then(|v| v.parse::<f64>().ok())
+                    .filter(|s| s.is_finite() && *s >= 0.0)
+            };
             Self {
-                bundle: get("bundle").filter(|b| !b.is_empty()),
+                bundle: get("bundle")
+                    .filter(|b| !b.is_empty())
+                    .or_else(|| get("game").as_deref().and_then(game_bundle)),
                 scene: get("scene").filter(|s| !s.is_empty()),
                 msaa: num("msaa").filter(|&m| m == 1 || m == 4).unwrap_or(1),
+                render_scale: get("scale")
+                    .and_then(|v| flint_player::RenderScaleSetting::web().parse(&v))
+                    .unwrap_or_else(flint_player::RenderScaleSetting::web),
                 size: num("width").zip(num("height")),
+                frame_step: secs("frame_step").filter(|s| *s > 0.0),
+                hold_at: secs("hold_at"),
+                perf: get("perf").and_then(|v| match v.as_str() {
+                    "cpu" => Some(false),
+                    "0" => None,
+                    _ => Some(true),
+                }),
+                poll: get("loop").as_deref() == Some("poll"),
+                touch: get("touch")
+                    .and_then(|v| flint_runtime::TouchControlsMode::parse(&v))
+                    .unwrap_or_default(),
+                fps: get("fps")
+                    .and_then(|v| flint_player::FrameRateSetting::parse(&v))
+                    .unwrap_or_else(|| {
+                        if flint_player::web_coarse_pointer() {
+                            flint_player::FrameRateSetting::Auto
+                        } else {
+                            flint_player::FrameRateSetting::Native
+                        }
+                    }),
             }
         }
+    }
+
+    /// Where play.chaps.dev keeps a game's bundle (`tools/play-site/build.py`
+    /// packs each one there). An id is a bundle name: lowercase letters,
+    /// digits, `-` and `_`, so a query can't point outside `games/`.
+    fn game_bundle(id: &str) -> Option<String> {
+        let ok = !id.is_empty()
+            && id
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_');
+        ok.then(|| format!("games/{id}/{id}.flintpack"))
     }
 
     pub fn run() {
@@ -124,11 +201,25 @@ mod web {
             loaded.scene_file.scene.name,
             loaded.world.entity_count()
         );
-        let title = loaded.scene_file.scene.name.clone();
+        // The page may have named the game already (play.chaps.dev's
+        // doorway, from games.json); the scene's own name is the fallback.
+        let title = page_text("gate-title").unwrap_or_else(|| loaded.scene_file.scene.name.clone());
+        let line = page_text("gate-line").or_else(|| loaded.scene_file.scene.description.clone());
         status(&title);
 
         let event_loop = EventLoop::new().map_err(|e| format!("event loop: {e}"))?;
-        event_loop.set_control_flow(ControlFlow::Poll);
+        // Draw once per requestAnimationFrame: `about_to_wait` asks for a
+        // redraw, winit waits for the browser's next frame, and the main
+        // thread sleeps in between. Poll queued a new task as soon as the
+        // last one ended, so the thread never went idle; Chrome still ran
+        // its frames, but Firefox starved its own refresh driver and showed
+        // one frame in five, with stalls of seconds and broken sound (#121,
+        // docs/design/web.md).
+        event_loop.set_control_flow(if args.poll {
+            ControlFlow::Poll
+        } else {
+            ControlFlow::Wait
+        });
         let mut app = PlayerApp::new(
             loaded.world,
             loaded.scene_path,
@@ -137,11 +228,20 @@ mod web {
             loaded.scene_file.scene.input_config.clone(),
         );
         app.msaa_sample_count = args.msaa;
+        app.render_scale = args.render_scale;
+        app.input.touch_controls_mut().set_mode(args.touch);
+        app.clock.frame_step = args.frame_step;
+        app.hold_at = args.hold_at;
+        app.set_frame_rate(args.fps);
+        if let Some(gpu) = args.perf {
+            app.enable_perf(gpu);
+        }
         app.apply_scene_settings(&loaded.scene_file);
         app.set_schema_paths(loaded.schemas);
         app.set_event_proxy(event_loop.create_proxy());
         // Returns at once: the browser drives the loop from here on.
         event_loop.spawn_app(app);
+        open_gate(&title, line.as_deref().unwrap_or(""));
 
         for (source, parts, base) in late {
             fetch_late_bundles(source, parts, base, title.clone());
@@ -366,6 +466,11 @@ mod web {
         web_sys::window()?.document()?.get_element_by_id(id)
     }
 
+    /// An element's text, if the page has filled it in.
+    fn page_text(id: &str) -> Option<String> {
+        element(id)?.text_content().filter(|t| !t.trim().is_empty())
+    }
+
     fn fix_canvas_size(width: u32, height: u32) {
         if let Some(canvas) = element(WEB_CANVAS_ID) {
             let style = format!("width: {width}px !important; height: {height}px !important;");
@@ -393,6 +498,73 @@ mod web {
             let fraction = total.map(|t| got as f64 / t.max(1) as f64).unwrap_or(0.0);
             let _ = bar.set_attribute("style", &format!("--p: {:.4}", fraction.min(1.0)));
         }
+    }
+
+    /// The Begin gate (#102). The world is already running behind it,
+    /// silent. Its click is the gesture a browser asks for: it locks the
+    /// pointer and starts the sound (`flint_player::web_begin`), and the
+    /// veil lifts. Afterwards a line under the world says how to take the
+    /// pointer back whenever Escape has freed it.
+    fn open_gate(title: &str, line: &str) {
+        use std::cell::Cell;
+        use std::rc::Rc;
+        use wasm_bindgen::closure::Closure;
+
+        let (Some(gate), Some(button)) = (element("gate"), element("begin")) else {
+            flint_player::web_begin();
+            return;
+        };
+        if let Some(el) = element("gate-title") {
+            el.set_text_content(Some(title));
+        }
+        if let Some(el) = element("gate-line") {
+            el.set_text_content(Some(line));
+        }
+        let _ = gate.set_attribute("data-ready", "");
+        if let Ok(button) = button.clone().dyn_into::<web_sys::HtmlElement>() {
+            let _ = button.focus();
+        }
+
+        let begun = Rc::new(Cell::new(false));
+        let on_begin = {
+            let begun = begun.clone();
+            Closure::<dyn FnMut()>::new(move || {
+                if begun.replace(true) {
+                    return;
+                }
+                flint_player::web_begin();
+                let _ = gate.set_attribute("data-gone", "");
+                if let Some(canvas) = element(flint_player::WEB_CANVAS_ID)
+                    .and_then(|c| c.dyn_into::<web_sys::HtmlElement>().ok())
+                {
+                    let _ = canvas.focus();
+                }
+            })
+        };
+        let _ = button.add_event_listener_with_callback("click", on_begin.as_ref().unchecked_ref());
+        on_begin.forget();
+
+        let Some(document) = web_sys::window().and_then(|w| w.document()) else {
+            return;
+        };
+        let on_lock = {
+            let document = document.clone();
+            Closure::<dyn FnMut()>::new(move || {
+                let Some(hint) = element("relook") else {
+                    return;
+                };
+                if document.pointer_lock_element().is_some() || !begun.get() {
+                    let _ = hint.remove_attribute("data-on");
+                } else {
+                    let _ = hint.set_attribute("data-on", "");
+                }
+            })
+        };
+        let _ = document.add_event_listener_with_callback(
+            "pointerlockchange",
+            on_lock.as_ref().unchecked_ref(),
+        );
+        on_lock.forget();
     }
 
     fn hide_progress() {
