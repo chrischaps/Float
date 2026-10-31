@@ -383,6 +383,27 @@ surface are hit-or-miss vs the t=0 wave phase, check the no-mode render
 first). New fields must be LISTED in the scene seat block (schema
 defaults don't materialize).
 
+Raft detail pass ✅ (#5): `tools/generate_raft.py` builds logs as
+hand-gridded meshes (taper, bow, ovality, flank knots, chamfered
+off-square ends with end-grain caps) and lashings as three-turn rope
+helices with a knot lump + tail (frayed ones on raft2: slack, two turns,
+long unravelling tail). Albedo maps from `tools/generate_raft_texture.py`
+(per-log wood with knots baked at the same (u,v) the geometry bulges,
+end grain, 3-strand rope; `weathered` = salt bloom + more checks) are
+embedded per log. Three rng streams: `rng` baseline layout (draw order
+frozen), `wrng` weathering, `drng` detail. Detail draws are SIGNED so
+the deck top can only hold or sink (butts aft, tips toward the seat,
+ovality/lobe phased to trough on top, bow only sags, knots flush on
+top) — the seated body is framed against a flat deck. Lashings sit
+within ~5 mm of the old tori. `export()` rewrites texture bookkeeping
+(one texture per image, named after its material) and asserts NORMAL +
+TEXCOORD_0 on every primitive. ENGINE GOTCHA fixed here: multi-node
+GLBs are node-expanded (`model_loader.rs` caches each node as
+`asset/node`) and that path never namespaced material texture names,
+so every textured multi-node static model rendered untextured (white ×
+factor) — `SceneRenderer::namespace_mesh_textures` now patches both
+paths.
+
 Polish backlog: real M6/M8 + weather SFX from
 `specs/elevenlabs_audio_prompts.md`; playtest pass on the body detail
 (finger/toe read in first person, texture contrast under the cel post,
