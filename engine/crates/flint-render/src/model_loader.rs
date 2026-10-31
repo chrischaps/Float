@@ -251,6 +251,7 @@ fn expand_nodes_animated(
                 default_color,
                 None, // No vertex baking — transforms live on the entity
             );
+            renderer.namespace_mesh_textures(&cache_key, asset_name);
 
             let model = toml::Value::Table({
                 let mut m = toml::map::Map::new();

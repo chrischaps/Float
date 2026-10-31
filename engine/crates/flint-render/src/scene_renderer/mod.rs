@@ -1767,17 +1767,24 @@ impl SceneRenderer {
         }
 
         // Patch material texture references on cached meshes to use namespaced names
-        if let Some(gpu_meshes) = self.mesh_cache.get_mut(name) {
+        self.namespace_mesh_textures(name, name);
+    }
+
+    /// Point the cached meshes under `cache_key` at the textures `load_model`
+    /// uploaded for `asset_name` (namespaced `asset::texture`). Node-expanded
+    /// models cache each node under its own key (`asset/node`) and must call
+    /// this too, or every texture lookup misses and falls back to white.
+    pub fn namespace_mesh_textures(&mut self, cache_key: &str, asset_name: &str) {
+        let ns = |tex: &mut Option<String>| {
+            if let Some(t) = tex.take() {
+                *tex = Some(format!("{}::{}", asset_name, t));
+            }
+        };
+        if let Some(gpu_meshes) = self.mesh_cache.get_mut(cache_key) {
             for mesh in gpu_meshes.iter_mut() {
-                if let Some(ref tex) = mesh.material.base_color_texture {
-                    mesh.material.base_color_texture = Some(format!("{}::{}", name, tex));
-                }
-                if let Some(ref tex) = mesh.material.normal_texture {
-                    mesh.material.normal_texture = Some(format!("{}::{}", name, tex));
-                }
-                if let Some(ref tex) = mesh.material.metallic_roughness_texture {
-                    mesh.material.metallic_roughness_texture = Some(format!("{}::{}", name, tex));
-                }
+                ns(&mut mesh.material.base_color_texture);
+                ns(&mut mesh.material.normal_texture);
+                ns(&mut mesh.material.metallic_roughness_texture);
             }
         }
     }
