@@ -22,12 +22,16 @@ impl PlayerApp {
     pub(super) fn process_script_commands(&mut self, commands: Vec<ScriptCommand>) {
         for cmd in commands {
             match cmd {
-                ScriptCommand::PlaySound { name, volume } => {
+                ScriptCommand::PlaySound {
+                    name,
+                    volume,
+                    pitch,
+                } => {
                     if self.audio.engine.is_available() {
                         if let Err(e) = self.audio.engine.play_non_spatial(
                             &name,
                             volume,
-                            1.0,
+                            pitch,
                             false,
                             flint_audio::Bus::Sfx,
                         ) {
@@ -40,14 +44,20 @@ impl PlayerApp {
                     position,
                     volume,
                     pitch,
+                    distances,
+                    rolloff,
                 } => {
                     let pos =
                         FlintVec3::new(position.0 as f32, position.1 as f32, position.2 as f32);
-                    if let Err(e) = self
-                        .audio
-                        .engine
-                        .play_at_position(&name, pos, volume, pitch)
-                    {
+                    if let Err(e) = self.audio.engine.play_oneshot_at(
+                        &name,
+                        pos,
+                        volume,
+                        pitch,
+                        distances.unwrap_or(flint_audio::engine::DEFAULT_DISTANCES),
+                        rolloff.unwrap_or(flint_audio::engine::DEFAULT_ROLLOFF),
+                        flint_audio::Bus::Sfx,
+                    ) {
                         tracing::warn!(target: "script", "play_sound_at error: {:?}", e);
                     }
                 }
@@ -170,6 +180,40 @@ impl PlayerApp {
                 }
             }
         }
+    }
+
+    /// Begin sound, from the user gesture that begins the game (#101). A
+    /// browser gives no sound before one, so the web player runs silent
+    /// until this is called from its Begin click; on the desktop the device
+    /// opened at start and this does nothing new. Loops already in the
+    /// scene start, and so does the scene's music session if it was skipped
+    /// for want of a device. Says whether there is sound.
+    pub fn start_audio(&mut self) -> bool {
+        let had_sound = self.audio.engine.is_available();
+        // A music session clocks its suite on kira's manager itself, which
+        // the browser's worklet mix (#136) keeps on the audio thread; such a
+        // scene mixes on the main thread, as before.
+        #[cfg(target_arch = "wasm32")]
+        if !had_sound
+            && !self
+                .world
+                .entities_with_component(music_session::MUSIC_SESSION)
+                .is_empty()
+        {
+            tracing::info!(
+                "[flint-audio] a music_session needs kira here: mixing on the main thread"
+            );
+            self.audio
+                .engine
+                .set_web_mixer(flint_audio::engine::WebMixer::MainThread);
+        }
+        if !self.audio.start(&self.world) {
+            return false;
+        }
+        if !had_sound && self.music_session.is_none() {
+            self.start_music_session();
+        }
+        true
     }
 
     /// Start the scene-declared music session, if any (F3, ADR 0019): find

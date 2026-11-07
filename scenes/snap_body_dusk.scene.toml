@@ -1,0 +1,110 @@
+# Baked dusk snapshot (~19.9h) — time_of_day.rhai keyframe values frozen,
+# since `flint render` does not run scripts. Interpolated between the
+# sunset (19.0) and dusk (20.4) keys at t=0.71 (smoothstepped).
+
+[scene]
+name = "Float — dusk snapshot"
+version = "0.1"
+description = "Baked dusk lighting for headless renders"
+
+[post_process]
+enabled = true
+bloom_enabled = true
+bloom_intensity = 0.06
+bloom_threshold = 1.0
+vignette_enabled = true
+vignette = 0.18
+fog_enabled = true
+fog_color = [0.18, 0.12, 0.25]
+fog_density = 0.0015
+fog_start = 60.0
+
+[entities.sun]
+[entities.sun.light]
+type = "directional"
+direction = [-0.9565, -0.1229, -0.2563]
+color = [0.0, 0.0, 0.0]
+intensity = 0.0
+
+[entities.sky_dome]
+[entities.sky_dome.sky]
+zenith_color = [0.06, 0.05, 0.18, 1.0]
+horizon_color = [0.35, 0.18, 0.35, 1.0]
+haze_color = [0.45, 0.25, 0.42, 0.6]
+cloud_tint = [0.20, 0.15, 0.30, 0.8]
+sun_disc_size = 0.035
+sun_glow = 1.0
+star_opacity = 0.55
+cloud_coverage = 0.38
+cloud_density = 0.22
+cloud_scale = 0.9
+cloud_drift_x = 0.004
+cloud_drift_y = 0.0015
+ambient_sky = [0.09, 0.06, 0.13, 1.0]
+ambient_ground = [0.04, 0.028, 0.055, 1.0]
+
+[entities.ocean]
+[entities.ocean.ocean]
+seed = 7
+num_waves = 12
+wavelength_min = 5.0
+wavelength_max = 70.0
+amplitude = 1.15
+choppiness = 0.82
+direction_deg = 25.0
+spread_deg = 40.0
+speed_scale = 1.0
+wind_speed = 7.0
+fetch_km = 60.0
+peak_enhancement = 3.3
+deep_color = [0.008, 0.030, 0.11, 1.0]
+shallow_color = [0.05, 0.08, 0.20, 1.0]
+foam_color = [0.97, 0.99, 1.0, 1.0]
+sss_color = [0.05, 0.10, 0.16, 1.0]
+# NOTE: threshold raised from the game's 0.72 so crest foam is visible in a
+# frozen (scriptless) render — this scene is a foam-lighting test fixture.
+foam_threshold = 0.95
+foam_noise_scale = 0.35
+ramp_steps = 3.0
+specular_strength = 1.0
+# No glow at dusk: blooms are rare LATE-night events (biolum.rhai,
+# earliest 21.6h) — dusk foam never glows.
+foam_glow_color = [0.35, 0.95, 0.75, 1.0]
+foam_glow = 0.0
+turbidity = 0.8
+refraction_strength = 0.6
+absorption_color = [0.9, 0.35, 0.22]
+sky_reflection_strength = 0.45
+grid_scale = 60.0
+fade_start = 90.0
+fade_end = 170.0
+
+[entities.raft]
+[entities.raft.transform]
+position = [0.0, 0.05, 0.0]
+rotation = [0.0, 0.0, 0.0]
+[entities.raft.model]
+asset = "raft"
+[entities.raft.ocean_contact]
+half_x = 1.2
+half_z = 1.15
+
+[entities.legs]
+[entities.legs.transform]
+position = [0.0, 0.3, 1.0]
+[entities.legs.model]
+asset = "legs"
+
+# ── Body playtest fixture (#6): the player's body at BIND pose (render
+#    runs no scripts or clips, so the hands rest on the thighs in the
+#    idle_thighs arm pose), framed from the eye by render.bat's body
+#    shots. Bind pose is check_clearance()'s case 0, the rest pose the
+#    hand-on-thigh contact is tuned for. ──
+
+[entities.body]
+[entities.body.transform]
+position = [0.0, 0.28, 1.0]
+[entities.body.model]
+asset = "body"
+[entities.body.skeleton]
+skin = "body_rig"

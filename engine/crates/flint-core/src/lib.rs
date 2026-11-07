@@ -5,7 +5,10 @@
 //! - `ContentHash` - SHA-256 based content hashing
 //! - `Transform`, `Vec3` - Spatial types
 //! - Error types and Result alias
+//! - `vfs` - The read-only file layer every runtime read goes through
+//! - `bundle` - Game bundles: a game's files in one fetchable blob for the vfs
 
+pub mod bundle;
 pub mod callbacks;
 pub mod components;
 mod error;
@@ -14,10 +17,15 @@ mod hash;
 mod id;
 pub mod ik;
 pub mod ocean;
+pub mod projection;
 pub mod quat;
+pub mod ray_mesh;
 pub mod spline;
 pub mod toml_util;
 mod types;
+pub mod vfs;
+pub mod world_line;
+pub mod world_text;
 
 pub use error::{FlintError, Result};
 pub use hash::ContentHash;

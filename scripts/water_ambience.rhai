@@ -215,12 +215,12 @@ fn on_update() {
     dunk_cd -= dt;
     if sub > 0.65 && last_sub_lvl <= 0.65 && dunk_cd <= 0.0 {
         let n = if random_range(0.0, 1.0) < 0.5 { 1 } else { 2 };
-        play_sound(`dunk_in_${n}`, 0.85);
+        play_sound(`audio/dunk_in_${n}.ogg`, 0.85);
         dunk_cd = 0.8;
     }
     if sub < 0.35 && last_sub_lvl >= 0.35 && dunk_cd <= 0.0 {
         let n = if random_range(0.0, 1.0) < 0.5 { 1 } else { 2 };
-        play_sound(`dunk_out_${n}`, 0.8);
+        play_sound(`audio/dunk_out_${n}.ogg`, 0.8);
         drip_t = 0.35;             // the drip tail lands just after the sheet
         dunk_cd = 0.8;
     }
@@ -228,7 +228,7 @@ fn on_update() {
         drip_t -= dt;
         if drip_t < 0.0 {
             let n = 1 + random_range(0.0, 3.999).to_int();
-            play_sound(`drip_${n}`, 0.5);
+            play_sound(`audio/drip_${n}.ogg`, 0.5);
         }
     }
     last_sub_lvl = sub;

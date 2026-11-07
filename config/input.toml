@@ -76,3 +76,33 @@ kind = "button"
 [[actions.toggle_debug.bindings]]
 type = "key"
 code = "F1"
+
+# ── On a phone (Flint#133, #134): drag to look, two buttons to scoot ────
+# Kept to the least that plays it: no stick and no menu. The whole screen
+# is the look region, and a drag turns the view as the mouse does (a
+# finger's travel in points times `sensitivity` counts, at mouse_sens rad
+# per count: a swipe across a phone is a little over a quarter turn). Each
+# button drives the scoot axis from its own end, as A and D do.
+
+[touch_controls]
+opacity = 0.75
+
+[[touch_controls.buttons]]
+action = "scoot"
+value = 1.0
+label = "◀"
+anchor = "bottom_left"
+offset = [64, 64]
+radius = 30
+
+[[touch_controls.buttons]]
+action = "scoot"
+value = -1.0
+label = "▶"
+anchor = "bottom_right"
+offset = [64, 64]
+radius = 30
+
+[touch_controls.look]
+region = [0.0, 0.0, 1.0, 1.0]
+sensitivity = 0.7

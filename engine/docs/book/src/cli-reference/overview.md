@@ -77,13 +77,87 @@ makes it the tool for verifying `on_draw_ui` output:
 flint-player scenes/race.scene.toml --schemas engine/schemas --schemas schemas   --width 1280 --height 720   --screenshot renders/hud.png --screenshot-at 6 --exit-after 6.5
 ```
 
+With `--screenshot`, `--exit-after` or `--input-script`, the run is a capture
+and ignores the real keyboard, mouse and pads, so a stray scroll over its
+window can't change the shot. Only the input script drives it (see
+[input gates](../concepts/input-gates.md#during-a-capture)).
+
 | Flag | Description |
 |------|-------------|
 | `--width <px>` / `--height <px>` | Initial window size in physical pixels (default `1280`x`720`; ignored with `--fullscreen`) |
 | `--screenshot <path>` | Write a PNG of the presented frame (scene + HUD). Parent directories are created |
 | `--screenshot-at <secs>` | Game time at which to capture: the first frame whose clock reaches this value (default `0`, the first frame) |
 | `--screenshot-every <secs>` | Keep capturing every N seconds after `--screenshot-at` until exit; files are numbered `hud_0001.png`, `hud_0002.png`, ... next to `--screenshot` |
-| `--exit-after <secs>` | Exit once game time reaches this value |
+| `--exit-after <secs>` | Exit once game time reaches this value, printing the average frame time and the average draw calls, entity draws, culled draws and triangles per frame (both skip the first 2 s) |
+| `--frame-step <secs>` | Advance the clock exactly this much per frame, whatever the wall time |
+| `--input-script <file>` | Play timed keys, typed text, axes, gamepad buttons, the wheel and the mouse, one event per line (below). Scripted keys reach egui and the debug keys too, so `2.0 tap F2` opens the stats overlay |
+| `--stats` | Open the F2 rendering stats overlay from the first frame. F2 still closes it |
+| `--perf` | Print a perf line every 10 s: frame p50/p99/max, each phase's CPU time (mean/max), each pass's GPU time where the adapter can time, draws and triangles. The same line the web page's `?perf=1` copies, so a desktop and a browser can be set side by side |
+
+An input script plays its events at set game times. `#` starts a comment:
+
+```text
+0.0   down    KeyW               # hold a key (names as in input configs)
+2.5   up      KeyW
+3.0   tap     KeyF 0.4           # down now, up 0.4 s later (default 0.06)
+3.0   axis    LeftStickX -0.35   # stick value on the script pad
+4.0   press   South              # gamepad button down
+4.2   release South
+4.5   pull    RightTrigger2 0.6  # a trigger pulled part-way (0 lets go)
+5.0   wheel   1                  # one wheel line up this frame
+5.5   wheel   -0.5 2             # half a line down, two lines right
+6.0   mouse   640 360            # pointer to (640, 360) in window pixels
+6.1   down    MouseLeft          # mouse buttons work with down, up and tap
+6.2   mouse   900 500 0.5        # glide there over 0.5 s: a drag
+6.8   up      MouseLeft
+7.0   click   320 200            # pointer there, then tap MouseLeft
+7.5   click   320 200 MouseRight
+8.0   down    ShiftLeft          # held modifiers reach egui: a shift-drag
+9.0   type    200 planks         # text into the focused egui field
+9.5   tap     Enter
+10.0  look    40 -10             # raw mouse motion, for mouse-look
+10.5  look    300 0 1.5          # spread over 1.5 s
+```
+
+`pull` sets an analog button's travel, as a real pad's trigger sends it: a
+`gamepad_button` binding to `RightTrigger2` reads 0.6, not the 0 or 1 that
+`press` gives. It sets the value alone, so add a `press` and `release` too
+when a script wants the button's press edge. `axis RightTrigger2` writes an
+axis of that name, which a button binding never reads.
+
+The mouse buttons are `MouseLeft`, `MouseRight`, `MouseMiddle`, `MouseBack`
+and `MouseForward`. Pointer positions are physical window pixels, the same
+pixels a screenshot has, so a point read off a capture can be clicked in the
+next one. A glide moves the pointer a little every frame, as a hand would.
+
+The mouse takes the path a real one does (ADR 0082): egui first, then game
+extensions, then `InputState` and scripts. So a scripted click can press an
+egui button, drag between egui widgets or open a tooltip, and a click over a
+panel stays out of the world. The wheel goes the same way: turned over a
+panel, it scrolls the panel (`wheel -10` scrolls a list down) and the game's
+`mouse_wheel_*()` reads zero, as with a real wheel. Two things wait a frame,
+however coarse the frames: a button press or a wheel turn in the frame the
+pointer jumped (egui decides who gets a click or a scroll from where the
+pointer was the frame before), and any release in the frame of its press. A
+`click` therefore takes three frames: move, press, release.
+
+Keys take the path a real keyboard does too (ADR 0097). egui gets each one
+as egui-winit would have made it, the key and, on a press, the character it
+types on a US layout (`KeyA` with Shift held types `A`; nothing while Ctrl is
+held). Shift, Ctrl, Alt and Super also send a `ModifiersChanged`, so egui
+sees a held modifier on the clicks and drags that follow, and so do
+extensions. Then the same focus rule as a real key: while an egui field has
+keyboard focus, the key stops there, and `InputState`, scripts and the debug
+keys never see it. `type` sends the rest of its line as egui text, spaces and
+all, without pressing any keys; click a field first to focus it. A key egui
+passes on goes to game extensions' `on_key` next, as a real one does (ADR
+0103), with the character it stands for on a US layout. Two differences from
+a real keyboard: extensions' `on_window_event` never sees a scripted key
+(winit's `KeyEvent` can't be built outside winit), so read keys in `on_key`
+to script them, and a scripted Esc doesn't quit the player. The real cursor still moves the pointer if it crosses the window
+during a capture, so keep it outside.
+
+`look` feeds raw mouse motion, what `mouse_delta_x()` / `mouse_delta_y()` read, at once or spread over the seconds given. As a real mouse's motion, it reaches the game only while the cursor is captured and no egui field has focus ([Cursor Capture and Input Gates](../concepts/input-gates.md), ADR 0110). The script's pad plays whether or not the window has focus. A real pad doesn't.
 
 Times are `GameClock` seconds (what scripts see via `total_time()`), not
 wall-clock seconds since launch, so a capture lands on the same gameplay

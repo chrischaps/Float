@@ -4,8 +4,10 @@
 //! They access the world through the shared ScriptCallContext.
 
 use crate::context::{DrawCommand, LogLevel, ScriptCallContext, ScriptCommand};
+use crate::projector::{clip_to_screen, project_clip, View};
 use flint_core::components as comp;
 use flint_core::events::TRANSITION_COMPLETE;
+use flint_core::vfs;
 use flint_core::EntityId;
 use flint_core::{euler_deg_to_quat, quat_mul, quat_normalize};
 use rhai::{Array, Dynamic, Engine, ImmutableString, Map};
@@ -1226,8 +1228,9 @@ fn register_input_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>) {
     }
 
     // any_input_just_pressed() -> bool
-    // True on any raw keyboard/mouse/gamepad press this frame, including
-    // keys with no action binding ("press any key" screens).
+    // True on any raw keyboard/mouse/gamepad press, or a finger landing,
+    // this frame, including keys with no action binding ("press any key"
+    // screens).
     {
         let ctx = ctx.clone();
         engine.register_fn("any_input_just_pressed", move || -> bool {
@@ -1262,6 +1265,29 @@ fn register_input_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>) {
         });
     }
 
+    // touch_controls_visible() -> bool
+    // True while the engine draws the on-screen sticks and buttons of the
+    // input config's [touch_controls] block (#133): after a finger touched,
+    // until a key or pad takes over. A HUD can make room for them.
+    {
+        let ctx = ctx.clone();
+        engine.register_fn("touch_controls_visible", move || -> bool {
+            let c = crate::lock_or_recover(&ctx);
+            c.input.touch_controls_visible
+        });
+    }
+
+    // set_touch_controls(enabled: bool)
+    // Put the on-screen controls away (false) while a menu wants every tap,
+    // and bring them back (true) for play (#134). Applied after this frame's
+    // scripts; it lasts across scene changes, like set_cursor_captured.
+    {
+        let ctx = ctx.clone();
+        engine.register_fn("set_touch_controls", move |enabled: bool| {
+            crate::lock_or_recover(&ctx).touch_controls_override = Some(enabled);
+        });
+    }
+
     // mouse_delta_x() -> f64
     {
         let ctx = ctx.clone();
@@ -1277,6 +1303,24 @@ fn register_input_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>) {
         engine.register_fn("mouse_delta_y", move || -> f64 {
             let c = crate::lock_or_recover(&ctx);
             c.input.mouse_delta.1
+        });
+    }
+
+    // mouse_wheel_x() / mouse_wheel_y() -> f64 - wheel lines (notches)
+    // this frame; up and right are positive. A touchpad's pixel scroll
+    // arrives as fractions of a line. Zero while the cursor is over egui.
+    {
+        let ctx = ctx.clone();
+        engine.register_fn("mouse_wheel_x", move || -> f64 {
+            let c = crate::lock_or_recover(&ctx);
+            c.input.mouse_wheel.0
+        });
+    }
+    {
+        let ctx = ctx.clone();
+        engine.register_fn("mouse_wheel_y", move || -> f64 {
+            let c = crate::lock_or_recover(&ctx);
+            c.input.mouse_wheel.1
         });
     }
 
@@ -1345,6 +1389,7 @@ fn register_audio_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>) {
             c.commands.push(ScriptCommand::PlaySound {
                 name: name.to_string(),
                 volume: 1.0,
+                pitch: 1.0,
             });
         });
     }
@@ -1357,6 +1402,20 @@ fn register_audio_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>) {
             c.commands.push(ScriptCommand::PlaySound {
                 name: name.to_string(),
                 volume,
+                pitch: 1.0,
+            });
+        });
+    }
+
+    // play_sound(name, volume, pitch) — 3-arg overload with pitch
+    {
+        let ctx = ctx.clone();
+        engine.register_fn("play_sound", move |name: &str, volume: f64, pitch: f64| {
+            let mut c = crate::lock_or_recover(&ctx);
+            c.commands.push(ScriptCommand::PlaySound {
+                name: name.to_string(),
+                volume,
+                pitch,
             });
         });
     }
@@ -1373,6 +1432,8 @@ fn register_audio_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>) {
                     position: (x, y, z),
                     volume: vol,
                     pitch: 1.0,
+                    distances: None,
+                    rolloff: None,
                 });
             },
         );
@@ -1384,12 +1445,35 @@ fn register_audio_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>) {
         engine.register_fn(
             "play_sound_at",
             move |name: &str, x: f64, y: f64, z: f64, vol: f64, pitch: f64| {
-                let mut c = ctx.lock().unwrap();
+                let mut c = crate::lock_or_recover(&ctx);
                 c.commands.push(ScriptCommand::PlaySoundAt {
                     name: name.to_string(),
                     position: (x, y, z),
                     volume: vol,
                     pitch,
+                    distances: None,
+                    rolloff: None,
+                });
+            },
+        );
+    }
+
+    // play_sound_at(name, x, y, z, opts) — opts is a map with optional keys:
+    //   volume (1), pitch (1), min_distance (1), max_distance (25), rolloff (2)
+    {
+        let ctx = ctx.clone();
+        engine.register_fn(
+            "play_sound_at",
+            move |name: &str, x: f64, y: f64, z: f64, opts: Map| {
+                let o = SoundOpts::from_map(&opts);
+                let mut c = crate::lock_or_recover(&ctx);
+                c.commands.push(ScriptCommand::PlaySoundAt {
+                    name: name.to_string(),
+                    position: (x, y, z),
+                    volume: o.volume,
+                    pitch: o.pitch,
+                    distances: o.distances,
+                    rolloff: o.rolloff,
                 });
             },
         );
@@ -1664,6 +1748,21 @@ fn write_rotation_quat(comps: &mut flint_ecs::DynamicComponents, q: [f32; 4]) {
     );
 }
 
+/// A mesh ray's hit as scripts see it: the keys `raycast` answers with.
+fn ray_hit_dynamic(hit: Option<flint_core::ray_mesh::RayHit>) -> Dynamic {
+    let Some(hit) = hit else {
+        return Dynamic::UNIT;
+    };
+    let mut map = Map::new();
+    map.insert("entity".into(), Dynamic::from(hit.entity.raw() as i64));
+    map.insert("distance".into(), Dynamic::from(hit.distance as f64));
+    for (k, axis) in ["x", "y", "z"].iter().enumerate() {
+        map.insert(format!("point_{axis}").into(), Dynamic::from(hit.point[k] as f64));
+        map.insert(format!("normal_{axis}").into(), Dynamic::from(hit.normal[k] as f64));
+    }
+    Dynamic::from(map)
+}
+
 fn register_physics_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>) {
     // raycast(ox, oy, oz, dx, dy, dz, max_dist) -> Map or ()
     {
@@ -1932,6 +2031,17 @@ fn register_physics_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>)
             c.cursor_captured_override = Some(captured);
         });
     }
+
+    // is_cursor_captured() -> bool — whether the cursor is captured now
+    // (ADR 0110). A set_cursor_captured() request shows from the next
+    // frame; Escape, F3/F4 and a lost capture show too. While captured,
+    // mouse_x()/mouse_y() read the window centre and clicks skip egui.
+    {
+        let ctx = ctx.clone();
+        engine.register_fn("is_cursor_captured", move || -> bool {
+            crate::lock_or_recover(&ctx).cursor_captured
+        });
+    }
 }
 
 // ─── 2D Physics API ──────────────────────────────────────
@@ -2043,8 +2153,8 @@ fn register_math_api(engine: &mut Engine) {
 
     engine.register_fn("random", || -> f64 {
         // Simple pseudo-random based on time — no external crate needed
-        let t = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
+        let t = web_time::SystemTime::now()
+            .duration_since(web_time::UNIX_EPOCH)
             .unwrap_or_default()
             .subsec_nanos();
         // Simple hash to get a 0..1 value
@@ -2053,8 +2163,8 @@ fn register_math_api(engine: &mut Engine) {
     });
 
     engine.register_fn("random_range", |min: f64, max: f64| -> f64 {
-        let t = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
+        let t = web_time::SystemTime::now()
+            .duration_since(web_time::UNIX_EPOCH)
             .unwrap_or_default()
             .subsec_nanos();
         let hash = t.wrapping_mul(2654435761);
@@ -2657,22 +2767,128 @@ fn register_ui_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>) {
     {
         let ctx = ctx.clone();
         engine.register_fn("world_to_screen", move |x: f64, y: f64, z: f64| -> Map {
-            let c = crate::lock_or_recover(&ctx);
-            let clip = project_clip(&c.camera_view_proj, [x as f32, y as f32, z as f32]);
+            // The same answer `Projector` gives native code (ADR 0087).
+            let view = View::of(&crate::lock_or_recover(&ctx));
             let mut map = Map::new();
-            let visible = clip[3] > 1e-4;
-            if visible {
-                let (sx, sy) = clip_to_screen(clip, c.screen_width, c.screen_height);
-                map.insert("x".into(), Dynamic::from(sx as f64));
-                map.insert("y".into(), Dynamic::from(sy as f64));
-                map.insert("depth".into(), Dynamic::from(clip[3] as f64));
-            } else {
-                map.insert("x".into(), Dynamic::from(0.0_f64));
-                map.insert("y".into(), Dynamic::from(0.0_f64));
-                map.insert("depth".into(), Dynamic::from(clip[3] as f64));
-            }
+            let (sx, sy, depth, visible) =
+                match view.world_to_screen([x as f32, y as f32, z as f32]) {
+                    Some(p) => (p.x, p.y, p.depth, true),
+                    None => {
+                        let clip = project_clip(&view.view_proj, [x as f32, y as f32, z as f32]);
+                        (0.0, 0.0, clip[3], false)
+                    }
+                };
+            map.insert("x".into(), Dynamic::from(sx as f64));
+            map.insert("y".into(), Dynamic::from(sy as f64));
+            map.insert("depth".into(), Dynamic::from(depth as f64));
             map.insert("visible".into(), Dynamic::from(visible));
             map
+        });
+    }
+
+    // screen_to_ground(x, y, plane_y) -> [x, z] or ()
+    // The ground under a screen point: where the ray through (x, y) meets the
+    // plane y = plane_y. (x, y) is in logical points, the mouse_x()/mouse_y()
+    // space, and the camera is the one world_to_screen uses, so
+    // world_to_screen of the hit lands back on (x, y). () where the view
+    // doesn't reach the plane: sky, a level orthographic camera, or a plane
+    // behind the camera.
+    {
+        let ctx = ctx.clone();
+        engine.register_fn(
+            "screen_to_ground",
+            move |x: f64, y: f64, plane_y: f64| -> Dynamic {
+                let c = crate::lock_or_recover(&ctx);
+                match flint_core::projection::screen_to_ground(
+                    &c.camera_view_proj,
+                    x as f32,
+                    y as f32,
+                    c.screen_width,
+                    c.screen_height,
+                    plane_y as f32,
+                ) {
+                    Some([gx, gz]) => Dynamic::from_array(vec![
+                        Dynamic::from(gx as f64),
+                        Dynamic::from(gz as f64),
+                    ]),
+                    None => Dynamic::UNIT,
+                }
+            },
+        );
+    }
+
+    // screen_to_heightfield(x, y) -> [x, y, z] or ()
+    // The game's ground under a screen point (ADR 0095): where the ray
+    // through (x, y) first comes down onto the ground field the host
+    // registered with Projector::set_ground. () with no ground registered,
+    // or where the ray misses it (the sky, or past its edge); fall back to
+    // screen_to_ground there.
+    {
+        let ctx = ctx.clone();
+        engine.register_fn("screen_to_heightfield", move |x: f64, y: f64| -> Dynamic {
+            let (view, ground) = {
+                let c = crate::lock_or_recover(&ctx);
+                (crate::projector::View::of(&c), c.ground.clone())
+            };
+            match ground.and_then(|g| view.screen_to_heightfield(x as f32, y as f32, &g)) {
+                Some([gx, gy, gz]) => Dynamic::from_array(vec![
+                    Dynamic::from(gx as f64),
+                    Dynamic::from(gy as f64),
+                    Dynamic::from(gz as f64),
+                ]),
+                None => Dynamic::UNIT,
+            }
+        });
+    }
+
+    // ground_height(x, z) -> f64 or ()
+    // World y of the registered ground field at (x, z). () with none
+    // registered, or off its edge. (terrain_height reads a scene's terrain.)
+    {
+        let ctx = ctx.clone();
+        engine.register_fn("ground_height", move |x: f64, z: f64| -> Dynamic {
+            let ground = crate::lock_or_recover(&ctx).ground.clone();
+            match ground.and_then(|g| g.height_at(x as f32, z as f32)) {
+                Some(h) => Dynamic::from(h as f64),
+                None => Dynamic::UNIT,
+            }
+        });
+    }
+
+    // raycast_meshes(ox, oy, oz, dx, dy, dz, max_dist) -> Map or ()
+    // The nearest mesh drawn as a ray target (ADR 0105) that the ray from
+    // (ox, oy, oz) along (dx, dy, dz) meets within max_dist world units:
+    // #{ entity, distance, point_x/y/z, normal_x/y/z }, as `raycast` answers,
+    // with the normal facing back along the ray. () when it meets none. The
+    // meshes stand where the last frame drew them.
+    {
+        let ctx = ctx.clone();
+        engine.register_fn(
+            "raycast_meshes",
+            move |ox: f64, oy: f64, oz: f64, dx: f64, dy: f64, dz: f64, max_dist: f64| -> Dynamic {
+                let scene = crate::lock_or_recover(&ctx).ray_scene.clone();
+                let o = [ox as f32, oy as f32, oz as f32];
+                let d = [dx as f32, dy as f32, dz as f32];
+                ray_hit_dynamic(scene.cast(o, d, max_dist as f32))
+            },
+        );
+    }
+
+    // screen_to_mesh(x, y) -> Map or ()
+    // The nearest mesh drawn as a ray target under a screen point (ADR 0105),
+    // as raycast_meshes answers: picking what's drawn, a wall or a roof,
+    // rather than the ground. () where the ray meets none.
+    {
+        let ctx = ctx.clone();
+        engine.register_fn("screen_to_mesh", move |x: f64, y: f64| -> Dynamic {
+            let (view, scene) = {
+                let c = crate::lock_or_recover(&ctx);
+                (crate::projector::View::of(&c), c.ray_scene.clone())
+            };
+            ray_hit_dynamic(
+                view.screen_ray(x as f32, y as f32)
+                    .and_then(|(o, d)| scene.cast(o, d, f32::INFINITY)),
+            )
         });
     }
 
@@ -2703,6 +2919,56 @@ fn register_ui_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>) {
                     thickness as f32,
                     0,
                 );
+            },
+        );
+    }
+
+    // draw_world_line(x1, y1, z1, x2, y2, z2, r, g, b, a, thickness)
+    // World-space line drawn in the 3D frame with a depth test (ADR 0083):
+    // geometry in front hides it. Projected with the camera the frame
+    // renders with; thickness in logical points, colour as the HUD's.
+    {
+        let ctx = ctx.clone();
+        engine.register_fn(
+            "draw_world_line",
+            move |x1: f64,
+                  y1: f64,
+                  z1: f64,
+                  x2: f64,
+                  y2: f64,
+                  z2: f64,
+                  r: f64,
+                  g: f64,
+                  b: f64,
+                  a: f64,
+                  thickness: f64| {
+                let mut c = crate::lock_or_recover(&ctx);
+                c.world_lines.push(flint_core::world_line::WorldLine {
+                    a: [x1 as f32, y1 as f32, z1 as f32],
+                    b: [x2 as f32, y2 as f32, z2 as f32],
+                    color: [r as f32, g as f32, b as f32, a as f32],
+                    thickness: thickness as f32,
+                });
+            },
+        );
+    }
+
+    // draw_world_text(x, y, z, text, size, opts)
+    // Text at a world point, drawn in the 3D frame with a depth test
+    // (ADR 0104): geometry in front hides it. opts are draw_text_opts's
+    // (font, color, align, stroke, spacing, shadow; no layer), centred on
+    // the point by default, plus valign ("top"|"middle"|"bottom"), and
+    // facing ([nx, ny, nz]) with up ([x, y, z], world up by default) to lay
+    // it in a plane. A billboard's size is in points; on a plane, every
+    // length is in world units.
+    {
+        let ctx = ctx.clone();
+        engine.register_fn(
+            "draw_world_text",
+            move |x: f64, y: f64, z: f64, text: &str, size: f64, opts: Map| {
+                let t = world_text_from([x as f32, y as f32, z as f32], text, size as f32, &opts);
+                let mut c = crate::lock_or_recover(&ctx);
+                c.world_texts.push(t);
             },
         );
     }
@@ -3009,6 +3275,25 @@ fn register_ui_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>) {
         engine.register_fn("pop_clip", move || {
             let mut c = crate::lock_or_recover(&ctx);
             c.pop_clip();
+        });
+    }
+
+    // push_over_ui() / pop_over_ui()
+    // Every draw call issued between them draws above the game's egui panels
+    // and windows instead of under them (ADR 0085). Pushes nest, unbalanced
+    // pops are ignored, and the depth resets each frame.
+    {
+        let ctx = ctx.clone();
+        engine.register_fn("push_over_ui", move || {
+            let mut c = crate::lock_or_recover(&ctx);
+            c.push_over_ui();
+        });
+    }
+    {
+        let ctx = ctx.clone();
+        engine.register_fn("pop_over_ui", move || {
+            let mut c = crate::lock_or_recover(&ctx);
+            c.pop_over_ui();
         });
     }
 
@@ -3841,7 +4126,7 @@ fn load_data_impl(c: &mut ScriptCallContext, path: &str, reload: bool) -> Dynami
     if let Some(v) = c.data_cache.get(&key) {
         return toml_to_dynamic(v.clone());
     }
-    let parsed = std::fs::read_to_string(&full)
+    let parsed = vfs::read_to_string(&full)
         .map_err(|e| e.to_string())
         .and_then(|text| text.parse::<toml::Value>().map_err(|e| e.to_string()));
     match parsed {
@@ -4689,6 +4974,31 @@ pub(crate) fn array_to_f32s(arr: &Array) -> Vec<f32> {
     arr.iter().filter_map(dyn_to_f32).collect()
 }
 
+/// Parsed `play_sound_at` option map. Every key is optional: full volume,
+/// normal pitch, and the engine's falloff. Naming only one distance keeps
+/// the engine's default (1 or 25) for the other.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct SoundOpts {
+    pub volume: f64,
+    pub pitch: f64,
+    pub distances: Option<(f32, f32)>,
+    pub rolloff: Option<f32>,
+}
+
+impl SoundOpts {
+    pub(crate) fn from_map(opts: &Map) -> Self {
+        let get = |k: &str| opts.get(k).and_then(dyn_to_f32);
+        let (min, max) = (get("min_distance"), get("max_distance"));
+        Self {
+            volume: get("volume").map_or(1.0, f64::from),
+            pitch: get("pitch").map_or(1.0, f64::from),
+            distances: (min.is_some() || max.is_some())
+                .then(|| (min.unwrap_or(1.0), max.unwrap_or(25.0))),
+            rolloff: get("rolloff"),
+        }
+    }
+}
+
 /// Parsed `draw_text_opts` option map. Every key is optional; defaults are
 /// white, left-aligned, layer 0, no stroke/shadow, default font.
 #[derive(Debug, Clone, PartialEq)]
@@ -4769,6 +5079,56 @@ impl TextOpts {
             }
         }
         o
+    }
+}
+
+/// A `draw_world_text` call as the host draws it: `draw_text_opts`'s
+/// options, centred and middled on the point unless `align` or `valign`
+/// say otherwise, and on a plane when `facing` is a usable normal.
+pub(crate) fn world_text_from(
+    at: [f32; 3],
+    text: &str,
+    size: f32,
+    opts: &Map,
+) -> flint_core::world_text::WorldText {
+    let o = TextOpts::from_map(opts);
+    let align = if opts.contains_key("align") { o.align } else { 1 };
+    let valign = match opts.get("valign") {
+        Some(v) => match v.clone().try_cast::<ImmutableString>() {
+            Some(s) => match s.as_str() {
+                "top" => 0,
+                "bottom" => 2,
+                _ => 1,
+            },
+            None => dyn_to_f32(v).map_or(1, |i| (i as i64).clamp(0, 2) as u8),
+        },
+        None => 1,
+    };
+    let vec3 = |key: &str| -> Option<[f32; 3]> {
+        let arr = opts.get(key)?.clone().try_cast::<Array>()?;
+        match array_to_f32s(&arr)[..] {
+            [x, y, z] => Some([x, y, z]),
+            _ => None,
+        }
+    };
+    let plane = vec3("facing")
+        .filter(|n| n.iter().any(|c| *c != 0.0))
+        .map(|normal| flint_core::world_text::TextPlane {
+            normal,
+            up: vec3("up").unwrap_or([0.0, 1.0, 0.0]),
+        });
+    flint_core::world_text::WorldText {
+        at,
+        text: text.to_string(),
+        size,
+        color: o.color,
+        align,
+        valign,
+        stroke: o.stroke,
+        font: o.font,
+        spacing: o.spacing,
+        shadow: o.shadow,
+        plane,
     }
 }
 
@@ -4864,6 +5224,52 @@ mod text_opts_tests {
         assert_eq!(o.color, [1.0, 1.0, 1.0, 1.0]);
         assert_eq!(o.align, 2);
         assert_eq!(o.stroke, None);
+    }
+
+    #[test]
+    fn world_text_is_a_centred_billboard_by_default() {
+        let t = world_text_from([1.0, 2.0, 3.0], "Ada's", 14.0, &Map::new());
+        assert_eq!(t.at, [1.0, 2.0, 3.0]);
+        assert_eq!(t.text, "Ada's");
+        assert_eq!((t.align, t.valign), (1, 1));
+        assert_eq!(t.color, [1.0, 1.0, 1.0, 1.0]);
+        assert_eq!(t.plane, None);
+    }
+
+    #[test]
+    fn world_text_takes_the_text_opts_and_a_plane() {
+        let mut m = Map::new();
+        m.insert("font".into(), Dynamic::from("display"));
+        m.insert("align".into(), Dynamic::from("left"));
+        m.insert("valign".into(), Dynamic::from("bottom"));
+        m.insert(
+            "facing".into(),
+            arr(&[Dynamic::from(0_i64), Dynamic::from(0_i64), Dynamic::from(-1.0_f64)]),
+        );
+        let t = world_text_from([0.0; 3], "x", 0.2, &m);
+        assert_eq!(t.font.as_deref(), Some("display"));
+        assert_eq!((t.align, t.valign), (0, 2));
+        let plane = t.plane.unwrap();
+        assert_eq!(plane.normal, [0.0, 0.0, -1.0]);
+        assert_eq!(plane.up, [0.0, 1.0, 0.0]);
+
+        m.insert(
+            "up".into(),
+            arr(&[Dynamic::from(1_i64), Dynamic::from(0_i64), Dynamic::from(0_i64)]),
+        );
+        assert_eq!(world_text_from([0.0; 3], "x", 0.2, &m).plane.unwrap().up, [1.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn world_text_without_a_usable_normal_is_a_billboard() {
+        let mut m = Map::new();
+        m.insert(
+            "facing".into(),
+            arr(&[Dynamic::from(0_i64), Dynamic::from(0_i64), Dynamic::from(0_i64)]),
+        );
+        assert_eq!(world_text_from([0.0; 3], "x", 9.0, &m).plane, None);
+        m.insert("facing".into(), arr(&[Dynamic::from(1_i64)]));
+        assert_eq!(world_text_from([0.0; 3], "x", 9.0, &m).plane, None);
     }
 
     #[test]
@@ -5102,19 +5508,3 @@ fn push_line_3d(
     });
 }
 
-/// World point → clip space with a column-major view-projection (m[col][row]).
-fn project_clip(m: &[[f32; 4]; 4], p: [f32; 3]) -> [f32; 4] {
-    let mut out = [0.0f32; 4];
-    for (row, o) in out.iter_mut().enumerate() {
-        *o = m[0][row] * p[0] + m[1][row] * p[1] + m[2][row] * p[2] + m[3][row];
-    }
-    out
-}
-
-/// Clip space → HUD pixels (origin top-left, y down).
-fn clip_to_screen(clip: [f32; 4], w: f32, h: f32) -> (f32, f32) {
-    let inv_w = 1.0 / clip[3];
-    let nx = clip[0] * inv_w;
-    let ny = clip[1] * inv_w;
-    ((nx * 0.5 + 0.5) * w, (1.0 - (ny * 0.5 + 0.5)) * h)
-}

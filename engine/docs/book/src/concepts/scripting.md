@@ -50,6 +50,7 @@ Scripts define behavior through callback functions. The engine detects which cal
 | `on_scene_enter` / `on_scene_exit` | `fn on_scene_enter()` | Around scene transitions (see [Scene Transition API](#scene-transition-api)) |
 | `on_sequence_cue` | `fn on_sequence_cue(sequence, cue)` | An animation sequence passed a `cue` event (see [Animation](animation.md#sequences)) |
 | `on_animation_end` | `fn on_animation_end(clip)` | A `once` sprite clip finished (see [2D Sprites](sprites-2d.md)) |
+| `on_event` | `fn on_event(name, data)` | A custom game event fired by a script, the engine or a player extension (see [Event API](#event-api)) |
 
 The `on_interact` callback is sugar for the common pattern of proximity-based interaction. It automatically checks the entity's `interactable` component for `range` (default 3.0) and `enabled` (default true) before firing.
 
@@ -99,11 +100,12 @@ All functions are available globally in every script. Entity IDs are passed as `
 | `action_value(action)` | `f64` | Analog value for Axis1d actions (0.0 if not bound) |
 | `mouse_delta_x()` | `f64` | Horizontal mouse movement this frame |
 | `mouse_delta_y()` | `f64` | Vertical mouse movement this frame |
+| `mouse_wheel_x()` / `mouse_wheel_y()` | `f64` | Wheel lines (notches) this frame; up and right are positive. A touchpad's scroll arrives as fractions, 50 px to a line. Zero while the cursor is over egui |
 | `mouse_x()` / `mouse_y()` | `f64` | Cursor position in logical points (the `screen_width()` / `draw_*` space) |
 | `is_mouse_pressed(button)` | `bool` | Mouse button held: `0` left, `1` right, `2` middle |
 | `is_mouse_just_pressed(button)` | `bool` | Mouse button went down this frame |
 
-`mouse_x()` / `mouse_y()` and the button queries are what menus and other screen-space UI hit-test against; they are always fed, whether or not the cursor is captured. In scenes with a player character the first left click also captures the cursor for mouse-look (it still registers as a press).
+`mouse_x()` / `mouse_y()` and the button queries are what menus and other screen-space UI hit-test against. The buttons are always fed, whether or not the cursor is captured. While it's captured, `mouse_x()` / `mouse_y()` read the window centre, and clicks skip egui ([Cursor Capture and Input Gates](input-gates.md)). In scenes with a player character the first left click also captures the cursor for mouse-look (it still registers as a press).
 
 Action names are defined by input configuration files and are fully customizable per game. The built-in defaults include: `move_forward`, `move_backward`, `move_left`, `move_right`, `jump`, `interact`, `sprint`, `weapon_1`, `weapon_2`, `reload`, `fire`. Games can define arbitrary custom actions in their input config TOML files and query them from scripts with `is_action_pressed("custom_action")`.
 
@@ -124,8 +126,10 @@ Audio functions produce deferred commands that the player processes after the sc
 |----------|-------------|
 | `play_sound(name)` | Play a non-spatial sound at default volume |
 | `play_sound(name, volume)` | Play a non-spatial sound at the given volume (0.0--1.0) |
+| `play_sound(name, volume, pitch)` | As above, with a pitch multiplier |
 | `play_sound_at(name, x, y, z, volume)` | Play a spatial sound at a 3D position |
 | `play_sound_at(name, x, y, z, volume, pitch)` | As above, with a pitch multiplier |
+| `play_sound_at(name, x, y, z, opts)` | A spatial sound with a map of options, each optional: `volume` (1), `pitch` (1), `min_distance` (1), `max_distance` (25), `rolloff` (2) |
 | `stop_sound(name)` | Stop a playing sound |
 
 Sound names match the audio files loaded from the `audio/` directory (without extension). A one-shot naming a file that is not there fails silently — it logs a warning and plays nothing.
@@ -133,9 +137,10 @@ Sound names match the audio files loaded from the `audio/` directory (without ex
 Varying `pitch` slightly per trigger (say 0.9–1.1) is the cheapest way to stop a
 repeated one-shot sounding like a repeated one-shot.
 
-Spatial one-shot tracks attenuate to silence at 25 m. An event further away
-than that must use non-spatial `play_sound` with a hand-scaled volume, or it
-will simply not be heard.
+By default a spatial one-shot fades to silence at 25 m. A sound meant to be
+heard further away sets `max_distance` in the options map, and usually a
+`rolloff` below 1 so it fades like a sound in the open. See
+[Audio: Scripting](audio.md#scripting-integration).
 
 ### Animation API
 
@@ -223,10 +228,11 @@ A handful of probes per frame is cheap. Thousands are not.
 
 | Function | Returns | Description |
 |----------|---------|-------------|
-| `any_input_just_pressed()` | `bool` | True on the frame any key, mouse button, or gamepad button was pressed |
+| `any_input_just_pressed()` | `bool` | True on the frame any key, mouse button, or gamepad button was pressed, or a finger landed |
 | `last_input_device()` | `String` | `"keyboard"`, `"mouse"`, `"gamepad"` or `"touch"`: the device of the most recent deliberate input |
 | `gamepad_connected()` | `bool` | True while at least one gamepad is attached |
-| `set_cursor_captured(captured)` | | Capture (hide + lock) or release the mouse cursor |
+| `set_cursor_captured(captured)` | | Capture (hide + lock) or release the mouse cursor, at the end of this frame |
+| `is_cursor_captured()` | `bool` | Whether the cursor is captured now ([Cursor Capture and Input Gates](input-gates.md)) |
 
 `any_input_just_pressed` reads **raw** presses and bypasses action maps
 entirely — it is for "press any key to continue", where the whole point is that
@@ -250,6 +256,34 @@ scenes that have one, so a fixed-camera or custom-camera scene must ask.
 |----------|-------------|
 | `fire_event(name)` | Fire a named game event |
 | `fire_event_data(name, data)` | Fire an event with a data map payload |
+
+A fired event is broadcast. Every script that defines `on_event(name, data)`
+receives it, including the script that fired it, in entity-id order. `data` is
+always a map: `fire_event` sends an empty one. The payload travels as TOML, so
+map values must be booleans, integers, floats, strings, arrays or maps; `()`
+and other types are dropped. Audio triggers hear the same events.
+
+```rhai
+fn on_event(name, data) {
+    if name == "door_opened" {
+        log(`door ${data.id} opened`);
+    }
+}
+```
+
+**Timing.** Script commands run after `on_update`, so an event a script fires
+reaches `on_event` at the start of the next frame, before that frame's
+`on_update`. Events from the host arrive the same frame:
+
+- **Player extensions** call `ExtensionCtx::fire_event(name, data)` in
+  `pre_update`. `data` is anything that converts into a `toml::Value`, usually
+  a `toml::Table`. Scripts see it before this frame's `on_update`.
+- **Engine code** pushes a `GameEvent::Custom { name, data }` onto the physics
+  event queue, which hands it to scripts with the next batch of collisions
+  and input actions.
+
+A payload that isn't a table arrives as `#{ value: data }`. Events are dropped
+while the game state pauses scripts, as input actions are.
 
 ### Log API
 
@@ -289,6 +323,22 @@ The `raycast()` function automatically excludes the calling entity's collider fr
 | `distance` | `f64` | Distance from origin to hit point |
 | `point_x`, `point_y`, `point_z` | `f64` | World-space hit position |
 | `normal_x`, `normal_y`, `normal_z` | `f64` | Surface normal at hit point |
+
+`raycast()` meets physics colliders. To meet what's drawn, the runtime meshes a host uploaded as ray targets (see [Rendering: Runtime meshes](rendering.md#runtime-meshes)), use `raycast_meshes` and `screen_to_mesh` (ADR 0105). They need no physics, meet the drawn triangles from either side, and answer with the same fields as `raycast()`, the normal turned back toward the ray's origin:
+
+| Function | Returns | Description |
+|----------|---------|-------------|
+| `raycast_meshes(ox, oy, oz, dx, dy, dz, max_dist)` | `Map` or `()` | The nearest ray target the ray meets within `max_dist` world units. `(dx, dy, dz)` needn't be unit length; `distance` is in world units |
+| `screen_to_mesh(x, y)` | `Map` or `()` | The nearest ray target under a screen point (e.g. the cursor), for picking a wall or a roof |
+
+They meet the targets where the last frame drew them. A camera rig that keeps out of walls casts from the player's head toward where it wants to stand, and comes in to the hit:
+
+```rust
+let d = [cx - hx, cy - hy, cz - hz];
+let len = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+let hit = raycast_meshes(hx, hy, hz, d[0], d[1], d[2], len);
+let clear = if hit == () { 1.0 } else { hit.distance / len };   // the share of the way that's open
+```
 
 **`move_character`** performs collision-corrected kinematic movement using Rapier's shape-sweep. The entity must have `rigidbody` and `collider` components. The returned map contains the corrected position and a `grounded` flag:
 
@@ -541,6 +591,10 @@ write immediately --- call it after a settings screen commits, so a crash a
 moment later loses nothing. The `save/` directory is created on demand; add it
 to the game's `.gitignore`. Loads and saves log at `info`, failures at `warn`.
 
+A game's Rust code shares the same store: a player extension reaches it as
+`ExtensionCtx::persist` (see [Player Extensions](../guides/player-extensions.md#saved-data)),
+and its writes are saved the same way.
+
 ### Data Files API
 
 Read-only game data tables (trick dictionaries, item stats, tuning) kept as
@@ -618,6 +672,8 @@ The draw API lets scripts render 2D overlays each frame via the `on_draw_ui()` c
 | `draw_line_ex(x1, y1, x2, y2, r, g, b, a, thickness, layer)` | Line segment with explicit layer |
 | `draw_line_3d(x1, y1, z1, x2, y2, z2, r, g, b, a, thickness)` | World-space line projected with the frame's camera (near-plane clipped) |
 | `draw_line_3d_ex(x1, y1, z1, x2, y2, z2, r, g, b, a, thickness, layer)` | Same, with explicit layer |
+| `draw_world_line(x1, y1, z1, x2, y2, z2, r, g, b, a, thickness)` | World-space line drawn in the 3D frame with a depth test: geometry in front of it hides it (see below) |
+| `draw_world_text(x, y, z, text, size, opts)` | Text at a world point, drawn with a depth test: a billboard, or painted on a plane (see below) |
 | `draw_ring(cx, cy, r_inner, r_outer, start_deg, end_deg, r, g, b, a, layer)` | Annular sector (`r_inner` = 0 gives a pie slice); see angle convention below |
 | `draw_arc(cx, cy, radius, start_deg, end_deg, r, g, b, a, thickness, layer)` | Stroked arc: a ring centred on `radius`, `thickness` wide |
 | `draw_polygon(points, r, g, b, a, layer)` | Convex filled polygon; `points` is `[[x, y], ...]` or a flat `[x0, y0, x1, y1, ...]` list (ints or floats) |
@@ -634,8 +690,74 @@ The draw API lets scripts render 2D overlays each frame via the `on_draw_ui()` c
 | `measure_text(text, size)` | `Map` | Laid-out size of `text` in the default font as `#{width, height}` |
 | `measure_text_ex(text, size, font, spacing)` | `Map` | Same, for a named font family and extra letter spacing (`""` = default font) |
 | `find_nearest_interactable()` | `Map` or `()` | Nearest interactable entity info, or `()` if none in range |
+| `world_to_screen(x, y, z)` | `Map` | A world point in logical points as `#{x, y, depth, visible}`; `visible` is false behind the camera |
+| `screen_to_ground(x, y, plane_y)` | `[x, z]` or `()` | The point on the plane `y = plane_y` under a screen point, or `()` where the view doesn't reach it |
+| `screen_to_mesh(x, y)` | `Map` or `()` | The drawn ray target under a screen point, as `raycast_meshes` answers (see [Physics API](#physics-api)) |
+| `screen_to_heightfield(x, y)` | `[x, y, z]` or `()` | The game's ground under a screen point, where the ray first comes down onto the ground field the host registered, or `()` with none registered or where the ray misses it |
+| `ground_height(x, z)` | `f64` or `()` | World y of the registered ground field at (x, z), or `()` with none registered or off its edge |
+
+#### Lines in the world
+
+`draw_line_3d` projects onto the HUD, so it shows in front of everything, including the model a ring is drawn round. `draw_world_line` draws in the 3D frame instead. It goes over the finished image, before the HUD, and it's hidden wherever the scene's depth is nearer. A ring on the ground round a statue therefore passes behind the statue's far side. The arguments and units are `draw_line_3d`'s: world coordinates, a display-space colour, and a width in logical points. The edges are anti-aliased. World lines don't write depth, so they never hide each other. Fog, bloom and tonemapping don't touch them. They're projected with the camera the frame renders with, from `on_update` or `on_draw_ui` alike. There is no layer, and there is no clip rect.
+
+Each end is pulled toward the camera by 0.2% of its distance, so a line laid exactly on a surface doesn't flicker against it. A line meant to lie on a raised surface, such as a road or a pavement, should still be drawn at or just above that surface. Draw a ring as a polyline:
+
+```rust
+fn ring(cx, cz, y, r, steps) {
+    for i in 0..steps {
+        let a0 = i.to_float() / steps.to_float() * 2.0 * PI();
+        let a1 = (i + 1).to_float() / steps.to_float() * 2.0 * PI();
+        draw_world_line(cx + r * a0.cos(), y, cz + r * a0.sin(),
+                        cx + r * a1.cos(), y, cz + r * a1.sin(),
+                        1.0, 0.8, 0.2, 0.7, 2.0);
+    }
+}
+```
+
+Rust hosts can set the same lines on the renderer directly with `SceneRenderer::set_world_lines(lines, pixels_per_point)`.
+
+#### Text in the world
+
+`draw_text_opts` at a `world_to_screen` point floats over everything, so a name on a sign shows through the roof in front of it. `draw_world_text(x, y, z, text, size, opts)` writes text in the world instead. Like a world line, it's drawn over the finished image, before the HUD, and hidden wherever the scene's depth is nearer, glyph by glyph: a name half behind a post is half drawn. It doesn't write depth, and fog, bloom and tonemapping don't touch it. It's laid out in the HUD's fonts and colours, so it looks like the same text drawn with `draw_text_opts`.
+
+`opts` takes `draw_text_opts`'s keys: `font`, `color`, `align`, `stroke`, `spacing` and `shadow`. There's no `layer`, and no clip rect. The text is centred on the point unless `align` (`"left"`, `"center"`, `"right"`) or `valign` (`"top"`, `"middle"`, `"bottom"`) say otherwise.
+
+Without `facing`, the text is a billboard: it faces the screen at `size` logical points wherever the point is, like a name tag, and takes the point's depth. With `facing: [nx, ny, nz]` it lies in the plane through the point with that normal, as if painted there, and reads from that side. It isn't drawn from behind, so paint a two-sided sign twice, once on each face. `up` (default `[0, 1, 0]`) says which way the letters stand; only its part across the plane counts. On a plane every length is in world units: `size` is the em, and `spacing`, the stroke's width and the shadow's offset are world units too. The letters are rasterised at the size the em spans on screen, in whole pixels from 4 to 128, so they stay sharp as the camera comes close.
+
+```rust
+// A shop's name on both faces of its sign, fitted to a 0.5 m board.
+fn sign(x, y, z, fx, fz, name) {
+    let m = measure_text_ex(name, 20.0, "display", 0.0);
+    let size = (0.5 * 20.0 / m.width).min(0.13);
+    for side in [1.0, -1.0] {
+        draw_world_text(x + fx * side * 0.03, y, z + fz * side * 0.03, name, size,
+            #{ font: "display", color: [0.98, 0.93, 0.80, 1.0], facing: [fx * side, 0.0, fz * side] });
+    }
+}
+```
+
+The point is pulled toward the camera by the world lines' 0.2% (`DEPTH_SLACK`), so text painted on a surface doesn't fight it. A plane's text that reaches behind the camera isn't drawn at all, and nor is any text whose point is behind it or past the far plane. Scripts decide when text is too small to read: there's no minimum size.
 
 `find_nearest_interactable()` returns a map with `entity` (ID), `prompt_text`, `interaction_type`, and `distance` fields when an interactable entity is within range.
+
+`world_to_screen` and `screen_to_ground` are inverses. In `on_draw_ui` they use the camera the frame renders with; in `on_update`, which runs before script camera overrides apply, they use the previous frame's. `world_to_screen` of a ground hit lands back on the screen point it came from. Native functions a game registers get the same answers from `Projector` (see [Player extensions](../guides/player-extensions.md#projecting-from-native-functions)). `screen_to_ground` takes logical points, the `mouse_x()` / `mouse_y()` space, so it is correct at any display scale. It works for perspective and orthographic cameras, including one looking straight down. It returns `()` over the sky, when an orthographic camera looks level, or when the plane is behind the camera. Picking the ground under the cursor:
+
+```rhai
+let g = screen_to_ground(mouse_x(), mouse_y(), 0.0);
+if g != () && is_mouse_just_pressed(0) {
+    set_position(marker, g[0], 0.0, g[1]);   // exactly under the cursor
+}
+```
+
+On ground that isn't flat, a plane cuts the view at the wrong height: on a hill, the click lands past or short of the spot under the cursor. A game that registers its ground with `Projector::set_ground` (see [Player extensions](../guides/player-extensions.md#picking-a-ground-that-isnt-flat)) gets `screen_to_heightfield(x, y)`, the first point where the ray through the screen point comes down onto that ground, as `[x, y, z]`, and `ground_height(x, z)`. Both return `()` where there's no answer, so fall back to the plane there:
+
+```rhai
+let g = screen_to_heightfield(mouse_x(), mouse_y());
+if g == () {
+    let p = screen_to_ground(mouse_x(), mouse_y(), 0.0);
+    if p != () { g = [p[0], 0.0, p[1]]; }
+}
+```
 
 Both `measure_text` calls lay the string out with the same font stack the HUD draws with, so a measured width can be used to centre or right-pad text exactly. (Before the first frame has rendered they return a glyph-count estimate.)
 
@@ -665,7 +787,15 @@ name = "display"                      # use as font = "display"
 file = "BarlowCondensed-BlackItalic.ttf"
 ```
 
-The player logs the loaded families at startup (`RUST_LOG=info`). Text without a `font` — and the data-driven UI's default — uses egui's built-in proportional font, exactly as before.
+Each named family keeps egui's built-in fonts behind it, for glyphs the file lacks. The player logs the loaded families at startup (`RUST_LOG=info`). Text without a `font` — and the data-driven UI's default — uses egui's built-in proportional font, unless the manifest names another (ADR 0081):
+
+```toml
+[egui]
+proportional = "body"                 # a file stem or an alias
+monospace = "code"
+```
+
+That face then leads egui's default family, for the script HUD's unnamed text and for a game's own egui panels alike ([Player Extensions](../guides/player-extensions.md#fonts)).
 
 #### Rings and Arcs
 
@@ -686,6 +816,21 @@ for i in 0..items.len() {
     draw_text(list_x, list_y + i * 24.0 - scroll, items[i], 18.0, 1.0, 1.0, 1.0, 1.0);
 }
 pop_clip();
+```
+
+#### Over the UI
+
+| Function | Description |
+|----------|-------------|
+| `push_over_ui()` | Draw every following call above the game's egui panels and windows |
+| `pop_over_ui()` | Go back to drawing under them |
+
+The script HUD normally draws under a game's own egui ([Player Extensions](../guides/player-extensions.md)), so a panel covers any HUD drawing behind it. Calls issued between `push_over_ui()` and `pop_over_ui()` go on a layer of their own, painted after every egui panel and window but before popups, debug panels and tooltips. Among themselves they still sort by `layer`, and each can be clipped. Pushes nest, unbalanced pops are ignored, and the depth is reset every frame. Use it for short-lived effects that have to reach the UI, such as an item flying into an inventory button, and keep everything else under it, so the HUD never covers what a panel says:
+
+```rhai
+push_over_ui();
+draw_circle(pip_x, pip_y, 5.0, 0.79, 0.64, 0.15, 1.0);  // lands on the button
+pop_over_ui();
 ```
 
 #### Shared Modules (`scripts/lib`)

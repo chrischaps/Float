@@ -188,6 +188,30 @@ impl SceneRenderer {
         self.debug_overlay_draws.clear();
     }
 
+    /// Depth-tested world lines for the frames that follow, until replaced
+    /// (ADR 0083). They're projected with each frame's own camera and drawn
+    /// over the finished image, hidden behind nearer geometry. Widths are in
+    /// logical points; `px_per_point` converts them to the target's pixels.
+    /// Pass an empty `Vec` to clear them.
+    pub fn set_world_lines(
+        &mut self,
+        lines: Vec<flint_core::world_line::WorldLine>,
+        px_per_point: f32,
+    ) {
+        self.world_lines = lines;
+        self.world_line_px_per_point = px_per_point;
+    }
+
+    /// Whether, once `render` returns, the context's depth view holds the
+    /// frame's scene depth, single sample, for overlays drawn against it
+    /// such as world text (ADR 0104). It doesn't with MSAA and no HDR
+    /// chain, where the multisampled depth is never resolved.
+    pub fn frame_depth_ready(&self) -> bool {
+        let has_postprocess =
+            self.postprocess_pipeline.is_some() && self.postprocess_resources.is_some();
+        !self.device_lost && (has_postprocess || self.sample_count == 1)
+    }
+
     /// Background colour of the main pass (linear RGBA). Editors use this
     /// to review alpha-blended effects against light and dark backdrops.
     pub fn set_clear_color(&mut self, rgba: [f32; 4]) {
@@ -214,7 +238,7 @@ pub fn load_particle_textures(
         let mut found = false;
         for dir in search_dirs {
             let path = dir.join(&tex_name);
-            if path.exists() {
+            if flint_core::vfs::exists(&path) {
                 match renderer.load_texture_file(device, queue, &tex_name, &path) {
                     Ok(true) => {
                         println!("Loaded particle texture: {tex_name}");

@@ -7,7 +7,10 @@ use super::SceneRenderer;
 use crate::billboard_pipeline::BillboardUniforms;
 use crate::camera::{mat4_inverse, mat4_mul, Camera};
 use crate::debug::DebugMode;
-use crate::grass_pipeline::{GrassComputeUniforms, GrassRenderUniforms, BLADE_INDEX_COUNT};
+use crate::grass_pipeline::{
+    grass_cull_padding, grass_cull_planes, grass_dispatch_window, GrassComputeUniforms,
+    GrassDrawArgs, GrassRenderUniforms,
+};
 use crate::particle_pipeline::ParticleUniforms;
 use crate::pipeline::TransformUniforms;
 use crate::shadow::{ShadowDrawUniforms, CASCADE_COUNT, SHADOW_DRAW_STRIDE};
@@ -36,6 +39,7 @@ impl RenderPhase {
 
 impl SceneRenderer {
     /// Render depth from light perspective for cascaded shadow mapping.
+    #[profiling::function]
     pub(super) fn render_shadow_pass(
         &mut self,
         device: &wgpu::Device,
@@ -90,7 +94,11 @@ impl SceneRenderer {
                 light_view_proj: cascade_vp,
                 model,
             };
-            for draw in self.entity_draws.iter().filter(|d| !d.is_wireframe) {
+            // `casts_shadow` is the entity's `material.cast_shadows` (ADR 0100)
+            let casts = |d: &&super::DrawCall| {
+                d.casts_shadow && !d.is_wireframe && super::draw_visible(d, &cascade_frustum)
+            };
+            for draw in self.entity_draws.iter().filter(casts) {
                 draw_uniforms.push(slot(draw.model));
             }
             for draw in &self.terrain_draws {
@@ -98,10 +106,10 @@ impl SceneRenderer {
                     draw_uniforms.push(slot(draw.model));
                 }
             }
-            for draw in self.transparent_draws.iter().filter(|d| !d.is_wireframe) {
+            for draw in self.transparent_draws.iter().filter(casts) {
                 draw_uniforms.push(slot(draw.model));
             }
-            for draw in &self.skinned_entity_draws {
+            for draw in self.skinned_entity_draws.iter().filter(|d| d.casts_shadow) {
                 draw_uniforms.push(slot(draw.model));
             }
         }
@@ -139,10 +147,16 @@ impl SceneRenderer {
                 });
 
                 pass.set_pipeline(&shadow_pass.shadow_pipeline);
+                // Same per-cascade test as the uniform gather above, so the
+                // slots line up.
+                let cascade_frustum = crate::frustum::Frustum::from_view_projection(&cascade_vp);
+                let casts = |d: &super::DrawCall| {
+                    d.casts_shadow && !d.is_wireframe && super::draw_visible(d, &cascade_frustum)
+                };
 
                 // Render each solid entity
                 for draw in &self.entity_draws {
-                    if draw.is_wireframe {
+                    if !casts(draw) {
                         continue;
                     }
                     bind_next(&mut pass, &mut next_slot);
@@ -152,7 +166,6 @@ impl SceneRenderer {
                 }
 
                 // Render terrain chunks into shadow map (frustum cull per cascade)
-                let cascade_frustum = crate::frustum::Frustum::from_view_projection(&cascade_vp);
                 for draw in &self.terrain_draws {
                     if !cascade_frustum.aabb_visible(draw.aabb_min, draw.aabb_max) {
                         continue;
@@ -165,12 +178,13 @@ impl SceneRenderer {
 
                 // Render grass into shadow cascade (nearest 2 only)
                 if cascade < 2 {
-                    if let (Some(gp), Some(render_bg), Some(instance_bg)) = (
+                    if let (Some(gp), Some(render_bg), Some(instance_bg), Some(args)) = (
                         &self.grass_pipeline,
                         &self.grass_render_uniform_bind_group,
                         &self.grass_render_instance_bind_group,
+                        &self.grass_draw_args_buffer,
                     ) {
-                        if self.grass_instance_count > 0 {
+                        if self.grass_drawing {
                             // Grass shadow pipeline uses TransformUniforms (same layout as PBR)
                             let grass_shadow_uniforms = TransformUniforms {
                                 view_proj: cascade_vp,
@@ -205,18 +219,18 @@ impl SceneRenderer {
                                 gp.blade_index_buffer.slice(..),
                                 wgpu::IndexFormat::Uint16,
                             );
-                            pass.draw_indexed(
-                                0..BLADE_INDEX_COUNT,
-                                0,
-                                0..self.grass_instance_count,
-                            );
+                            // The count is the compute pass's (ADR 0092)
+                            pass.draw_indexed_indirect(args, 0);
+                            // Back to the depth pipeline for the transparent
+                            // casters, which bind the shared dynamic-offset group
+                            pass.set_pipeline(&shadow_pass.shadow_pipeline);
                         }
                     }
                 }
 
-                // Render transparent entities into shadow map (skip very transparent)
+                // Render transparent entities into shadow map
                 for draw in &self.transparent_draws {
-                    if draw.is_wireframe {
+                    if !casts(draw) {
                         continue;
                     }
                     bind_next(&mut pass, &mut next_slot);
@@ -228,9 +242,9 @@ impl SceneRenderer {
                 // Render skinned entities into shadow map
                 pass.set_pipeline(&shadow_pass.skinned_shadow_pipeline);
 
-                for draw in &self.skinned_entity_draws {
+                for draw in self.skinned_entity_draws.iter().filter(|d| d.casts_shadow) {
                     bind_next(&mut pass, &mut next_slot);
-                    pass.set_bind_group(1, &draw.bone_bind_group, &[]);
+                    pass.set_bind_group(1, &*draw.bone_bind_group, &[]);
                     pass.set_vertex_buffer(0, draw.vertex_buffer.slice(..));
                     pass.set_index_buffer(draw.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                     pass.draw_indexed(0..draw.index_count, 0, 0..1);
@@ -263,7 +277,11 @@ impl SceneRenderer {
             queue.write_buffer(&grid.transform_buffer, 0, bytemuck::cast_slice(&[uniforms]));
         }
 
-        // Update entity transforms and write debug_mode + tonemapping into each material buffer
+        // Update entity transforms and write debug_mode + tonemapping into each material buffer.
+        // Draws of the same look share a material buffer (`SharedMaterial`), so
+        // each buffer's flags are written once.
+        let mut flagged: std::collections::HashSet<*const wgpu::Buffer> =
+            std::collections::HashSet::new();
         for draw in &self.entity_draws {
             let uniforms = TransformUniforms {
                 view_proj,
@@ -274,21 +292,23 @@ impl SceneRenderer {
             };
             queue.write_buffer(&draw.transform_buffer, 0, bytemuck::cast_slice(&[uniforms]));
 
-            // Write debug_mode at byte offset 28 in the material buffer
-            // Layout: base_color(16) + metallic(4) + roughness(4) + use_vertex_color(4) = 28
-            queue.write_buffer(
-                &draw.material_buffer,
-                28,
-                bytemuck::cast_slice(&[debug_mode_u32]),
-            );
+            if flagged.insert(std::ptr::from_ref::<wgpu::Buffer>(&draw.material_buffer)) {
+                // Write debug_mode at byte offset 28 in the material buffer
+                // Layout: base_color(16) + metallic(4) + roughness(4) + use_vertex_color(4) = 28
+                queue.write_buffer(
+                    &draw.material_buffer,
+                    28,
+                    bytemuck::cast_slice(&[debug_mode_u32]),
+                );
 
-            // Write enable_tonemapping at byte offset 32
-            // Layout: ... + debug_mode(4) = 32
-            queue.write_buffer(
-                &draw.material_buffer,
-                32,
-                bytemuck::cast_slice(&[tonemapping_u32]),
-            );
+                // Write enable_tonemapping at byte offset 32
+                // Layout: ... + debug_mode(4) = 32
+                queue.write_buffer(
+                    &draw.material_buffer,
+                    32,
+                    bytemuck::cast_slice(&[tonemapping_u32]),
+                );
+            }
         }
 
         // Update skinned entity transforms
@@ -302,16 +322,18 @@ impl SceneRenderer {
             };
             queue.write_buffer(&draw.transform_buffer, 0, bytemuck::cast_slice(&[uniforms]));
 
-            queue.write_buffer(
-                &draw.material_buffer,
-                28,
-                bytemuck::cast_slice(&[debug_mode_u32]),
-            );
-            queue.write_buffer(
-                &draw.material_buffer,
-                32,
-                bytemuck::cast_slice(&[tonemapping_u32]),
-            );
+            if flagged.insert(std::ptr::from_ref::<wgpu::Buffer>(&draw.material_buffer)) {
+                queue.write_buffer(
+                    &draw.material_buffer,
+                    28,
+                    bytemuck::cast_slice(&[debug_mode_u32]),
+                );
+                queue.write_buffer(
+                    &draw.material_buffer,
+                    32,
+                    bytemuck::cast_slice(&[tonemapping_u32]),
+                );
+            }
         }
 
         // Update transparent entity transforms
@@ -325,16 +347,18 @@ impl SceneRenderer {
             };
             queue.write_buffer(&draw.transform_buffer, 0, bytemuck::cast_slice(&[uniforms]));
 
-            queue.write_buffer(
-                &draw.material_buffer,
-                28,
-                bytemuck::cast_slice(&[debug_mode_u32]),
-            );
-            queue.write_buffer(
-                &draw.material_buffer,
-                32,
-                bytemuck::cast_slice(&[tonemapping_u32]),
-            );
+            if flagged.insert(std::ptr::from_ref::<wgpu::Buffer>(&draw.material_buffer)) {
+                queue.write_buffer(
+                    &draw.material_buffer,
+                    28,
+                    bytemuck::cast_slice(&[debug_mode_u32]),
+                );
+                queue.write_buffer(
+                    &draw.material_buffer,
+                    32,
+                    bytemuck::cast_slice(&[tonemapping_u32]),
+                );
+            }
         }
 
         // Update transparent skinned entity transforms
@@ -348,16 +372,18 @@ impl SceneRenderer {
             };
             queue.write_buffer(&draw.transform_buffer, 0, bytemuck::cast_slice(&[uniforms]));
 
-            queue.write_buffer(
-                &draw.material_buffer,
-                28,
-                bytemuck::cast_slice(&[debug_mode_u32]),
-            );
-            queue.write_buffer(
-                &draw.material_buffer,
-                32,
-                bytemuck::cast_slice(&[tonemapping_u32]),
-            );
+            if flagged.insert(std::ptr::from_ref::<wgpu::Buffer>(&draw.material_buffer)) {
+                queue.write_buffer(
+                    &draw.material_buffer,
+                    28,
+                    bytemuck::cast_slice(&[debug_mode_u32]),
+                );
+                queue.write_buffer(
+                    &draw.material_buffer,
+                    32,
+                    bytemuck::cast_slice(&[tonemapping_u32]),
+                );
+            }
         }
 
         // Update terrain chunk transforms
@@ -372,14 +398,27 @@ impl SceneRenderer {
             queue.write_buffer(&draw.transform_buffer, 0, bytemuck::cast_slice(&[uniforms]));
         }
 
+        // Grass view uniforms (its vertex shader reads only view_proj and camera_pos)
+        if let Some(buf) = &self.grass_transform_buffer {
+            let uniforms = TransformUniforms {
+                view_proj,
+                model: identity_matrix(),
+                model_inv_transpose: identity_matrix(),
+                camera_pos,
+                _pad: 0.0,
+            };
+            queue.write_buffer(buf, 0, bytemuck::cast_slice(&[uniforms]));
+        }
+
         // Update terrain material buffer (tonemapping flag)
         if let Some(buf) = &self.terrain_material_buffer {
             // enable_tonemapping is at byte offset 12 (texture_tile(4) + metallic(4) + roughness(4))
             queue.write_buffer(buf, 12, bytemuck::cast_slice(&[tonemapping_u32]));
         }
 
-        // Update ocean uniforms (wave phases in f64, grid follows the camera)
-        if self.ocean_active {
+        // Update ocean uniforms (wave phases in f64, grid follows the camera).
+        // Water bodies read them too (ADR 0094), sea or no sea.
+        if self.water_active() {
             if let (Some(spectrum), Some(ubuf), Some(tbuf)) = (
                 &self.ocean_spectrum,
                 &self.ocean_uniform_buffer,
@@ -425,15 +464,6 @@ impl SceneRenderer {
                     camera_near: self.ocean_camera_near_far.0,
                     camera_far: self.ocean_camera_near_far.1,
                     grab_enabled: u32::from(self.ocean_grab_this_frame),
-                    fog_color: {
-                        let c = self.postprocess_config.fog_color;
-                        let strength = if self.postprocess_config.fog_enabled {
-                            1.0
-                        } else {
-                            0.0
-                        };
-                        [c[0], c[1], c[2], strength]
-                    },
                     sky_zenith: self.sky_params.zenith_color,
                     sky_horizon: self.sky_params.horizon_color,
                     sky_haze: self.sky_params.haze_color,
@@ -479,9 +509,31 @@ impl SceneRenderer {
                     // these uniforms, so it can never race time_of_day.rhai.
                     mode: self.postprocess_config.render_mode,
                     mode_mix: self.postprocess_config.mode_mix,
-                    _pad_mode: [0.0; 2],
+                    // Shoreline foam reads the grab pass's depth: off
+                    // without it, whatever the component says.
+                    shore_foam_width: if self.ocean_grab_this_frame {
+                        v.shore_foam_width
+                    } else {
+                        0.0
+                    },
+                    shore_foam_strength: v.shore_foam_strength,
+                    shore_foam_color: v.shore_foam_color,
+                    shore_foam_speed: v.shore_foam_speed,
+                    shore_foam_reach: v.shore_foam_reach,
+                    _pad_shore: [0.0; 2],
                 };
                 queue.write_buffer(ubuf, 0, bytemuck::cast_slice(&[uniforms]));
+
+                // Each body's look, its missing colours the sea's as they
+                // stand this frame (so a time-of-day palette tints them too).
+                if let Some(sea_buf) = &self.ocean_sea_body_buffer {
+                    let sea = crate::water_body::WaterBodyUniformsGpu::sea(v);
+                    queue.write_buffer(sea_buf, 0, bytemuck::cast_slice(&[sea]));
+                }
+                for b in self.water_bodies_to_draw() {
+                    let u = b.look.to_gpu(v, b.flowing);
+                    queue.write_buffer(&b.uniform_buffer, 0, bytemuck::cast_slice(&[u]));
+                }
             }
         }
 
@@ -607,6 +659,7 @@ impl SceneRenderer {
     }
 
     /// Execute the main render pass: skybox → grid → terrain → entities → sprites → particles → debug.
+    #[profiling::function]
     pub(super) fn render_main_pass<'a>(
         &'a self,
         render_pass: &mut wgpu::RenderPass<'a>,
@@ -784,8 +837,8 @@ impl SceneRenderer {
             let Some(wire_ib) = &draw.wire_index_buffer else {
                 continue;
             };
-            render_pass.set_bind_group(0, &draw.transform_bind_group, &[]);
-            render_pass.set_bind_group(3, &draw.bone_bind_group, &[]);
+            render_pass.set_bind_group(0, &*draw.transform_bind_group, &[]);
+            render_pass.set_bind_group(3, &*draw.bone_bind_group, &[]);
             render_pass.set_vertex_buffer(0, draw.vertex_buffer.slice(..));
             render_pass.set_index_buffer(wire_ib.slice(..), wgpu::IndexFormat::Uint32);
             render_pass.draw_indexed(0..draw.wire_index_count, 0, 0..1);
@@ -820,8 +873,8 @@ impl SceneRenderer {
                     .chain(self.transparent_skinned_draws.iter())
                 {
                     if draw.entity_id == Some(sel_id) {
-                        render_pass.set_bind_group(0, &draw.transform_bind_group, &[]);
-                        render_pass.set_bind_group(3, &draw.bone_bind_group, &[]);
+                        render_pass.set_bind_group(0, &*draw.transform_bind_group, &[]);
+                        render_pass.set_bind_group(3, &*draw.bone_bind_group, &[]);
                         render_pass.set_vertex_buffer(0, draw.vertex_buffer.slice(..));
                         render_pass.set_index_buffer(
                             draw.index_buffer.slice(..),
@@ -856,8 +909,8 @@ impl SceneRenderer {
                     .chain(self.transparent_skinned_draws.iter())
                 {
                     if draw.entity_id == Some(sel_id) {
-                        render_pass.set_bind_group(0, &draw.transform_bind_group, &[]);
-                        render_pass.set_bind_group(3, &draw.bone_bind_group, &[]);
+                        render_pass.set_bind_group(0, &*draw.transform_bind_group, &[]);
+                        render_pass.set_bind_group(3, &*draw.bone_bind_group, &[]);
                         render_pass.set_vertex_buffer(0, draw.vertex_buffer.slice(..));
                         render_pass.set_index_buffer(
                             draw.index_buffer.slice(..),
@@ -931,15 +984,17 @@ impl SceneRenderer {
             }
 
             // Grass rendering (after terrain -- also writes depth)
-            if let (Some(gp), Some(render_bg), Some(instance_bg)) = (
+            if let (Some(gp), Some(render_bg), Some(instance_bg), Some(args)) = (
                 &self.grass_pipeline,
                 &self.grass_render_uniform_bind_group,
                 &self.grass_render_instance_bind_group,
+                &self.grass_draw_args_buffer,
             ) {
-                if self.grass_instance_count > 0 {
-                    // Explicitly set bind group 0 (transform) — cannot rely on terrain having set it
-                    if let Some(first_terrain) = self.terrain_draws.first() {
-                        render_pass.set_bind_group(0, &first_terrain.transform_bind_group, &[]);
+                if self.grass_drawing {
+                    // Bind group 0 (transform): the grass's own view uniforms,
+                    // so grass on a game's ground draws with no terrain loaded
+                    if let Some(transform_bg) = &self.grass_transform_bind_group {
+                        render_pass.set_bind_group(0, transform_bg, &[]);
                     }
                     render_pass.set_pipeline(&gp.render_pipeline);
                     render_pass.set_bind_group(1, render_bg, &[]);
@@ -950,14 +1005,15 @@ impl SceneRenderer {
                         gp.blade_index_buffer.slice(..),
                         wgpu::IndexFormat::Uint16,
                     );
-                    render_pass.draw_indexed(0..BLADE_INDEX_COUNT, 0, 0..self.grass_instance_count);
+                    // The count is the compute pass's, culled to the view (ADR 0092)
+                    render_pass.draw_indexed_indirect(args, 0);
                 }
             }
         } // end opaque phase (terrain + grass)
 
         // Ocean rendering (after all opaque — writes depth so fog applies;
         // group 3 holds the grab-pass snapshots, or dummies when disabled)
-        if self.ocean_active && phase.draws_ocean_and_after() {
+        if self.water_active() && phase.draws_ocean_and_after() {
             let grab_bg = if self.ocean_grab_this_frame {
                 self.ocean_grab_bind_group.as_ref()
             } else {
@@ -969,15 +1025,32 @@ impl SceneRenderer {
                 &self.ocean_transform_bind_group,
                 grab_bg,
             ) {
-                render_pass.set_pipeline(&op.pipeline);
                 render_pass.set_bind_group(0, transform_bg, &[]);
-                render_pass.set_bind_group(1, ocean_bg, &[]);
                 render_pass.set_bind_group(2, &self.light_bind_group, &[]);
                 render_pass.set_bind_group(3, grab_bg, &[]);
-                render_pass.set_vertex_buffer(0, op.grid_vertex_buffer.slice(..));
-                render_pass
-                    .set_index_buffer(op.grid_index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-                render_pass.draw_indexed(0..op.grid_index_count, 0, 0..1);
+                if self.ocean_active {
+                    render_pass.set_pipeline(&op.pipeline);
+                    render_pass.set_bind_group(1, ocean_bg, &[]);
+                    render_pass.set_vertex_buffer(0, op.grid_vertex_buffer.slice(..));
+                    render_pass.set_index_buffer(
+                        op.grid_index_buffer.slice(..),
+                        wgpu::IndexFormat::Uint32,
+                    );
+                    render_pass.draw_indexed(0..op.grid_index_count, 0, 0..1);
+                }
+                // Lakes and rivers (ADR 0094): after the sea, depth-tested,
+                // so one above sea level hides the sea beneath it.
+                let mut bodies = self.water_bodies_to_draw().peekable();
+                if bodies.peek().is_some() {
+                    render_pass.set_pipeline(&op.body_pipeline);
+                    for b in bodies {
+                        render_pass.set_bind_group(1, &b.bind_group, &[]);
+                        render_pass.set_vertex_buffer(0, b.vertex_buffer.slice(..));
+                        render_pass
+                            .set_index_buffer(b.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                        render_pass.draw_indexed(0..b.index_count, 0, 0..1);
+                    }
+                }
             }
         }
 
@@ -1027,8 +1100,8 @@ impl SceneRenderer {
                         .chain(self.transparent_skinned_draws.iter())
                     {
                         if draw.entity_id == Some(sel_id) {
-                            render_pass.set_bind_group(0, &draw.transform_bind_group, &[]);
-                            render_pass.set_bind_group(3, &draw.bone_bind_group, &[]);
+                            render_pass.set_bind_group(0, &*draw.transform_bind_group, &[]);
+                            render_pass.set_bind_group(3, &*draw.bone_bind_group, &[]);
                             render_pass.set_vertex_buffer(0, draw.vertex_buffer.slice(..));
                             render_pass.set_index_buffer(
                                 draw.index_buffer.slice(..),
@@ -1045,10 +1118,10 @@ impl SceneRenderer {
                 if !self.skinned_entity_draws.is_empty() {
                     render_pass.set_pipeline(&sp.pipeline);
                     for draw in &self.skinned_entity_draws {
-                        render_pass.set_bind_group(0, &draw.transform_bind_group, &[]);
-                        render_pass.set_bind_group(1, &draw.material_bind_group, &[]);
+                        render_pass.set_bind_group(0, &*draw.transform_bind_group, &[]);
+                        render_pass.set_bind_group(1, &*draw.material_bind_group, &[]);
                         // Light bind group 2 is already set
-                        render_pass.set_bind_group(3, &draw.bone_bind_group, &[]);
+                        render_pass.set_bind_group(3, &*draw.bone_bind_group, &[]);
                         render_pass.set_vertex_buffer(0, draw.vertex_buffer.slice(..));
                         render_pass.set_index_buffer(
                             draw.index_buffer.slice(..),
@@ -1156,10 +1229,10 @@ impl SceneRenderer {
                         crate::pipeline::BlendMode::Additive => &sp.transparent_additive_pipeline,
                         crate::pipeline::BlendMode::Multiply => &sp.transparent_multiply_pipeline,
                     };
-                    render_pass.set_bind_group(0, &draw.transform_bind_group, &[]);
-                    render_pass.set_bind_group(1, &draw.material_bind_group, &[]);
+                    render_pass.set_bind_group(0, &*draw.transform_bind_group, &[]);
+                    render_pass.set_bind_group(1, &*draw.material_bind_group, &[]);
                     render_pass.set_bind_group(2, &self.light_bind_group, &[]);
-                    render_pass.set_bind_group(3, &draw.bone_bind_group, &[]);
+                    render_pass.set_bind_group(3, &*draw.bone_bind_group, &[]);
                     render_pass.set_vertex_buffer(0, draw.vertex_buffer.slice(..));
                     render_pass
                         .set_index_buffer(draw.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
@@ -1217,6 +1290,7 @@ impl SceneRenderer {
     }
 
     /// Run post-processing: SSAO, bloom, composite HDR → sRGB.
+    #[profiling::function]
     pub(super) fn render_postprocess(
         &self,
         device: &wgpu::Device,
@@ -1224,6 +1298,7 @@ impl SceneRenderer {
         depth_view: &wgpu::TextureView,
         target_view: &wgpu::TextureView,
         camera: &Camera,
+        mut timer: Option<&mut crate::gpu_timer::GpuTimer>,
     ) {
         let pp = match &self.postprocess_pipeline {
             Some(pp) => pp,
@@ -1234,39 +1309,60 @@ impl SceneRenderer {
             None => return,
         };
 
+        // GPU timing (ADR 0108): each effect is a scope of its own (#120,
+        // so a slow frame names its pass), and the pass that writes the
+        // target another, timed inside its own submission. Under vsync the
+        // GPU waits for the swapchain image before that submission runs,
+        // and a scope across it would count the wait.
+        let mut scoped = |label: &'static str, run: &mut dyn FnMut()| {
+            let scope = timer
+                .as_deref_mut()
+                .map(|t| t.begin_submit(device, queue, label));
+            run();
+            if let (Some(t), Some(scope)) = (timer.as_deref_mut(), scope) {
+                t.end_submit(device, queue, scope);
+            }
+        };
+
         // Run Kuwahara filter if enabled
         if self.postprocess_config.enabled && self.postprocess_config.kuwahara_enabled {
-            pp.run_kuwahara(device, queue, resources, &self.postprocess_config);
+            scoped("Kuwahara", &mut || {
+                pp.run_kuwahara(device, queue, resources, &self.postprocess_config)
+            });
         }
 
         // Run SSAO if enabled
         if self.postprocess_config.enabled && self.postprocess_config.ssao_enabled {
-            pp.run_ssao(
-                device,
-                queue,
-                resources,
-                &self.postprocess_config,
-                depth_view,
-                camera,
-            );
+            scoped("SSAO", &mut || {
+                pp.run_ssao(
+                    device,
+                    queue,
+                    resources,
+                    &self.postprocess_config,
+                    depth_view,
+                    camera,
+                )
+            });
         }
 
         // Run volumetric (god rays) if enabled and shadows are available
         if self.postprocess_config.enabled && self.postprocess_config.volumetric_enabled {
             if let Some(shadow_pass) = &self.shadow_pass {
                 if shadow_pass.enabled {
-                    pp.run_volumetric(
-                        device,
-                        queue,
-                        resources,
-                        &self.postprocess_config,
-                        depth_view,
-                        camera,
-                        &shadow_pass.shadow_view,
-                        &shadow_pass.shadow_sampler,
-                        &shadow_pass.shadow_uniforms_buffer,
-                        &self.light_buffer,
-                    );
+                    scoped("Volumetric", &mut || {
+                        pp.run_volumetric(
+                            device,
+                            queue,
+                            resources,
+                            &self.postprocess_config,
+                            depth_view,
+                            camera,
+                            &shadow_pass.shadow_view,
+                            &shadow_pass.shadow_sampler,
+                            &shadow_pass.shadow_uniforms_buffer,
+                            &self.light_buffer,
+                        )
+                    });
                 }
             }
         }
@@ -1276,7 +1372,9 @@ impl SceneRenderer {
             && self.postprocess_config.bloom_enabled
             && resources.bloom_mip_count > 0
         {
-            pp.run_bloom(device, queue, resources, &self.postprocess_config);
+            scoped("Bloom", &mut || {
+                pp.run_bloom(device, queue, resources, &self.postprocess_config)
+            });
         }
 
         // FXAA (ADR 0050): when active, composite renders into the lazily
@@ -1292,7 +1390,6 @@ impl SceneRenderer {
         } else {
             target_view
         };
-
         // Composite: HDR + bloom + SSAO + volumetric + fog → tonemapped sRGB surface
         // (always runs — this is what converts Rgba16Float → surface format)
         pp.composite(
@@ -1306,18 +1403,28 @@ impl SceneRenderer {
             // Same f64 phase wrap as the ocean upload — keeps mode animation
             // precise over long sessions. Headless render leaves this 0.0.
             (self.ocean_time % 100_000.0) as f32,
+            self.ground_fog.as_ref(),
+            if fxaa_active {
+                None
+            } else {
+                timer.as_deref_mut()
+            },
         );
 
         if fxaa_active {
-            pp.run_fxaa(device, queue, resources, target_view);
+            pp.run_fxaa(device, queue, resources, target_view, timer);
         }
     }
 
-    /// Dispatch the grass compute shader to scatter instances.
-    /// Call before render_main_pass, after update_per_frame_uniforms.
+    /// Dispatch the grass compute shader to scatter this camera's blades,
+    /// culled to its view, and count them into the indirect draw arguments
+    /// (ADR 0092). Call before the shadow and main passes, and call
+    /// [`GrassCountReadback::start_map`] after submitting `encoder`.
+    ///
+    /// [`GrassCountReadback::start_map`]: crate::grass_pipeline::GrassCountReadback::start_map
     pub fn dispatch_grass_compute(
         &mut self,
-        _device: &wgpu::Device,
+        device: &wgpu::Device,
         queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
         camera: &Camera,
@@ -1327,6 +1434,15 @@ impl SceneRenderer {
             Some(c) if c.enabled => c.clone(),
             _ => return,
         };
+
+        // The last count that has come back, for stats
+        if let Some(count) = self
+            .grass_count_readback
+            .as_mut()
+            .and_then(|readback| readback.poll(device))
+        {
+            self.grass_instance_count = count.min(self.grass_max_instances);
+        }
 
         let grass_pipeline = match &self.grass_pipeline {
             Some(p) => p,
@@ -1346,10 +1462,33 @@ impl SceneRenderer {
             None => return,
         };
 
-        // Reset atomic counter to 0
-        if let Some(counter_buf) = &self.grass_counter_buffer {
-            queue.write_buffer(counter_buf, 0, &[0u8; 4]);
-        }
+        // Reset the draw arguments to no blades; the compute pass counts them in
+        let Some(draw_args) = &self.grass_draw_args_buffer else {
+            return;
+        };
+        queue.write_buffer(draw_args, 0, bytemuck::bytes_of(&GrassDrawArgs::RESET));
+
+        // Only the cells within reach of the camera are dispatched (ADR 0089)
+        let spacing = 1.0 / config.density.sqrt();
+        let window = grass_dispatch_window(
+            [self.grass_terrain_offset[0], self.grass_terrain_offset[2]],
+            [self.grass_terrain_width, self.grass_terrain_depth],
+            spacing,
+            [camera.position.x, camera.position.z],
+            config.max_distance,
+        );
+        let ([start_x, start_z], [count_x, count_z]) = window.unwrap_or(([0, 0], [0, 0]));
+
+        // Only the blades in view are drawn. The planes are pushed out by the
+        // tallest blade, and with shadows on by how far its shadow reaches,
+        // so nothing that leans or casts into the view is lost at its edges.
+        let sun = (self.shadows_enabled() && self.light_uniforms.directional_count > 0)
+            .then(|| self.light_uniforms.directional_lights[0].direction);
+        let tallest = config.blade_height * (1.0 + config.height_variation.max(0.0));
+        let frustum_planes = grass_cull_planes(
+            &camera.view_projection_matrix(),
+            grass_cull_padding(tallest, sun),
+        );
 
         // Update compute uniforms
         let uniforms = GrassComputeUniforms {
@@ -1363,12 +1502,24 @@ impl SceneRenderer {
             max_distance: config.max_distance,
             fade_start: config.fade_start,
             density_threshold: config.density_threshold,
-            density_layer: config.density_layer,
+            // A ground's mask is a single channel
+            density_layer: if self.grass_on_ground {
+                0
+            } else {
+                config.density_layer
+            },
             blade_height: config.blade_height,
             height_variation: config.height_variation,
-            _pad0: 0.0,
-            _pad1: 0.0,
-            _pad2: 0.0,
+            scale_by_density: self.grass_scale_by_density as u32,
+            grid_start_x: start_x,
+            grid_start_z: start_z,
+            // A terrain's samples sit on its mesh's vertices; a game's
+            // ground map's in its cells (ADR 0098)
+            height_at_corners: !self.grass_on_ground as u32,
+            _pad0: 0,
+            _pad1: 0,
+            _pad2: 0,
+            frustum_planes,
         };
 
         if let Some(buf) = &self.grass_compute_uniform_buffer {
@@ -1405,14 +1556,12 @@ impl SceneRenderer {
             queue.write_buffer(buf, 0, bytemuck::cast_slice(&[render_uniforms]));
         }
 
-        // Compute dispatch
-        let spacing = 1.0 / config.density.sqrt();
-        let grid_x = (self.grass_terrain_width / spacing).ceil() as u32;
-        let grid_z = (self.grass_terrain_depth / spacing).ceil() as u32;
-        let workgroups_x = (grid_x + 7) / 8;
-        let workgroups_z = (grid_z + 7) / 8;
+        // Compute dispatch over the window (none when the camera is out of reach;
+        // the counter, reset above, then reads zero)
+        let workgroups_x = count_x.div_ceil(8);
+        let workgroups_z = count_z.div_ceil(8);
 
-        {
+        if workgroups_x > 0 && workgroups_z > 0 {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("Grass Compute Pass"),
                 timestamp_writes: None,
@@ -1424,35 +1573,10 @@ impl SceneRenderer {
             pass.dispatch_workgroups(workgroups_x, workgroups_z, 1);
         }
 
-        // Copy counter to staging buffer for CPU readback
-        if let (Some(counter), Some(staging)) =
-            (&self.grass_counter_buffer, &self.grass_staging_buffer)
-        {
-            encoder.copy_buffer_to_buffer(counter, 0, staging, 0, 4);
+        // Copy the count out for stats, unless the last copy is still coming back
+        if let Some(readback) = &mut self.grass_count_readback {
+            readback.record_copy(encoder, draw_args);
         }
-    }
-
-    /// Read back the grass instance count from the staging buffer.
-    /// Call after submitting the command buffer from the previous frame.
-    pub fn read_grass_instance_count(&mut self, device: &wgpu::Device) {
-        let staging = match &self.grass_staging_buffer {
-            Some(s) => s,
-            None => return,
-        };
-
-        let slice = staging.slice(..);
-        let (tx, rx) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |result| {
-            let _ = tx.send(result);
-        });
-        device.poll(wgpu::Maintain::Wait);
-
-        if let Ok(Ok(())) = rx.recv() {
-            let data = slice.get_mapped_range();
-            let count = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
-            self.grass_instance_count = count.min(self.grass_max_instances);
-            drop(data);
-            staging.unmap();
-        }
+        self.grass_drawing = true;
     }
 }

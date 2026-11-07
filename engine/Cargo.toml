@@ -16,6 +16,7 @@ members = [
     "crates/flint-physics",
     "crates/flint-player",
     "crates/flint-audio",
+    "crates/flint-audio-worklet",
     "crates/flint-music",
     "crates/flint-input-capture",
     "crates/flint-animation",
@@ -47,6 +48,7 @@ default-members = [
     "crates/flint-physics",
     "crates/flint-player",
     "crates/flint-audio",
+    "crates/flint-audio-worklet",
     "crates/flint-music",
     "crates/flint-input-capture",
     "crates/flint-animation",
@@ -87,14 +89,21 @@ pest_derive = "2.7"
 wgpu = "23.0"
 winit = "0.30"
 pollster = "0.4"
+# Frame profiler scopes: nothing at all without a backend feature (ADR 0109)
+profiling = "1.0"
+# profiling's Tracy backend uses this version; named here for its features
+tracy-client = { version = "0.18", default-features = false }
 bytemuck = { version = "1.19", features = ["derive"] }
 
 # File watching
 notify = "7.0"
 notify-debouncer-mini = "0.5"
 
-# Image encoding
-image = "0.25"
+# Image decoding and encoding: the formats a game ships, PNG and JPEG
+# (glTF's two) and Radiance HDR (skybox panoramas). The web player stops
+# here, leaving out exr, tiff, webp, avif and the rest (#123); flint-render
+# puts image's defaults back for every native build.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "hdr"] }
 
 # Physics
 rapier3d = { version = "0.22", features = ["default"] }
@@ -107,15 +116,22 @@ glam = { version = "0.30", features = ["mint"] }
 # Scripting
 rhai = { version = "1", features = ["sync"] }
 
-# Game loop
-instant = "0.1"
+# Game loop. std's Instant panics on wasm32 ("time not implemented on this
+# platform"); web-time re-exports std's types on native and wraps
+# performance.now() / Date.now() on the web.
+web-time = "1.1"
 # default-features off: gilrs's default Windows backend (WGI) only delivers
 # input to the process owning the foreground window — console apps (play-chart,
 # the input spike) get nothing. XInput polls regardless of focus. See ADR 0011.
+# The backend is picked by target, not feature, everywhere else: evdev on
+# Linux, IOKit on macOS, the browser Gamepad API on wasm32. `xinput` is a
+# no-op there (rusty-xinput is a Windows-only dep) but must stay on: gilrs-core
+# 0.6.7's "needs xinput or wgi" compile_error is not gated to Windows.
 gilrs = { version = "0.11", default-features = false, features = ["xinput"] }
 # Direct motor access for the haptics rumble path: gilrs's high-level ff
 # server quantizes commands to a 50 ms tick; gilrs-core's FfDevice is a
-# synchronous XInputSetState. Same crate gilrs already depends on.
+# synchronous XInputSetState. Same crate gilrs already depends on. Native
+# only (flint-input-capture's rumble path); a browser can't drive motors this way.
 gilrs-core = { version = "0.6", default-features = false, features = ["xinput"] }
 
 # Android
@@ -142,7 +158,7 @@ rand_chacha = "0.9"
 symphonia = { version = "0.5", default-features = false, features = ["ogg", "vorbis", "wav", "pcm", "flac"] }
 
 # glTF
-gltf = "1.4"
+gltf = { version = "1.4", features = ["KHR_materials_emissive_strength"] }
 
 # File dialogs
 rfd = "0.15"
@@ -167,6 +183,7 @@ flint-viewer = { path = "crates/flint-viewer" }
 flint-runtime = { path = "crates/flint-runtime" }
 flint-physics = { path = "crates/flint-physics" }
 flint-audio = { path = "crates/flint-audio" }
+flint-audio-worklet = { path = "crates/flint-audio-worklet" }
 flint-music = { path = "crates/flint-music" }
 flint-input-capture = { path = "crates/flint-input-capture" }
 flint-animation = { path = "crates/flint-animation" }
@@ -179,3 +196,26 @@ flint-procgen-ai = { path = "crates/flint-procgen-ai" }
 flint-debug-ui = { path = "crates/flint-debug-ui" }
 flint-player = { path = "crates/flint-player" }
 flint-android = { path = "crates/flint-android" }
+
+# The web player's build (#123): `trunk build --release --cargo-profile
+# web-release` in crates/flint-player, as .github/workflows/play.yml does.
+# Every first visit downloads the wasm before the world appears, so it
+# trades build time and some speed for bytes. docs/design/web.md (Size) has
+# what each line saved. `panic = "abort"` keeps the panic message: the
+# console_error_panic_hook flint-web installs runs before the abort.
+[profile.web-release]
+inherits = "release"
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+
+# The AudioWorklet's mixer (#136, crates/flint-audio-worklet): its own small
+# wasm, run on the audio thread against a deadline, so it is built for speed,
+# not bytes, in every build of the page (Trunk.toml's pre_build hook).
+[profile.worklet]
+inherits = "release"
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"

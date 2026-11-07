@@ -46,8 +46,8 @@ Music commands are detailed in [Music Commands](cli-reference/music.md).
 | Left Click | Fire |
 | R | Reload |
 | 1 / 2 | Weapon slots |
-| F2 | Toggle render stats overlay |
-| F3 | Toggle scene debug panels (ocean, day/time, camera, grass, weather… — only those the scene uses; never the F4 menu) |
+| F2 | Toggle render stats overlay (with the GPU's time per phase, where the device can time) |
+| F3 | Toggle scene debug panels (ocean, day/time, camera, grass, weather… — only those the scene uses; never the F4 menu) and the game's own (ADR 0107) |
 | F4 | Toggle the **Rendering & Effects** menu (all render/post toggles and parameters, debug shading mode, shadows, lighting levers) |
 | F9 | Force a music-session full-fail (debug builds, session running) |
 | `` ` `` / `\` | Music Guide overlay / Manifest Map strip (debug builds, session running) |
@@ -92,7 +92,7 @@ The old per-effect keys (F1 debug mode, F4 shadows, F5 bloom, F6 post) are gone;
 
 ### Rendering & Effects Menu (F4, player and viewer)
 
-One panel for everything the old F-keys flipped. Sections: **Post chain** (enable, exposure, vignette, chromatic aberration, radial blur, desaturate; player-only "freeze script post overrides"), **SSAO** (radius, intensity, bias, samples), **Depth of field** (strength, focus distance, range; viewer adds DoF-follow-selection), **Fog** and height fog, **Bloom** with film grain and FXAA, **Kuwahara**, **Render mode** (none / Matrix / blood / drunk / Tron / underwater, mix, params), **Dither / Volumetric**, **Shadows** (enable, resolution — rebuilds the shadow pass), **Lighting** (ambient sky/ground, diffuse wrap, Oren-Nayar, sheen, reset), **Camera** (vertical FOV), **Shading** (debug mode combo). The viewer also has an authored-vs-viewer-default post switch.
+One panel for everything the old F-keys flipped. Sections: **Post chain** (enable, exposure, vignette, chromatic aberration, radial blur, desaturate; player-only "freeze script post overrides"), **SSAO** (radius, intensity, bias, samples), **Depth of field** (strength, focus distance, range; viewer adds DoF-follow-selection), **Fog** with height fog, the aerial tint and ground fog, **Bloom** with film grain and FXAA, **Kuwahara**, **Render mode** (none / Matrix / blood / drunk / Tron / underwater, mix, params), **Dither / Volumetric**, **Shadows** (enable, resolution — rebuilds the shadow pass), **Lighting** (ambient sky/ground, diffuse wrap, Oren-Nayar, sheen, reset), **Camera** (vertical FOV), **Shading** (debug mode combo). The viewer also has an authored-vs-viewer-default post switch.
 
 ### File Type Auto-Detection (`flint edit`)
 
@@ -304,6 +304,10 @@ position = [0, 0, 0]
 | `is_action_just_pressed(action)` | `bool` | Check if action pressed this frame |
 | `last_input_device()` / `gamepad_connected()` | `String` / `bool` | `"keyboard"` \| `"mouse"` \| `"gamepad"` \| `"touch"` latch for prompt glyphs; whether a pad is attached |
 | `mouse_x()` / `mouse_y()` | `f64` | Cursor in logical points; `is_mouse_pressed(b)` / `is_mouse_just_pressed(b)` (0 left, 1 right, 2 middle) |
+| `screen_to_ground(x, y, plane_y)` | `[x, z]`/`()` | Ground point under a screen point (e.g. the cursor); `world_to_screen(x, y, z)` is the inverse |
+| `screen_to_heightfield(x, y)` / `ground_height(x, z)` | `[x, y, z]`/`()`, `f64`/`()` | The host's registered ground field under a screen point, and its height (ADR 0095) |
+| `draw_world_line(x1, y1, z1, x2, y2, z2, r, g, b, a, thickness)` | `()` | World-space line in the 3D frame, hidden behind nearer geometry (unlike `draw_line_3d`, which is HUD) |
+| `draw_world_text(x, y, z, text, size, opts)` | `()` | Text at a world point, hidden behind nearer geometry: a billboard in points, or painted on a plane (`facing`) in world units |
 | `delta_time()` | `f64` | Seconds since last frame |
 | `play_sound(name)` | --- | Play a sound effect |
 | `set_dof(strength)` / `set_dof_focus(dist, range)` | --- | Drive depth of field from a script |
@@ -316,6 +320,7 @@ position = [0, 0, 0]
 | `fade_anim_layer(id, idx, w, secs)` | --- | Ramp a layer's weight over `secs` |
 | `play_sequence(id, name)` / `stop_sequence(id)` | --- | Drive the animator from `animations/*.sequence.toml` (cues → `on_sequence_cue`) |
 | `raycast(ox,oy,oz, dx,dy,dz, dist)` | `Map`/`()` | Cast a ray, get hit info |
+| `raycast_meshes(ox,oy,oz, dx,dy,dz, dist)` / `screen_to_mesh(x, y)` | `Map`/`()` | The same against the meshes drawn as ray targets, no physics needed: a wall in the camera's way, the roof under the cursor (ADR 0105) |
 | `move_character(id, dx, dy, dz)` | `#{x,y,z,grounded}` | Collision-corrected movement |
 | `spawn_entity(name)` | `i64` | Create a new entity |
 | `load_scene(path)` | --- | Transition to a new scene |
@@ -338,6 +343,7 @@ position = [0, 0, 0]
 | `draw_rect_gradient(x, y, w, h, r1,g1,b1,a1, r2,g2,b2,a2, vertical, layer)` | --- | Two-colour linear gradient fill |
 | `draw_rect_ex4(x, y, w, h, r, g, b, a, tl, tr, br, bl, layer)` | --- | Filled rect with per-corner rounding; `draw_rect_outline_ex(..., thickness, rounding, layer)` |
 | `push_clip(x, y, w, h)` / `pop_clip()` | --- | Clip following draw calls to a rect (nests by intersection; reset each frame) |
+| `push_over_ui()` / `pop_over_ui()` | --- | Draw following calls above the game's egui panels and windows (nests; reset each frame) |
 | `import "ui_kit" as ui;` | --- | Load `scripts/lib/ui_kit.rhai`; call `ui::fn_name(...)`. Edits under `scripts/lib/` hot-reload every script |
 
 ## Render Command Quick Examples

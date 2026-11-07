@@ -28,7 +28,10 @@
 // declared after seat_camera in the scene so it reads this frame's
 // values.)
 //
-// Look: mouse (cursor captured via set_cursor_captured) + arrows/stick.
+// Look: mouse (cursor captured via set_cursor_captured) + arrows/stick,
+// and on a touch screen a one-finger drag: config/input.toml's
+// [touch_controls.look] region feeds the drag into mouse_delta_x/y, so it
+// takes the same sensitivity and the same yaw/pitch clamps as the mouse.
 // Yaw is clamped around seat-outward so you can't look through your own
 // back; click to recapture the mouse after Escape.
 

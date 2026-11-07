@@ -11,4 +11,4 @@ last_hours = { type = "float", description = "time_hours seen last frame (wrap/s
 # Declares the first-days ramp to the engine's Day / Time panel so it can
 # report the real length of the current day. time_of_day.rhai applies the
 # same curve — keep the two in sync (the script is the one that runs).
-day_length_ramp = { type = "array", description = "Per-day multipliers on day_length_sec, indexed by day; the last entry repeats for every later day. Omit for a flat rate.", default = [0.1, 0.2, 0.4, 0.7, 1.0] }
+day_length_ramp = { type = "array", element = "float", description = "Per-day multipliers on day_length_sec, indexed by day; the last entry repeats for every later day. Omit for a flat rate.", default = [0.1, 0.2, 0.4, 0.7, 1.0] }

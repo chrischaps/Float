@@ -6,9 +6,11 @@ use flint_animation::skeletal_clip::SkeletalClip;
 use flint_animation::skeleton::Skeleton;
 use flint_animation::AnimationSystem;
 use flint_asset::{AssetCatalog, ContentStore};
+use flint_audio::decode::Need;
 use flint_audio::AudioSystem;
 use flint_core::components as comp;
-use flint_core::toml_util::{toml_f32, toml_vec3};
+use flint_core::toml_util::{toml_f32, toml_f64, toml_vec3};
+use flint_core::vfs;
 use flint_core::EntityId;
 use flint_core::Vec3 as FlintVec3;
 use flint_ecs::FlintWorld;
@@ -31,6 +33,8 @@ pub use flint_render::post_process_config_from_def;
 pub(super) struct LoadedGrassInfo {
     pub config: flint_terrain::GrassConfig,
     pub terrain_entity_name: String,
+    /// The component holding the `grass.*` fields: `terrain` or `grass_ground`.
+    pub component: &'static str,
 }
 
 pub(super) fn load_terrain_from_world_inner(
@@ -67,11 +71,11 @@ pub(super) fn load_terrain_from_world_inner(
         // Resolve heightmap path (scene dir, then parent)
         let hm_path = {
             let p = scene_dir.join(&heightmap_rel);
-            if p.exists() {
+            if vfs::exists(&p) {
                 p
             } else if let Some(parent) = scene_dir.parent() {
                 let pp = parent.join(&heightmap_rel);
-                if pp.exists() {
+                if vfs::exists(&pp) {
                     pp
                 } else {
                     p
@@ -174,43 +178,7 @@ pub(super) fn load_terrain_from_world_inner(
         physics.register_static_trimesh(entity.id, offset_verts, tris, 0.8, 0.1);
 
         // Load grass if enabled
-        let grass_config = {
-            let mut gc = flint_terrain::GrassConfig::default();
-            if let Some(enabled) = terrain_comp.get("grass.enabled") {
-                if enabled.as_bool().unwrap_or(false) {
-                    gc.enabled = true;
-                    gc.density = get_f32("grass.density", gc.density);
-                    gc.max_distance = get_f32("grass.max_distance", gc.max_distance);
-                    gc.fade_start = get_f32("grass.fade_start", gc.fade_start);
-                    gc.blade_width = get_f32("grass.blade_width", gc.blade_width);
-                    gc.blade_height = get_f32("grass.blade_height", gc.blade_height);
-                    gc.height_variation = get_f32("grass.height_variation", gc.height_variation);
-                    gc.wind_speed = get_f32("grass.wind_speed", gc.wind_speed);
-                    gc.wind_strength = get_f32("grass.wind_strength", gc.wind_strength);
-                    gc.bend_radius = get_f32("grass.bend_radius", gc.bend_radius);
-                    gc.bend_strength = get_f32("grass.bend_strength", gc.bend_strength);
-                    gc.density_threshold = get_f32("grass.density_threshold", gc.density_threshold);
-                    gc.density_layer =
-                        get_i32("grass.density_layer", gc.density_layer as i32) as u32;
-                    gc.dry_amount = get_f32("grass.dry_amount", gc.dry_amount);
-
-                    // Parse vec3 fields
-                    if let Some(v) = terrain_comp.get("grass.color_base").and_then(toml_vec3) {
-                        gc.color_base = v;
-                    }
-                    if let Some(v) = terrain_comp.get("grass.color_tip").and_then(toml_vec3) {
-                        gc.color_tip = v;
-                    }
-                    if let Some(v) = terrain_comp.get("grass.color_dry").and_then(toml_vec3) {
-                        gc.color_dry = v;
-                    }
-                    if let Some(v) = terrain_comp.get("grass.wind_direction").and_then(toml_vec3) {
-                        gc.wind_direction = v;
-                    }
-                }
-            }
-            gc
-        };
+        let grass_config = flint_terrain::GrassConfig::from_component(terrain_comp, false);
 
         if grass_config.enabled {
             // Get raw heightmap data and splat map data for GPU upload
@@ -221,18 +189,18 @@ pub(super) fn load_terrain_from_world_inner(
             // Load splat map pixels for grass compute shader
             let splat_path = {
                 let p = scene_dir.join(&config.splat_map_path);
-                if p.exists() {
+                if vfs::exists(&p) {
                     p
                 } else {
                     scene_dir
                         .parent()
                         .map(|pp| pp.join(&config.splat_map_path))
-                        .filter(|pp| pp.exists())
+                        .filter(|pp| vfs::exists(pp))
                         .unwrap_or(p)
                 }
             };
 
-            if let Ok(splat_img) = image::open(&splat_path) {
+            if let Ok(splat_img) = flint_render::open_image(&splat_path) {
                 let splat_rgba = splat_img.to_rgba8();
                 let (sw, sh) = splat_rgba.dimensions();
 
@@ -261,6 +229,7 @@ pub(super) fn load_terrain_from_world_inner(
                 *grass_info_out = Some(LoadedGrassInfo {
                     config: grass_config.clone(),
                     terrain_entity_name: entity.name.clone(),
+                    component: comp::TERRAIN,
                 });
             } else {
                 tracing::warn!("Grass enabled but splat map not found at {:?}", splat_path);
@@ -280,6 +249,121 @@ pub(super) fn load_terrain_from_world_inner(
         *terrain_out = Some((terrain, config));
         break; // Only one terrain entity for now
     }
+
+    // Grass on a scene-authored mesh ground (ADR 0089). One grass field per
+    // scene: a grass_ground replaces a terrain's grass.
+    if let Some(info) = load_grass_ground(world, scene_dir, device, queue, scene_renderer) {
+        if grass_info_out.is_some() {
+            tracing::warn!(
+                "grass_ground '{}' replaces the terrain's grass",
+                info.terrain_entity_name
+            );
+        }
+        *grass_info_out = Some(info);
+    }
+}
+
+/// Load a scene's `grass_ground` into `scene_renderer`, as the player does
+/// (ADR 0089). Returns whether grass was set. Public for `flint render`.
+pub fn load_scene_grass_ground(
+    world: &FlintWorld,
+    scene_path: &str,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    scene_renderer: &mut SceneRenderer,
+) -> bool {
+    let scene_dir = Path::new(scene_path)
+        .parent()
+        .unwrap_or_else(|| Path::new("."));
+    load_grass_ground(world, scene_dir, device, queue, scene_renderer).is_some()
+}
+
+/// Load the first `grass_ground` entity's mask and hand it to the renderer
+/// (ADR 0089). The ground is level at the entity's `y`, from its `x`, `z`
+/// across `width` × `depth`.
+fn load_grass_ground(
+    world: &FlintWorld,
+    scene_dir: &Path,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    scene_renderer: &mut SceneRenderer,
+) -> Option<LoadedGrassInfo> {
+    for entity in world.all_entities() {
+        let Some(ground) = world.get_component(entity.id, comp::GRASS_GROUND) else {
+            continue;
+        };
+        let config = flint_terrain::GrassConfig::from_component(ground, true);
+        if !config.enabled {
+            return None;
+        }
+        let mask_rel = ground.get("mask").and_then(|v| v.as_str()).unwrap_or("");
+        if mask_rel.is_empty() {
+            tracing::warn!("grass_ground '{}': missing mask path", entity.name);
+            return None;
+        }
+        let mask_path = {
+            let p = scene_dir.join(mask_rel);
+            match scene_dir.parent().map(|pp| pp.join(mask_rel)) {
+                Some(pp) if !vfs::exists(&p) && vfs::exists(&pp) => pp,
+                _ => p,
+            }
+        };
+        let mask = match flint_render::open_image(&mask_path) {
+            Ok(img) => img.to_luma8(),
+            Err(e) => {
+                tracing::warn!(
+                    "grass_ground '{}': mask {:?}: {}",
+                    entity.name,
+                    mask_path,
+                    e
+                );
+                return None;
+            }
+        };
+        let get_f32 = |key: &str, default: f32| -> f32 {
+            ground.get(key).and_then(toml_f32).unwrap_or(default)
+        };
+        let pos = world
+            .get_component(entity.id, comp::TRANSFORM)
+            .and_then(|t| t.get("position").and_then(toml_vec3))
+            .unwrap_or([0.0; 3]);
+        let (mask_width, mask_height) = mask.dimensions();
+        let result = scene_renderer.set_grass_ground(
+            device,
+            queue,
+            &config,
+            &flint_render::GrassGround {
+                origin: [pos[0], pos[2]],
+                size: [get_f32("width", 64.0), get_f32("depth", 64.0)],
+                mask: mask.as_raw(),
+                mask_width,
+                mask_height,
+                scale_by_mask: ground
+                    .get("scale_by_mask")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true),
+                height: flint_render::GrassHeight::Flat(pos[1]),
+            },
+        );
+        if let Err(e) = result {
+            tracing::warn!("grass_ground '{}': {}", entity.name, e);
+            return None;
+        }
+        tracing::info!(
+            "Grass ground '{}': {}x{} mask, density={}, max_dist={}",
+            entity.name,
+            mask_width,
+            mask_height,
+            config.density,
+            config.max_distance
+        );
+        return Some(LoadedGrassInfo {
+            config,
+            terrain_entity_name: entity.name.clone(),
+            component: comp::GRASS_GROUND,
+        });
+    }
+    None
 }
 
 /// Build a ModelLoadConfig with catalog-resolved path overrides.
@@ -421,12 +505,35 @@ pub(super) fn register_node_animation_data(
 /// Load audio files referenced by audio_source components and (unless the
 /// scene opts out via `[scene] preload_audio = false`) preload every audio
 /// file from audio/ for script-triggered sounds.
+///
+/// With `queue`, nothing is decoded here: each sound joins the engine's
+/// decode queue, which `tick_av_systems` works through a few milliseconds a
+/// frame, sources that are heard at once (autoplay, above silence) first,
+/// then the rest smallest first. That is how a late audio bundle arrives
+/// mid-game without a stall (#124). Without it, everything is decoded now,
+/// as a scene load can afford.
 pub(super) fn load_audio_from_world(
     world: &FlintWorld,
     audio: &mut AudioSystem,
     scene_path: &str,
     preload_all: bool,
+    queue: bool,
 ) {
+    let mut load = |name: &str, path: &Path, need: Need| {
+        if audio.engine.has_sound(name) {
+            return;
+        }
+        let result = if queue {
+            audio.engine.queue_sound(name, path, need)
+        } else {
+            audio.engine.load_sound(name, path)
+        };
+        match result {
+            Err(e) => tracing::warn!("Failed to load audio '{}': {:?}", name, e),
+            Ok(()) if !queue => println!("Loaded audio: {}", name),
+            Ok(()) => {}
+        }
+    };
     let scene_dir = Path::new(scene_path)
         .parent()
         .unwrap_or_else(|| Path::new("."));
@@ -439,39 +546,34 @@ pub(super) fn load_audio_from_world(
 
     // Load audio files referenced by audio_source components
     for entity in world.all_entities() {
-        let audio_file = world
+        let Some(source) = world
             .get_components(entity.id)
             .and_then(|components| components.get(comp::AUDIO_SOURCE).cloned())
-            .and_then(|audio_src| {
-                audio_src
-                    .get("file")
-                    .and_then(|v| v.as_str().map(String::from))
-            });
+        else {
+            continue;
+        };
+        let Some(file_name) = source.get("file").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        // Heard the moment it loads: an autoplay source above silence.
+        let audible = source
+            .get("autoplay")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true)
+            && source.get("volume").and_then(toml_f64).unwrap_or(1.0) > 0.0;
+        let need = if audible { Need::Audible } else { Need::Later };
 
-        if let Some(file_name) = audio_file {
-            if audio.engine.has_sound(&file_name) {
-                continue;
+        let mut found = false;
+        for dir in &search_dirs {
+            let audio_path = dir.join(file_name);
+            if vfs::exists(&audio_path) {
+                load(file_name, &audio_path, need);
+                found = true;
+                break;
             }
-
-            let mut loaded = false;
-            for dir in &search_dirs {
-                let audio_path = dir.join(&file_name);
-                if audio_path.exists() {
-                    match audio.engine.load_sound(&file_name, &audio_path) {
-                        Ok(_) => {
-                            println!("Loaded audio: {}", file_name);
-                            loaded = true;
-                        }
-                        Err(e) => {
-                            tracing::warn!("Failed to load audio '{}': {:?}", file_name, e);
-                        }
-                    }
-                    break;
-                }
-            }
-            if !loaded {
-                tracing::warn!("Audio file not found: {}", file_name);
-            }
+        }
+        if !found {
+            tracing::warn!("Audio file not found: {}", file_name);
         }
     }
 
@@ -484,25 +586,14 @@ pub(super) fn load_audio_from_world(
     }
     for dir in &search_dirs {
         let audio_dir = dir.join("audio");
-        if audio_dir.is_dir() {
-            if let Ok(entries) = std::fs::read_dir(&audio_dir) {
-                for entry in entries.flatten() {
-                    let path = entry.path();
+        if vfs::is_dir(&audio_dir) {
+            if let Ok(entries) = vfs::read_dir(&audio_dir) {
+                for path in entries {
                     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
                     if ext == "ogg" || ext == "wav" || ext == "mp3" || ext == "flac" {
                         let rel_name =
                             format!("audio/{}", path.file_name().unwrap().to_string_lossy());
-                        if audio.engine.has_sound(&rel_name) {
-                            continue;
-                        }
-                        match audio.engine.load_sound(&rel_name, &path) {
-                            Ok(_) => {
-                                println!("Preloaded audio: {}", rel_name);
-                            }
-                            Err(e) => {
-                                tracing::warn!("Failed to preload audio '{}': {:?}", rel_name, e);
-                            }
-                        }
+                        load(&rel_name, &path, Need::Later);
                     }
                 }
             }
@@ -532,11 +623,11 @@ pub(super) fn load_animations_from_world(scene_path: &str, animation: &mut Anima
         .unwrap_or_else(|| Path::new("."));
 
     let mut anim_dir = scene_dir.join("animations");
-    if !anim_dir.is_dir() {
+    if !vfs::is_dir(&anim_dir) {
         // Check parent directory (game project structure)
         if let Some(parent) = scene_dir.parent() {
             let parent_anim = parent.join("animations");
-            if parent_anim.is_dir() {
+            if vfs::is_dir(&parent_anim) {
                 anim_dir = parent_anim;
             } else {
                 return;
@@ -546,13 +637,12 @@ pub(super) fn load_animations_from_world(scene_path: &str, animation: &mut Anima
         }
     }
 
-    let entries = match std::fs::read_dir(&anim_dir) {
+    let entries = match vfs::read_dir(&anim_dir) {
         Ok(e) => e,
         Err(_) => return,
     };
 
-    for entry in entries.flatten() {
-        let path = entry.path();
+    for path in entries {
         if path
             .file_name()
             .and_then(|n| n.to_str())
@@ -577,12 +667,11 @@ pub(super) fn load_sequences_from_world(scene_path: &str, animation: &mut Animat
     let Some(anim_dir) = resolve_animations_dir(scene_path) else {
         return;
     };
-    let entries = match std::fs::read_dir(&anim_dir) {
+    let entries = match vfs::read_dir(&anim_dir) {
         Ok(e) => e,
         Err(_) => return,
     };
-    for entry in entries.flatten() {
-        let path = entry.path();
+    for path in entries {
         if path
             .file_name()
             .and_then(|n| n.to_str())
@@ -613,11 +702,11 @@ fn resolve_animations_dir(scene_path: &str) -> Option<std::path::PathBuf> {
         .parent()
         .unwrap_or_else(|| Path::new("."));
     let local = scene_dir.join("animations");
-    if local.is_dir() {
+    if vfs::is_dir(&local) {
         return Some(local);
     }
     let up = scene_dir.parent()?.join("animations");
-    up.is_dir().then_some(up)
+    vfs::is_dir(&up).then_some(up)
 }
 
 /// Load `.sprite.toml` files from the `animations/` directory next to the scene.
@@ -628,10 +717,10 @@ pub(super) fn load_sprite_animations_from_world(scene_path: &str, animation: &mu
         .unwrap_or_else(|| Path::new("."));
 
     let mut anim_dir = scene_dir.join("animations");
-    if !anim_dir.is_dir() {
+    if !vfs::is_dir(&anim_dir) {
         if let Some(parent) = scene_dir.parent() {
             let parent_anim = parent.join("animations");
-            if parent_anim.is_dir() {
+            if vfs::is_dir(&parent_anim) {
                 anim_dir = parent_anim;
             } else {
                 return;
@@ -641,13 +730,12 @@ pub(super) fn load_sprite_animations_from_world(scene_path: &str, animation: &mu
         }
     }
 
-    let entries = match std::fs::read_dir(&anim_dir) {
+    let entries = match vfs::read_dir(&anim_dir) {
         Ok(e) => e,
         Err(_) => return,
     };
 
-    for entry in entries.flatten() {
-        let path = entry.path();
+    for path in entries {
         if path
             .file_name()
             .and_then(|n| n.to_str())
@@ -682,7 +770,7 @@ pub(super) fn load_sprite_animations_from_world(scene_path: &str, animation: &mu
 /// Otherwise resolve relative to the current scene's directory.
 pub(super) fn resolve_scene_path(current_scene: &str, target: &str) -> String {
     let target_path = Path::new(target);
-    if target_path.is_absolute() || target_path.exists() {
+    if target_path.is_absolute() || vfs::exists(&target_path) {
         return target.to_string();
     }
 
@@ -691,14 +779,14 @@ pub(super) fn resolve_scene_path(current_scene: &str, target: &str) -> String {
         .unwrap_or_else(|| Path::new("."));
 
     let resolved = current_dir.join(target);
-    if resolved.exists() {
+    if vfs::exists(&resolved) {
         return resolved.to_string_lossy().to_string();
     }
 
     // Try parent directory (game root)
     if let Some(parent) = current_dir.parent() {
         let parent_resolved = parent.join(target);
-        if parent_resolved.exists() {
+        if vfs::exists(&parent_resolved) {
             return parent_resolved.to_string_lossy().to_string();
         }
     }
@@ -936,6 +1024,7 @@ fn upload_procgen_mesh(
             use_vertex_color: true,
             alpha_mode: flint_import::AlphaMode::Opaque,
             alpha_cutoff: 0.5,
+            ..Default::default()
         };
 
         renderer.load_procedural_mesh(device, name, &vertices, &mesh.indices, imported_mat);
@@ -982,6 +1071,7 @@ fn upload_procgen_mesh(
                 use_vertex_color: true,
                 alpha_mode: flint_import::AlphaMode::Opaque,
                 alpha_cutoff: 0.5,
+                ..Default::default()
             };
 
             renderer.load_procedural_mesh(

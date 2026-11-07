@@ -4,7 +4,7 @@
 //! path calls (`load_pending_sprites`) live here with the rest of the
 //! loading surface.
 
-use super::input_config::resolve_input_paths;
+use super::input_config::{read_user_override_file, resolve_input_paths, resolve_user_override};
 use super::scene_loading;
 use super::scene_loading::{
     build_model_load_config, load_animations_from_world, load_audio_from_world,
@@ -29,9 +29,11 @@ use flint_runtime::{
 use flint_script::context::DrawCommand;
 use flint_script::ScriptSystem;
 use gilrs::Gilrs;
+use flint_core::vfs;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
+#[cfg(not(any(target_os = "android", target_arch = "wasm32")))]
 use winit::dpi::PhysicalSize;
 use winit::event_loop::ActiveEventLoop;
 use winit::window::Window;
@@ -44,6 +46,11 @@ impl PlayerApp {
         input_config_override: Option<String>,
         scene_input_config: Option<String>,
     ) -> Self {
+        // The profiler's client, before the first scope (ADR 0109). Tracy's
+        // viewer connects to it while the game runs; starting it twice is
+        // harmless.
+        #[cfg(feature = "profile")]
+        profiling::tracy_client::Client::start();
         Self {
             world,
             scene_path,
@@ -65,18 +72,28 @@ impl PlayerApp {
             egui_winit: None,
             egui_renderer: None,
             draw_commands: Vec::new(),
+            world_texts: Vec::new(),
+            world_text_pipeline: None,
             ui_textures: HashMap::new(),
             ui_fonts: HashSet::new(),
             ui_fonts_warned: HashSet::new(),
             ui_fonts_root: None,
+            ui_fonts_installed: false,
             egui_fonts_ready: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             catalog: AssetCatalog::load_from_directory("assets").ok(),
             content_store: Some(ContentStore::new(".flint/assets")),
             fullscreen,
             cursor_captured: false,
+            window_focused: true,
+            real_pad_slots: Default::default(),
+            key_modifiers: Default::default(),
             skybox_path: None,
             scene_ambient: None,
             msaa_sample_count: 1,
+            render_scale: Default::default(),
+            dynamic_scale: Default::default(),
+            frame_pacer: None,
+            hold_at: None,
             scene_diffuse_wrap: None,
             scene_oren_nayar: None,
             scene_sheen: None,
@@ -102,6 +119,7 @@ impl PlayerApp {
             music_pp_base: None,
             music_pp_restore: None,
             scene_preload_audio: true,
+            audio_vfs_generation: flint_core::vfs::generation(),
             window_size: (1280, 720),
             capture: CaptureConfig::default(),
             exit_requested: false,
@@ -112,6 +130,7 @@ impl PlayerApp {
                 version: 1,
                 game_id: String::new(),
                 actions: Default::default(),
+                touch_controls: None,
             },
             pending_rebind: None,
             gilrs: None,
@@ -126,13 +145,79 @@ impl PlayerApp {
             particles_render_enabled: true,
             show_stats: false,
             stats_frame_times: std::collections::VecDeque::new(),
+            stats_gpu_timing: false,
+            perf: None,
             procgen_resolver: flint_procgen::ProcGenResolver::new(),
             loaded_chunks: HashMap::new(),
             #[cfg(target_os = "android")]
             android_gamepad: AndroidGamepadTracker::new(),
             #[cfg(target_os = "android")]
             android_axis_reader: None,
+            extensions: Vec::new(),
+            egui_input: Default::default(),
+            #[cfg(target_arch = "wasm32")]
+            pending_render: Default::default(),
+            #[cfg(target_arch = "wasm32")]
+            event_proxy: None,
+            #[cfg(target_arch = "wasm32")]
+            pointer_lock: Default::default(),
         }
+    }
+
+    /// Install a game's extension. Its script API is registered right away,
+    /// so add extensions before the event loop starts; after that, scripts
+    /// already compiled still see the new functions, because Rhai resolves
+    /// calls when they run. See `PlayerExtension` for when each hook runs.
+    pub fn add_extension(&mut self, mut extension: Box<dyn crate::extension::PlayerExtension>) {
+        extension.register_script_api(self.script.rhai_engine_mut());
+        self.extensions.push(extension);
+        // A late extension still gets its `fonts` hook.
+        if self.ui_fonts_installed {
+            self.ui_fonts_installed = false;
+            self.refresh_project_fonts();
+        }
+        // And its debug panels, before the next scene load builds them again.
+        #[cfg(feature = "debug-hud")]
+        self.create_extension_debug_panels();
+    }
+
+    /// A handle on the camera scripts' `world_to_screen` uses, for native
+    /// functions an extension registers (ADR 0087). Take it before
+    /// `add_extension` and move it into the extension, whose
+    /// `register_script_api` closures clone it. Called from a script, it
+    /// answers with the camera this frame renders with, as
+    /// `world_to_screen` does; from `pre_update`, last frame's, like
+    /// `ExtensionCtx::camera`.
+    pub fn projector(&self) -> crate::Projector {
+        self.script.projector()
+    }
+
+    /// Take the scene file's player settings: audio preload, skybox,
+    /// ambient and shading levers, camera and post-processing. Both entries
+    /// (`main.rs` and the web's `flint_web.rs`) call it after `new`.
+    pub fn apply_scene_settings(&mut self, scene_file: &flint_scene::SceneFile) {
+        self.scene_preload_audio = scene_file.scene.preload_audio;
+
+        // Skybox path + ambient from scene environment settings
+        if let Some(env) = &scene_file.environment {
+            self.skybox_path = env.skybox.clone();
+            if env.ambient_sky.is_some() || env.ambient_ground.is_some() {
+                self.scene_ambient = Some((
+                    env.ambient_sky
+                        .unwrap_or(flint_render::LightUniforms::DEFAULT_AMBIENT_SKY),
+                    env.ambient_ground
+                        .unwrap_or(flint_render::LightUniforms::DEFAULT_AMBIENT_GROUND),
+                ));
+            }
+            self.scene_diffuse_wrap = env.diffuse_wrap;
+            self.scene_oren_nayar = env.oren_nayar;
+            self.scene_sheen = env
+                .sheen_strength
+                .map(|s| (env.sheen_color.unwrap_or([1.0; 3]), s));
+        }
+
+        self.scene_camera = scene_file.camera.clone();
+        self.scene_post_process = scene_file.post_process.clone();
     }
 
     /// Set the schema paths used for scene loading (preserved across transitions).
@@ -190,12 +275,36 @@ impl PlayerApp {
         }
     }
 
+    /// The first `resumed`: the window, then the GPU device. A desktop
+    /// blocks on the device and finishes here. A browser can't block, so on
+    /// the web the device request runs as a promise and `finish_initialize`
+    /// follows when it lands (see `web_startup.rs`).
     pub(super) fn initialize(&mut self, event_loop: &ActiveEventLoop) -> Result<()> {
-        // Window, then renderer + model/procgen loading (context and
-        // renderer stay locals until the environment pass is done — they
-        // are stored on self only once fully built, as before).
         let window = self.create_window(event_loop)?;
-        let (render_context, mut scene_renderer) = self.init_render_and_models(&window)?;
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let render_context = pollster::block_on(RenderContext::new(window.clone()))
+                .context("Failed to initialize render context")?;
+            self.finish_initialize(window, render_context)
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.request_render_context(window);
+            Ok(())
+        }
+    }
+
+    /// Everything after the device: renderer, models, input, egui, the
+    /// scene's environment and the game systems.
+    pub(super) fn finish_initialize(
+        &mut self,
+        window: Arc<Window>,
+        render_context: RenderContext,
+    ) -> Result<()> {
+        // Renderer + model/procgen loading (context and renderer stay locals
+        // until the environment pass is done — they are stored on self only
+        // once fully built, as before).
+        let (render_context, mut scene_renderer) = self.init_render_and_models(render_context)?;
 
         // Input bindings, gamepad backend, egui overlay
         self.init_input_and_egui(&window, &render_context);
@@ -209,6 +318,7 @@ impl PlayerApp {
 
         self.render_context = Some(render_context);
         self.scene_renderer = Some(scene_renderer);
+        self.update_vsync_pacing();
 
         // Saved persistent store (save/persist.toml) before any script's
         // on_init runs, so persist_get sees last session's values.
@@ -237,7 +347,10 @@ impl PlayerApp {
 
     fn create_window(&mut self, event_loop: &ActiveEventLoop) -> Result<Arc<Window>> {
         let window_attrs = Window::default_attributes().with_title("Flint Player");
-        #[cfg(not(target_os = "android"))]
+        // In a browser the page's canvas is the window, sized by its CSS.
+        #[cfg(target_arch = "wasm32")]
+        let window_attrs = super::web_startup::canvas_attributes(window_attrs);
+        #[cfg(not(any(target_os = "android", target_arch = "wasm32")))]
         let window_attrs = window_attrs.with_inner_size(PhysicalSize::new(
             self.window_size.0.max(1),
             self.window_size.1.max(1),
@@ -260,12 +373,8 @@ impl PlayerApp {
 
     fn init_render_and_models(
         &mut self,
-        window: &Arc<Window>,
+        render_context: RenderContext,
     ) -> Result<(RenderContext, SceneRenderer)> {
-        // Initialize rendering
-        let render_context = pollster::block_on(RenderContext::new(window.clone()))
-            .context("Failed to initialize render context")?;
-
         self.camera.aspect = render_context.aspect_ratio();
         self.camera.fov = 70.0; // Slightly wider FOV for first-person
 
@@ -313,7 +422,7 @@ impl PlayerApp {
             spec_dirs.push(scene_dir.join("models"));
             let dir_refs: Vec<&Path> = spec_dirs
                 .iter()
-                .filter(|d| d.is_dir())
+                .filter(|d| vfs::is_dir(d))
                 .map(|d| d.as_path())
                 .collect();
             self.procgen_resolver.discover_and_index(&dir_refs);
@@ -351,14 +460,21 @@ impl PlayerApp {
         // Initialize gamepad backend (best-effort).
         self.gilrs = Gilrs::new().ok();
 
-        // Initialize egui for HUD overlay
+        // Initialize egui for HUD overlay. egui assumes textures of at most
+        // 2048 px a side until told otherwise, and panics on a wider one
+        // (Float's 2713 px title). Give it the device's limit, both for the
+        // passes egui-winit feeds it and now, since UI sprites load before
+        // the first pass.
+        let max_texture_side = render_context.device.limits().max_texture_dimension_2d as usize;
+        self.egui_ctx
+            .input_mut(|i| i.max_texture_side = max_texture_side);
         let egui_winit = egui_winit::State::new(
             self.egui_ctx.clone(),
             egui::ViewportId::ROOT,
             window,
             Some(window.scale_factor() as f32),
             None,
-            None,
+            Some(max_texture_side),
         );
         let egui_renderer = egui_wgpu::Renderer::new(
             &render_context.device,
@@ -411,7 +527,7 @@ impl PlayerApp {
             // Search scene dir first, then parent (game root)
             let skybox_path = {
                 let p = scene_dir.join(skybox_rel);
-                if p.exists() {
+                if vfs::exists(&p) {
                     p
                 } else if let Some(parent) = scene_dir.parent() {
                     parent.join(skybox_rel)
@@ -420,7 +536,7 @@ impl PlayerApp {
                 }
             };
 
-            if skybox_path.exists() {
+            if vfs::exists(&skybox_path) {
                 scene_renderer.load_skybox(
                     &render_context.device,
                     &render_context.queue,
@@ -468,6 +584,10 @@ impl PlayerApp {
             &mut self.audio,
             &self.scene_path,
             self.scene_preload_audio,
+            // In the browser the audio may already be here at start, and
+            // decoding it all in one frame is the stall #124 removed:
+            // queue it. The desktop decodes up front, as a load can afford.
+            cfg!(target_arch = "wasm32"),
         );
         self.audio
             .initialize(&mut self.world)
@@ -537,7 +657,8 @@ impl PlayerApp {
                 info.config,
                 std::path::PathBuf::from(&self.scene_path),
                 info.terrain_entity_name,
-            );
+            )
+            .with_component(info.component);
             self.debug_panels.push(Box::new(panel));
         }
         #[cfg(not(feature = "debug-hud"))]
@@ -558,6 +679,8 @@ impl PlayerApp {
             // is true here because player scripts drive post fields.
             self.debug_panels
                 .push(Box::new(flint_debug_ui::RenderDebugPanel::new(true)));
+            // The game's own (ADR 0107), after the engine's.
+            self.create_extension_debug_panels();
         }
     }
 
@@ -604,14 +727,14 @@ impl PlayerApp {
             .load_bindings(InputConfig::built_in_defaults())
             .context("failed to load built-in input defaults")?;
 
-        let paths = resolve_input_paths(
+        let mut paths = resolve_input_paths(
             Path::new(&self.scene_path),
             self.scene_input_config.as_deref(),
             self.input_config_override.as_deref(),
         );
 
         if let Some(path) = &paths.game_default {
-            if path.exists() {
+            if vfs::exists(path) {
                 let cfg = InputConfig::load_from_file(path).with_context(|| {
                     format!("failed to load game input config '{}'", path.display())
                 })?;
@@ -621,11 +744,17 @@ impl PlayerApp {
             }
         }
 
+        // Now the game default has set the game id, find the player's own
+        // rebinds: they're saved under it.
+        paths.user_override =
+            resolve_user_override(Path::new(&self.scene_path), &self.input.config().game_id);
+        // The player's copy (crate::user_files, localStorage on the web), else
+        // one the game ships in its vfs bundle.
         if let Some(path) = &paths.user_override {
-            if path.exists() {
-                let cfg = InputConfig::load_from_file(path).with_context(|| {
-                    format!("failed to load user input config '{}'", path.display())
-                })?;
+            let cfg = read_user_override_file(path).with_context(|| {
+                format!("failed to load user input config '{}'", path.display())
+            })?;
+            if let Some(cfg) = cfg {
                 self.user_override_config = cfg.clone();
                 self.input
                     .merge_bindings(cfg)
@@ -634,7 +763,7 @@ impl PlayerApp {
         }
 
         if let Some(path) = &paths.cli_override {
-            if path.exists() {
+            if vfs::exists(path) {
                 let cfg = InputConfig::load_from_file(path).with_context(|| {
                     format!("failed to load CLI input config '{}'", path.display())
                 })?;
@@ -673,20 +802,22 @@ impl PlayerApp {
     }
 
     /// (Re)load `<project>/fonts/` into egui when the project root changed
-    /// since the last scan (initial load and scene transitions).
+    /// since the last scan (initial load and scene transitions). Extensions'
+    /// `fonts` hooks edit the definitions before they're installed.
     pub(super) fn refresh_project_fonts(&mut self) {
         let root = super::fonts::find_fonts_dir(&self.scene_path);
-        if root.is_none() && self.ui_fonts.is_empty() {
-            // No fonts dir and nothing installed: egui defaults already apply.
-            self.ui_fonts_root = None;
-            return;
-        }
-        if root.is_some() && self.ui_fonts_root == root {
+        if self.ui_fonts_installed && self.ui_fonts_root == root {
             return; // same project root as the last scan
         }
-        self.ui_fonts = super::fonts::install_project_fonts(&self.egui_ctx, &self.scene_path);
+        let mut defs = super::fonts::project_font_definitions(&self.scene_path);
+        for ext in self.extensions.iter_mut() {
+            ext.fonts(&mut defs);
+        }
+        self.ui_fonts = super::fonts::script_families(&defs);
+        self.egui_ctx.set_fonts(defs);
         self.ui_fonts_warned.clear();
         self.ui_fonts_root = root;
+        self.ui_fonts_installed = true;
     }
 
     /// Give scripts a `measure_text` that lays text out with the same font
@@ -742,8 +873,8 @@ impl PlayerApp {
         ];
 
         for path in &candidates {
-            if path.exists() {
-                if let Ok(img) = image::open(path) {
+            if vfs::exists(path) {
+                if let Ok(img) = flint_render::open_image(path) {
                     let rgba = img.to_rgba8();
                     let (w, h) = rgba.dimensions();
                     let color_image =

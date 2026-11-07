@@ -9,6 +9,7 @@
 
 use crate::SceneRenderer;
 use flint_core::components as comp;
+use flint_core::vfs;
 use flint_core::EntityId;
 use flint_ecs::FlintWorld;
 use flint_import::{import_gltf, ImportResult};
@@ -76,10 +77,19 @@ pub fn quat_to_euler_xyz(q: [f32; 4]) -> [f32; 3] {
     [roll.to_degrees(), pitch.to_degrees(), yaw.to_degrees()]
 }
 
+/// Whether a `model` component names a mesh that code uploads at runtime
+/// (`runtime = true`) rather than a file on disk.
+pub fn is_runtime_model(model: &toml::Value) -> bool {
+    model
+        .get("runtime")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
 /// Resolve the file path for a model asset name.
 fn resolve_model_path(config: &ModelLoadConfig, asset_name: &str) -> Option<PathBuf> {
     if let Some(path) = config.overrides.get(asset_name) {
-        if path.exists() {
+        if vfs::exists(path) {
             return Some(path.clone());
         }
     }
@@ -89,7 +99,7 @@ fn resolve_model_path(config: &ModelLoadConfig, asset_name: &str) -> Option<Path
             .scene_dir
             .join("models")
             .join(format!("{}.{}", asset_name, ext));
-        if p.exists() {
+        if vfs::exists(&p) {
             return Some(p);
         }
     }
@@ -98,7 +108,7 @@ fn resolve_model_path(config: &ModelLoadConfig, asset_name: &str) -> Option<Path
             let p = parent
                 .join("models")
                 .join(format!("{}.{}", asset_name, ext));
-            if p.exists() {
+            if vfs::exists(&p) {
                 return Some(p);
             }
         }
@@ -109,7 +119,7 @@ fn resolve_model_path(config: &ModelLoadConfig, asset_name: &str) -> Option<Path
 /// Resolve the file path for a texture name.
 fn resolve_texture_path(config: &ModelLoadConfig, tex_name: &str) -> Option<PathBuf> {
     if let Some(path) = config.overrides.get(tex_name) {
-        if path.exists() {
+        if vfs::exists(path) {
             return Some(path.clone());
         }
     }
@@ -136,7 +146,7 @@ fn resolve_texture_path(config: &ModelLoadConfig, tex_name: &str) -> Option<Path
     for dir in &search_dirs {
         for name in &candidates {
             let p = dir.join(name);
-            if p.exists() {
+            if vfs::exists(&p) {
                 return Some(p);
             }
         }
@@ -261,6 +271,7 @@ fn expand_nodes_animated(
                         &mut mesh.material.base_color_texture,
                         &mut mesh.material.normal_texture,
                         &mut mesh.material.metallic_roughness_texture,
+                        &mut mesh.material.emissive_texture,
                     ] {
                         if let Some(t) = tex.take() {
                             *tex = Some(format!("{}::{}", asset_name, t));
@@ -304,6 +315,10 @@ fn expand_nodes_animated(
 /// Handles path resolution, GLB import, multi-node expansion, skinned mesh
 /// detection, and GPU upload. Returns metadata so callers can perform
 /// skeletal animation registration on top.
+///
+/// Entities whose model sets `runtime = true` are skipped: their mesh is
+/// uploaded by code at runtime (`SceneRenderer::load_procedural_mesh`), so
+/// there's no file to find.
 pub fn load_models_from_world(
     world: &mut FlintWorld,
     renderer: &mut SceneRenderer,
@@ -325,6 +340,7 @@ pub fn load_models_from_world(
             let components = world.get_components(e.id);
             let model_asset = components
                 .and_then(|c| c.get(comp::MODEL).cloned())
+                .filter(|model| !is_runtime_model(model))
                 .and_then(|model| {
                     model
                         .get("asset")

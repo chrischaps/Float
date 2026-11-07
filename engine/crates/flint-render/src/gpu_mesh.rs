@@ -16,9 +16,28 @@ pub struct GpuMesh {
     pub index_buffer: Arc<wgpu::Buffer>,
     pub index_count: u32,
     pub material: ImportedMaterial,
+    /// Local-space bounds of the vertices, for frustum culling.
+    pub aabb_min: [f32; 3],
+    pub aabb_max: [f32; 3],
     // Keep raw data for creating per-entity copies
     vertex_data: Vec<u8>,
     index_data: Vec<u8>,
+}
+
+/// Local-space bounds of `vertices`; all zeros when there are none.
+pub fn vertex_bounds(vertices: &[Vertex]) -> ([f32; 3], [f32; 3]) {
+    if vertices.is_empty() {
+        return ([0.0; 3], [0.0; 3]);
+    }
+    let mut min = [f32::INFINITY; 3];
+    let mut max = [f32::NEG_INFINITY; 3];
+    for v in vertices {
+        for i in 0..3 {
+            min[i] = min[i].min(v.position[i]);
+            max[i] = max[i].max(v.position[i]);
+        }
+    }
+    (min, max)
 }
 
 impl GpuMesh {
@@ -53,34 +72,19 @@ impl GpuMesh {
 
 /// A GPU-resident skinned mesh with bone buffer for skeletal animation
 pub struct GpuSkinnedMesh {
-    pub vertex_buffer: wgpu::Buffer,
-    pub index_buffer: wgpu::Buffer,
+    /// Shared by every draw of the mesh: skinning happens in the vertex
+    /// shader, so no draw needs geometry of its own (#121).
+    pub vertex_buffer: Arc<wgpu::Buffer>,
+    pub index_buffer: Arc<wgpu::Buffer>,
     pub index_count: u32,
     pub material: ImportedMaterial,
     pub bone_buffer: wgpu::Buffer,
     pub bone_bind_group: wgpu::BindGroup,
     pub skin_index: usize,
-    vertex_data: Vec<u8>,
     index_data: Vec<u8>,
 }
 
 impl GpuSkinnedMesh {
-    pub fn create_vertex_buffer_copy(&self, device: &wgpu::Device) -> wgpu::Buffer {
-        device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Skinned Vertex Buffer Copy"),
-            contents: &self.vertex_data,
-            usage: wgpu::BufferUsages::VERTEX,
-        })
-    }
-
-    pub fn create_index_buffer_copy(&self, device: &wgpu::Device) -> wgpu::Buffer {
-        device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Skinned Index Buffer Copy"),
-            contents: &self.index_data,
-            usage: wgpu::BufferUsages::INDEX,
-        })
-    }
-
     /// Reinterpret the raw index data as a slice of u32 triangle indices
     pub fn triangle_indices(&self) -> Vec<u32> {
         bytemuck::cast_slice::<u8, u32>(&self.index_data).to_vec()
@@ -118,6 +122,7 @@ impl MeshCache {
             use_vertex_color: false,
             alpha_mode: flint_import::AlphaMode::Opaque,
             alpha_cutoff: 0.5,
+            ..Default::default()
         };
 
         let gpu_meshes: Vec<GpuMesh> = import_result
@@ -169,11 +174,14 @@ impl MeshCache {
                     usage: wgpu::BufferUsages::INDEX,
                 });
 
+                let (aabb_min, aabb_max) = vertex_bounds(&vertices);
                 GpuMesh {
                     vertex_buffer: Arc::new(vertex_buffer),
                     index_buffer: Arc::new(index_buffer),
                     index_count: mesh.indices.len() as u32,
                     material,
+                    aabb_min,
+                    aabb_max,
                     vertex_data,
                     index_data,
                 }
@@ -241,6 +249,7 @@ impl MeshCache {
             use_vertex_color: false,
             alpha_mode: flint_import::AlphaMode::Opaque,
             alpha_cutoff: 0.5,
+            ..Default::default()
         };
 
         let gpu_meshes: Vec<GpuMesh> = mesh_indices
@@ -312,11 +321,14 @@ impl MeshCache {
                     usage: wgpu::BufferUsages::INDEX,
                 });
 
+                let (aabb_min, aabb_max) = vertex_bounds(&vertices);
                 GpuMesh {
                     vertex_buffer: Arc::new(vertex_buffer),
                     index_buffer: Arc::new(index_buffer),
                     index_count: mesh.indices.len() as u32,
                     material,
+                    aabb_min,
+                    aabb_max,
                     vertex_data,
                     index_data,
                 }
@@ -361,6 +373,7 @@ impl MeshCache {
             use_vertex_color: false,
             alpha_mode: flint_import::AlphaMode::Opaque,
             alpha_cutoff: 0.5,
+            ..Default::default()
         };
 
         let identity_bones: Vec<[[f32; 4]; 4]> = vec![
@@ -429,12 +442,11 @@ impl MeshCache {
                     })
                     .collect();
 
-                let vertex_data = bytemuck::cast_slice(&vertices).to_vec();
                 let index_data = bytemuck::cast_slice(&mesh.indices).to_vec();
 
                 let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                     label: Some(&format!("{} Skinned Vertex Buffer", name)),
-                    contents: &vertex_data,
+                    contents: bytemuck::cast_slice(&vertices),
                     usage: wgpu::BufferUsages::VERTEX,
                 });
 
@@ -461,14 +473,13 @@ impl MeshCache {
                 });
 
                 GpuSkinnedMesh {
-                    vertex_buffer,
-                    index_buffer,
+                    vertex_buffer: Arc::new(vertex_buffer),
+                    index_buffer: Arc::new(index_buffer),
                     index_count: mesh.indices.len() as u32,
                     material,
                     bone_buffer,
                     bone_bind_group,
                     skin_index,
-                    vertex_data,
                     index_data,
                 }
             })
@@ -489,7 +500,8 @@ impl MeshCache {
         self.skinned_meshes.get_mut(name)
     }
 
-    /// Upload a procedural mesh from raw vertex/index data to the GPU
+    /// Upload a procedural mesh from raw vertex/index data to the GPU,
+    /// replacing any mesh already cached under `name`.
     pub fn upload_procedural(
         &mut self,
         device: &wgpu::Device,
@@ -513,16 +525,40 @@ impl MeshCache {
             usage: wgpu::BufferUsages::INDEX,
         });
 
+        let (aabb_min, aabb_max) = vertex_bounds(vertices);
         let gpu_mesh = GpuMesh {
             vertex_buffer: Arc::new(vertex_buffer),
             index_buffer: Arc::new(index_buffer),
             index_count: indices.len() as u32,
             material,
+            aabb_min,
+            aabb_max,
             vertex_data,
             index_data,
         };
 
+        // Replacing drops the old buffers here; draw lists still holding
+        // them let go at the next `update_from_world`.
         self.meshes.insert(name.to_string(), vec![gpu_mesh]);
+    }
+
+    /// Remove a mesh (static and skinned) by name. Returns whether it
+    /// existed. Its GPU buffers are freed once the current frame's draw
+    /// lists, which still hold them, are rebuilt.
+    pub fn remove(&mut self, name: &str) -> bool {
+        let had_static = self.meshes.remove(name).is_some();
+        let had_skinned = self.skinned_meshes.remove(name).is_some();
+        had_static || had_skinned
+    }
+
+    /// Number of named meshes (static and skinned) in the cache.
+    pub fn len(&self) -> usize {
+        self.meshes.len() + self.skinned_meshes.len()
+    }
+
+    /// Whether the cache holds no meshes.
+    pub fn is_empty(&self) -> bool {
+        self.meshes.is_empty() && self.skinned_meshes.is_empty()
     }
 
     /// Check if a model has skinned meshes cached
@@ -534,5 +570,24 @@ impl MeshCache {
     pub fn clear(&mut self) {
         self.meshes.clear();
         self.skinned_meshes.clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vertex_bounds_span_every_position() {
+        let v = |p: [f32; 3]| Vertex {
+            position: p,
+            normal: [0.0, 1.0, 0.0],
+            color: [1.0; 4],
+            uv: [0.0; 2],
+        };
+        let (min, max) = vertex_bounds(&[v([1.0, -2.0, 3.0]), v([-4.0, 5.0, 0.5])]);
+        assert_eq!(min, [-4.0, -2.0, 0.5]);
+        assert_eq!(max, [1.0, 5.0, 3.0]);
+        assert_eq!(vertex_bounds(&[]), ([0.0; 3], [0.0; 3]));
     }
 }

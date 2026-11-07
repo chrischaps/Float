@@ -61,7 +61,11 @@ pub struct InputSnapshot {
     pub last_device: String,
     /// True while the host reports at least one gamepad attached.
     pub gamepad_connected: bool,
+    /// True while the on-screen touch controls are drawn (#133).
+    pub touch_controls_visible: bool,
     pub mouse_delta: (f64, f64),
+    /// Wheel lines (notches) this frame, (x, y); up and right are positive.
+    pub mouse_wheel: (f64, f64),
     /// Mouse buttons currently held (0 left, 1 right, 2 middle)
     pub mouse_buttons_down: Vec<i64>,
     /// Mouse buttons pressed this frame
@@ -206,12 +210,18 @@ pub enum ScriptCommand {
     PlaySound {
         name: String,
         volume: f64,
+        pitch: f64,
     },
     PlaySoundAt {
         name: String,
         position: (f64, f64, f64),
         volume: f64,
         pitch: f64,
+        /// `(min, max)` metres from the listener; `None` is the engine's
+        /// default (1 to 25).
+        distances: Option<(f32, f32)>,
+        /// The falloff curve between them; `None` is the engine's default.
+        rolloff: Option<f32>,
     },
     StopSound {
         name: String,
@@ -422,15 +432,23 @@ impl DrawCommand {
 /// A recorded draw command plus the clip rect (`[x, y, w, h]`, logical
 /// points) that was active when it was issued — `None` = unclipped. The
 /// clip is stamped per item so layer sorting stays a plain stable sort.
+/// `over_ui` is stamped the same way: true when the item was issued inside
+/// `push_over_ui` / `pop_over_ui`, and it then draws above the game's egui
+/// (ADR 0085).
 #[derive(Debug, Clone)]
 pub struct DrawItem {
     pub cmd: DrawCommand,
     pub clip: Option<[f32; 4]>,
+    pub over_ui: bool,
 }
 
 impl DrawItem {
     pub fn unclipped(cmd: DrawCommand) -> Self {
-        Self { cmd, clip: None }
+        Self {
+            cmd,
+            clip: None,
+            over_ui: false,
+        }
     }
 
     pub fn layer(&self) -> i32 {
@@ -460,9 +478,18 @@ pub struct ScriptCallContext {
     /// Accumulated 2D draw commands for the current frame, each stamped
     /// with the clip rect active when it was issued
     pub draw_commands: Vec<DrawItem>,
+    /// Depth-tested world lines queued this frame (`draw_world_line`,
+    /// ADR 0083). The host hands them to the renderer.
+    pub world_lines: Vec<flint_core::world_line::WorldLine>,
+    /// Depth-tested world text queued this frame (`draw_world_text`,
+    /// ADR 0104). The host lays it out and draws it before the HUD.
+    pub world_texts: Vec<flint_core::world_text::WorldText>,
     /// `push_clip` / `pop_clip` stack; each entry is already intersected
     /// with its parent. Cleared when the frame's draw commands are drained.
     pub clip_stack: Vec<[f32; 4]>,
+    /// `push_over_ui` / `pop_over_ui` depth; above zero, draw items are
+    /// stamped `over_ui`. Reset with the clip stack each frame.
+    pub over_ui_depth: u32,
     /// Mouse cursor in logical points (same space as `screen_width`);
     /// written by the host each frame alongside the screen size.
     pub mouse_pos_logical: (f32, f32),
@@ -508,6 +535,11 @@ pub struct ScriptCallContext {
     /// Script-driven cursor capture request. Games without a character
     /// controller (which normally gates capture) use this for mouse look.
     pub cursor_captured_override: Option<bool>,
+    /// `set_touch_controls(enabled)` this frame (#134).
+    pub touch_controls_override: Option<bool>,
+    /// Whether the cursor is captured now, for `is_cursor_captured()`
+    /// (ADR 0110). The host sets it each frame.
+    pub cursor_captured: bool,
     /// Raw pointer to the GameStateMachine — valid only during call scope
     pub state_machine: *mut GameStateMachine,
     /// Raw pointer to the PersistentStore — valid only during call scope
@@ -524,6 +556,13 @@ pub struct ScriptCallContext {
     pub data_cache: std::collections::HashMap<String, toml::Value>,
     /// Terrain height sampling callback — set by PlayerApp if terrain is loaded
     pub terrain_height_fn: Option<Box<dyn Fn(f32, f32) -> f32 + Send + Sync>>,
+    /// The game's ground, for `screen_to_heightfield` and `ground_height`
+    /// (ADR 0095). Set through `Projector::set_ground`; survives `clear()`.
+    pub ground: Option<Arc<flint_terrain::GroundField>>,
+    /// The meshes drawn as ray targets, where the last frame drew them, for
+    /// `raycast_meshes` and `screen_to_mesh` (ADR 0105). Set by the host
+    /// after each render update (`ScriptSystem::set_ray_scene`).
+    pub ray_scene: Arc<flint_core::ray_mesh::RayScene>,
     /// Real text measurement, installed by the host once a text backend
     /// exists: `(text, size, font family, letter spacing) -> (width, height)`
     /// in logical points. `measure_text` falls back to a glyph-count
@@ -567,7 +606,10 @@ impl ScriptCallContext {
             current_entity: EntityId::from_raw(0),
             commands: Vec::new(),
             draw_commands: Vec::new(),
+            world_lines: Vec::new(),
+            world_texts: Vec::new(),
             clip_stack: Vec::new(),
+            over_ui_depth: 0,
             mouse_pos_logical: (0.0, 0.0),
             input: InputSnapshot::default(),
             delta_time: 0.0,
@@ -596,6 +638,8 @@ impl ScriptCallContext {
             postprocess_mode_params_override: None,
             audio_lowpass_cutoff_override: None,
             cursor_captured_override: None,
+            touch_controls_override: None,
+            cursor_captured: false,
             state_machine: std::ptr::null_mut(),
             persistent_store: std::ptr::null_mut(),
             transition_progress: -1.0,
@@ -604,6 +648,8 @@ impl ScriptCallContext {
             ui_system: UiSystem::new(),
             data_cache: std::collections::HashMap::new(),
             terrain_height_fn: None,
+            ground: None,
+            ray_scene: Arc::default(),
             text_measurer: None,
             camera_follow: CameraFollowState::default(),
             shake: ShakeState::default(),
@@ -612,10 +658,12 @@ impl ScriptCallContext {
         }
     }
 
-    /// Record a draw command, stamping the clip rect currently on the stack.
+    /// Record a draw command, stamping the clip rect currently on the stack
+    /// and whether it was issued over the UI.
     pub fn push_draw(&mut self, cmd: DrawCommand) {
         let clip = self.clip_stack.last().copied();
-        self.draw_commands.push(DrawItem { cmd, clip });
+        let over_ui = self.over_ui_depth > 0;
+        self.draw_commands.push(DrawItem { cmd, clip, over_ui });
     }
 
     /// Push a clip rect (intersected with the enclosing one, if any).
@@ -632,9 +680,20 @@ impl ScriptCallContext {
         self.clip_stack.pop();
     }
 
-    /// Take this frame's draw items and reset the clip stack.
+    /// Start drawing over the game's egui. Pushes nest; each needs a pop.
+    pub fn push_over_ui(&mut self) {
+        self.over_ui_depth = self.over_ui_depth.saturating_add(1);
+    }
+
+    /// End the innermost `push_over_ui`; an unbalanced pop is ignored.
+    pub fn pop_over_ui(&mut self) {
+        self.over_ui_depth = self.over_ui_depth.saturating_sub(1);
+    }
+
+    /// Take this frame's draw items and reset the clip and over-UI stacks.
     pub fn take_draw_items(&mut self) -> Vec<DrawItem> {
         self.clip_stack.clear();
+        self.over_ui_depth = 0;
         std::mem::take(&mut self.draw_commands)
     }
 
@@ -793,6 +852,42 @@ mod tests {
         let _ = c.take_draw_items();
         assert!(c.clip_stack.is_empty());
         assert!(c.draw_commands.is_empty());
+    }
+
+    #[test]
+    fn over_ui_stamps_nests_and_resets() {
+        let mut c = ScriptCallContext::new();
+        let dot = || DrawCommand::CircleFilled {
+            x: 0.0,
+            y: 0.0,
+            radius: 1.0,
+            color: [1.0; 4],
+            layer: 0,
+        };
+        c.push_draw(dot());
+        c.push_over_ui();
+        c.push_clip([0.0, 0.0, 10.0, 10.0]);
+        c.push_draw(dot());
+        c.pop_clip();
+        c.push_over_ui();
+        c.pop_over_ui();
+        c.push_draw(dot()); // still inside the outer push
+        c.pop_over_ui();
+        c.pop_over_ui(); // unbalanced: ignored
+        c.push_draw(dot());
+
+        let items = c.take_draw_items();
+        let over: Vec<bool> = items.iter().map(|i| i.over_ui).collect();
+        assert_eq!(over, [false, true, true, false]);
+        // The two stamps are independent.
+        assert_eq!(items[1].clip, Some([0.0, 0.0, 10.0, 10.0]));
+        assert_eq!(items[2].clip, None);
+
+        // A frame that never pops still starts the next one under the UI.
+        c.push_over_ui();
+        let _ = c.take_draw_items();
+        c.push_draw(dot());
+        assert!(!c.take_draw_items()[0].over_ui);
     }
 
     #[test]
