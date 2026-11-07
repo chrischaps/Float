@@ -8,7 +8,7 @@ use super::scene_loading::{
     build_model_load_config, load_animations_from_world, load_audio_from_world,
     load_scripts_from_world, load_sequences_from_world, load_sprite_animations_from_world,
     load_terrain_from_world_inner, register_node_animation_data, register_skeletal_data,
-    resolve_procgen_assets, resolve_scene_path,
+    resolve_scene_path,
 };
 use super::PlayerApp;
 use flint_core::components as comp;
@@ -347,6 +347,8 @@ impl PlayerApp {
             Ok((world, scene_file)) => {
                 self.world = world;
                 self.scene_path = new_scene_path.clone();
+                // A slow-motion moment never outlives the scene that asked for it
+                self.clock.time_scale = 1.0;
                 self.skybox_path = scene_file
                     .environment
                     .as_ref()
@@ -374,6 +376,7 @@ impl PlayerApp {
                         .map(|s| (env.sheen_color.unwrap_or([1.0; 3]), s))
                 });
                 self.scene_camera = scene_file.camera.clone();
+                super::scene_loading::load_user_styles(&new_scene_path);
                 self.scene_post_process = scene_file.post_process.clone();
                 self.scene_input_config = scene_file.scene.input_config.clone();
                 self.scene_preload_audio = scene_file.scene.preload_audio;
@@ -393,6 +396,8 @@ impl PlayerApp {
     fn bring_up_scene(&mut self) {
         // Apply camera config before borrowing renderer
         self.apply_camera_def();
+        // The new scene's [post_process] with --style over it (#328)
+        let scene_post_config = self.scene_post_config();
 
         // Reload models
         if let (Some(renderer), Some(context)) = (&mut self.scene_renderer, &self.render_context) {
@@ -407,32 +412,19 @@ impl PlayerApp {
                 self.content_store.as_ref(),
             );
 
-            // Discover procgen specs and resolve unresolved assets before model loading
-            {
-                let scene_dir = Path::new(&self.scene_path)
-                    .parent()
-                    .unwrap_or(Path::new("."));
-                let mut spec_dirs = vec![scene_dir.join("specs")];
-                if let Some(parent) = scene_dir.parent() {
-                    spec_dirs.push(parent.join("specs"));
-                }
-                spec_dirs.push(scene_dir.join("models"));
-                let dir_refs: Vec<&Path> = spec_dirs
-                    .iter()
-                    .filter(|d| vfs::is_dir(d))
-                    .map(|d| d.as_path())
-                    .collect();
-                self.procgen_resolver.discover_and_index(&dir_refs);
-
-                resolve_procgen_assets(
-                    &self.world,
-                    &mut self.procgen_resolver,
+            // Procgen before the model loader: catalog > procgen > file (#32).
+            super::procgen_assets::resolve_scene(
+                &self.scene_path,
+                &self.world,
+                &mut self.procgen_resolver,
+                self.procgen_mode,
+                super::procgen_assets::GpuSink {
                     renderer,
-                    &context.device,
-                    &context.queue,
-                    &config,
-                );
-            }
+                    device: &context.device,
+                    queue: &context.queue,
+                    config: &config,
+                },
+            );
 
             let load_result = model_loader::load_models_from_world(
                 &mut self.world,
@@ -453,8 +445,12 @@ impl PlayerApp {
                 renderer,
                 Some(&mut self.physics),
                 &context.device,
+                &context.queue,
             );
             renderer.update_from_world(&self.world, &context.device);
+            // The new scene's first frame has no past: styles that keep
+            // history (ASCII's temporal stability, #277) start over
+            renderer.reset_style_history();
 
             // Scene-authored hemisphere ambient + wrap; reset first so the
             // previous scene's values never leak into one that doesn't
@@ -494,18 +490,20 @@ impl PlayerApp {
             }
 
             // Apply post-process config
-            if let Some(pp_def) = &self.scene_post_process {
-                renderer.set_post_process_config(
-                    super::scene_loading::post_process_config_from_def(pp_def),
-                );
-                renderer.ensure_kuwahara_resources(&context.device, &context.queue);
+            if let Some(config) = scene_post_config {
+                renderer.set_post_process_config(config);
+                renderer.ensure_style_resources(&context.device);
                 renderer.ensure_fxaa_resources(&context.device);
             }
         }
 
         // Reload terrain
+        // The scene panels go with the scene. Rendering & Effects (F4) and
+        // the game's own panels belong to the player and are kept (open or
+        // closed as they were); before #268 they were dropped here and
+        // never made again, so F4 went dead after the first transition.
         #[cfg(feature = "debug-hud")]
-        self.debug_panels.clear();
+        self.drop_scene_debug_panels();
         if let (Some(renderer), Some(context)) = (&mut self.scene_renderer, &self.render_context) {
             let mut grass_info = None;
             load_terrain_from_world_inner(
@@ -542,6 +540,10 @@ impl PlayerApp {
             self.create_visitor_debug_panel();
             self.create_dead_calm_debug_panel();
             self.create_camera_debug_panel();
+            self.create_particles_debug_panel();
+            self.create_styles_debug_panel();
+            self.create_render_debug_panel();
+            self.create_extension_debug_panels();
         }
         self.apply_camera_tuning();
 

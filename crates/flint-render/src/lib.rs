@@ -11,9 +11,12 @@ pub mod bitmap_font;
 mod camera;
 mod context;
 mod debug;
+mod file_watch;
 pub mod frustum;
 pub mod gpu_select;
+pub mod bind_cache;
 pub mod gpu_timer;
+pub mod glyph_atlas;
 mod gpu_mesh;
 pub mod grass_pipeline;
 pub mod ground_fog;
@@ -21,14 +24,19 @@ mod headless;
 pub mod model_loader;
 pub mod ocean_pipeline;
 pub mod orbit_controller;
+pub mod palette;
 pub mod particle_pipeline;
 mod pipeline;
 pub mod postprocess;
 mod primitives;
+pub mod quality;
 pub mod render_scale;
 pub mod render_stats;
 mod scene_renderer;
 pub mod shadow;
+pub mod entity_style;
+pub mod style_mask;
+pub mod stylize;
 pub mod skinned_pipeline;
 pub mod sky_pipeline;
 pub mod skybox_pipeline;
@@ -38,7 +46,11 @@ pub mod water_body;
 mod texture_cache;
 pub mod world_line_pipeline;
 
+pub use style_mask::{StyleIds, STYLE_MASK_FORMAT};
 pub use atlas::{AtlasRegistry, TextureAtlas};
+pub use glyph_atlas::{
+    EdgeGlyphs, GlyphAtlas, GlyphError, GlyphRamp, GlyphSet, GlyphSetCache, GpuGlyphAtlas,
+};
 pub use billboard_pipeline::BillboardPipeline;
 pub use bitmap_font::{anchor_origin, apply_fill, BitmapFont};
 pub use camera::{Camera, CameraMode};
@@ -74,11 +86,12 @@ pub use primitives::{
     generate_skeleton_lines_colored, srgb_to_linear, triangles_to_wireframe_indices, Mesh,
     SkinnedMesh, SkinnedVertex, Vertex,
 };
+pub use quality::{gpu_info, GpuInfo, QualitySettings, QualityValue};
 pub use render_scale::{clamp_render_scale, scaled_size, MIN_RENDER_SCALE};
 pub use render_stats::{format_count, RenderStats};
 pub use scene_renderer::{
-    load_particle_textures, ArchetypeVisual, LightingLevers, RendererConfig, SceneRenderer,
-    DEFAULT_CLEAR_COLOR,
+    load_particle_textures, ArchetypeVisual, LightingLevers, LodSettings, RendererConfig,
+    SceneRenderer, DEFAULT_CLEAR_COLOR,
 };
 pub use skinned_pipeline::SkinnedPipeline;
 pub use sky_pipeline::{SkyParams, SkyPipeline, SkyUniformsGpu};

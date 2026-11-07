@@ -255,6 +255,23 @@ pub enum ScriptCommand {
         param: String,
         value: f64,
     },
+    /// Draw an entity (and its descendants) in a per-entity style such as
+    /// `ascii` (#269). The player adds the style's component.
+    SetEntityStyle {
+        entity_id: i64,
+        style: String,
+    },
+    /// Change one setting of an entity's style: a parameter (number), an
+    /// option (string), `enabled` (bool) or a 3-array such as `tint`.
+    SetStyleParam {
+        entity_id: i64,
+        param: String,
+        value: toml::Value,
+    },
+    /// Take an entity's own style off again.
+    ClearEntityStyle {
+        entity_id: i64,
+    },
     LoadScene {
         path: String,
     },
@@ -532,11 +549,29 @@ pub struct ScriptCallContext {
     pub postprocess_mode_params_override: Option<[f32; 4]>,
     /// Script-driven audio low-pass filter override (cutoff frequency in Hz)
     pub audio_lowpass_cutoff_override: Option<f32>,
+    /// Time scale asked for by `set_time_scale`, applied to the game clock
+    /// from the next frame and held until changed or a scene loads.
+    pub time_scale_request: Option<f64>,
     /// Script-driven cursor capture request. Games without a character
     /// controller (which normally gates capture) use this for mouse look.
     pub cursor_captured_override: Option<bool>,
     /// `set_touch_controls(enabled)` this frame (#134).
     pub touch_controls_override: Option<bool>,
+    /// `set_lod_scale(scale)` / `set_draw_distance_scale(scale)` this frame
+    /// (#56); the host hands them to the renderer.
+    pub lod_scale_request: Option<f32>,
+    pub draw_distance_scale_request: Option<f32>,
+    /// The renderer's scales now, for `lod_scale()` and
+    /// `draw_distance_scale()`. The host sets them each frame.
+    pub lod_scale: f32,
+    pub draw_distance_scale: f32,
+    /// The quality settings as scripts see them (FlintKart#55): what the
+    /// host applied, with any `set_quality` this frame merged in.
+    pub quality: flint_core::quality::QualitySettings,
+    /// A `set_quality` call wants `quality` applied at the next frame.
+    pub quality_requested: bool,
+    /// What the GPU is, for `gpu_info()`. The host sets it once.
+    pub gpu_info: flint_core::quality::GpuInfo,
     /// Whether the cursor is captured now, for `is_cursor_captured()`
     /// (ADR 0110). The host sets it each frame.
     pub cursor_captured: bool,
@@ -637,8 +672,16 @@ impl ScriptCallContext {
             postprocess_render_mode_override: None,
             postprocess_mode_params_override: None,
             audio_lowpass_cutoff_override: None,
+            time_scale_request: None,
             cursor_captured_override: None,
             touch_controls_override: None,
+            lod_scale_request: None,
+            draw_distance_scale_request: None,
+            lod_scale: 1.0,
+            draw_distance_scale: 1.0,
+            quality: Default::default(),
+            quality_requested: false,
+            gpu_info: Default::default(),
             cursor_captured: false,
             state_machine: std::ptr::null_mut(),
             persistent_store: std::ptr::null_mut(),

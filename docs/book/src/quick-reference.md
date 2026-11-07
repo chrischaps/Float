@@ -28,6 +28,8 @@ A scannable cheat sheet for daily Flint development.
 | `flint play-chart <manifest> --chart <chart>` | Play a chart with live gamepad capture (`--record`, `--window`) |
 | `flint replay-chart <manifest> --chart <chart>` | Replay a recorded or synthetic session headless |
 | `flint render-suite <manifest> -o out.wav` | Render a scripted suite session to WAV |
+| `flint render-suite <file>.goldens.toml` | Render scenes and gate them against golden PNGs (`--bless` rewrites) |
+| `flint render <scene> --style ascii:cell=12` | Preview any registered style over a scene |
 | `flint spike-rumble` | Time the gamepad rumble paths |
 
 Music commands are detailed in [Music Commands](cli-reference/music.md).
@@ -176,7 +178,6 @@ desaturate = 0.0                # 0 = full colour, 1 = ash-grey
 dof_strength = 0.0              # 0 = sharp
 dof_focus_distance = 10.0       # view metres
 dof_focus_range = 5.0
-kuwahara_enabled = false        # painterly pre-pass
 film_grain = 0.0                # 0.02-0.05 is subtle
 grade_lift = [0.0, 0.0, 0.0]    # after ACES; neutral 0,0,0
 grade_gamma = [1.0, 1.0, 1.0]

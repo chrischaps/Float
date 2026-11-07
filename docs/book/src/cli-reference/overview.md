@@ -35,7 +35,7 @@ Flint's CLI is the primary interface for all engine operations. Below is a refer
 | `flint calibrate <manifest>` | Tap-to-beat latency calibration, written to `logs/latency/` |
 | `flint play-chart <manifest>` | Play a suite against its chart with live gamepad capture |
 | `flint replay-chart <manifest>` | Replay a recorded or synthetic session through judgment, headless |
-| `flint render-suite <manifest>` | Render a scripted suite session to WAV, offline and deterministic |
+| `flint render-suite <manifest>` | Render a suite offline and deterministically: a music `.suite.toml` to WAV, or a `.goldens.toml` of scenes gated against golden PNGs ([Headless Rendering](../guides/headless-rendering.md#golden-suites)) |
 | `flint spike-rumble` | Time the gamepad rumble command paths |
 
 The seven music commands are documented on their own page: [Music Commands](music.md).
@@ -58,13 +58,17 @@ flint play levels/tavern.scene.toml --schemas schemas --fullscreen
 | `--sfx-volume <f32>` | Initial gain for the `sfx` mixer bus |
 | `--gpu <name>` | GPU adapter to use (case-insensitive substring, e.g. `NVIDIA`). See [GPU Selection](#gpu-selection) |
 | `--list-gpus` | Print available GPU adapters and exit |
+| `--style <name[:k=v,...]>` | Turn a registered style on over the scene's post-processing, as `flint render --style` does: `ascii`, `ascii:cell=12,ramp=blocks`, `ascii:off`. Repeatable; a later word wins. Written over every scene again after a transition, so it survives them (#328) |
+| `--style-time <s>` | Hold the post time animated styles see (shared with the ocean, grain and render modes) at this many seconds |
 
 `--music-volume 0` is the quickest way to audition a scene's sound design
 without its score. See [Audio: Mixer Buses](../concepts/audio.md#mixer-buses).
 
 The standalone `flint-player` binary takes the same flags plus `--msaa <1|4>`
 (default `1`) for multisample anti-aliasing of the scene passes; `flint play`
-does not expose `--msaa`.
+does not expose `--msaa`. Its `--procgen-defer` shows placeholders for a
+scene's procgen assets at once and generates them over the following frames
+instead of during load (see [Specs in Scenes](../concepts/procgen.md#specs-in-scenes)).
 
 ### Player Screenshots (HUD included)
 
@@ -273,19 +277,48 @@ flint render scene.toml -o shot.png --distance 20 --pitch 30 --yaw 45 --target 0
 | `--width <px>` | `1920` | Image width |
 | `--height <px>` | `1080` | Image height |
 | `--gpu <name>` | (high-perf) | GPU adapter to use (substring match); `--list-gpus` prints the names |
+| `--list-styles` | | Print every registered style, its stage, table, and each parameter's default and range, then exit; with a scene, its `styles/` user styles too ([Stylize Passes](../concepts/stylize-passes.md#listing-the-styles)) |
+| `--json` | | With `--list-styles`: the list as JSON, for agents |
 | `--distance <f32>` | (auto) | Camera distance from target |
 | `--yaw <deg>` | (auto) | Horizontal camera angle |
 | `--pitch <deg>` | (auto) | Vertical camera angle |
 | `--target <x,y,z>` | (auto) | Camera look-at point |
 | `--fov <deg>` | (auto) | Field of view |
 | `--no-grid` | `false` | Disable ground grid |
-| `--debug-mode <mode>` | (none) | `wireframe`, `normals`, `depth`, `uv`, `unlit`, `metalrough` |
+| `--debug-mode <mode>` | (none) | `wireframe`, `normals`, `depth`, `uv`, `unlit`, `metalrough`, `style` |
 | `--wireframe-overlay` | `false` | Wireframe edges on solid geometry |
 | `--show-normals` | `false` | Normal direction arrows |
 | `--no-tonemapping` | `false` | Raw linear output |
 | `--no-shadows` | `false` | Disable shadow mapping |
 | `--shadow-resolution <px>` | `2048` | Shadow map resolution per cascade. A real control since the per-resolution texel upload (ADR 0049); earlier builds silently filtered as if 2048 |
 | `--msaa <n>` | `1` | MSAA sample count for the scene passes: `1` (off) or `4`. Default 1 keeps headless pixel-diff gates single-sample (ADR 0058) |
+| `--render-scale <f32>` | `1` | Draw the scene at this fraction of the image on each side (0.25–1), upscaled in the composite, as `flint-player --render-scale` (#122) |
+| `--gpu-time <frames>` | (none) | Render the frame this many times with GPU timing on and print each pass's smoothed time (ADR 0108) before writing the image |
+| `--ascii` | (off) | The full-screen ASCII style (#265, [Stylize Passes](../concepts/stylize-passes.md#ascii)): one glyph per cell on one screen grid. Any `--ascii-*` flag below marked *style* also turns it on |
+| `--ascii-font <name>` | `builtin` | *Style:* glyph set, `builtin` or `fonts/<name>.glyphs.toml` beside the scene ([Glyph Atlas](../concepts/glyph-atlas.md)) |
+| `--ascii-ramp <name>` | the set's | *Style:* ramp of that set (built-in: `classic`, `blocks`, `minimal`, `detailed`) |
+| `--ascii-color <mode>` | `source` | *Style:* `source` (the cell's hue), `tint` (one colour), `raw` (the cell's colour as it is), `mono` (white on grey) or `palette` ([colour modes](../concepts/stylize-passes.md#colour-modes)) |
+| `--ascii-palette <name>` | `phosphor` | *Style:* palette for `palette` mode: `cga`, `cga-warm`, `cga16`, `phosphor`, `amber`, `mono` or `palettes/<name>.palette.toml` beside the scene; sets `--ascii-color palette` unless that's given |
+| `--ascii-ground <mode>` | `dim` | *Style:* behind the glyph: `dim` (the mode's own), `black` or `inverse` (ink fills the cell, the glyph is cut out) |
+| `--ascii-glow <f32>` | `0` | *Style:* halo around bright glyphs (0.6 reads as a phosphor tube) |
+| `--ascii-tint <r,g,b>` | `0.35,1,0.45` | *Style:* the tint colour; sets `--ascii-color tint` unless that's given |
+| `--ascii-text <file>` | (none) | Also write the ASCII grid as UTF-8 text: a line per cell row, a character per cell, matching the PNG (a passed-through cell is a space; #317, [Reading a render as text](../guides/headless-rendering.md#reading-a-render-as-text)). Needs the style on; not with `--sweep` |
+| `--ascii-text-ansi <file>` | (none) | The same grid with 24-bit ANSI colours, each glyph's ink over its ground |
+| `--ascii-background <f32>` | `0.15` | *Style:* how much of the cell's colour fills behind its glyph (0 black) |
+| `--ascii-brightness <f32>` / `--ascii-contrast <f32>` | `0` / `1` | *Style:* luminance remap before the ramp: contrast about mid-grey, then an offset |
+| `--ascii-ink <f32>` | `1` | *Style:* glyph ink brightness |
+| `--ascii-dither <f32>` | `0` | *Style:* ordered dither before the ramp, fixed to the grid (#277) |
+| `--ascii-exposure <f32>` / `--ascii-normalize <f32>` | `0` / `0` | *Style:* stops of gain on each cell's colour; stretch each style id's tone range over the ramp, from this frame (#289) |
+| `--pixels-per-point <f32>` | `1` | A high-DPI window's scale factor: styles sized in points (ASCII cells) scale by it |
+| `--ascii-cell <n>` | `8` | ASCII cell width in points (height follows the font) |
+| `--ascii-levels <n>` | `0` | ASCII tone bands; `0` keeps the whole ramp |
+| `--ascii-footprint <cells>` | `1` | How many cells wide each cell's tone is averaged over |
+| `--ascii-no-edges` | `false` | Turn off the line glyphs (`─ │ ╱ ╲`) drawn on depth, normal and silhouette edges; the style's `edges = 0` |
+| `--ascii-edges <f32>` | `1` | *Style:* edge glyph strength over the tone glyph, 0 off to 1 ([Edges](../concepts/stylize-passes.md#edges), #267) |
+| `--ascii-edge-threshold <f32>` | `0.5` | *Style:* cell widths of edge a cell needs to draw a line glyph (lower finds more) |
+| `--ascii-edge-max <f32>` | `3` | *Style:* more edge than this is texture (grass) and keeps its tone glyph; a styled entity's outline ignores it |
+| `--ascii-edge-depth <f32>` | `0.6` | Relative view-distance step that counts as an edge (lower finds more) |
+| `--ascii-edge-normal <f32>` | `2.5` | Normal change that counts as a crease (lower finds more) |
 | `--no-postprocess` | `false` | Disable post-processing |
 | `--bloom-intensity <f32>` | `0.04` | Bloom strength |
 | `--bloom-threshold <f32>` | `1.0` | Bloom brightness threshold |
@@ -307,8 +340,11 @@ flint render scene.toml -o shot.png --distance 20 --pitch 30 --yaw 45 --target 0
 | `--kuwahara-sharpness <f32>` | `8.0` | Kuwahara sector sharpness |
 | `--kuwahara-hardness <f32>` | `8.0` | Kuwahara sector hardness |
 | `--kuwahara-anisotropy <f32>` | `1.0` | Kuwahara anisotropy (0 = isotropic, 1 = full) |
+| `--edge-depth <f32>` / `--edge-normal <f32>` | `0.6` / `2.5` | The [shared geometry edges](../concepts/stylize-passes.md#shared-edges)' silhouette and crease thresholds, for every style that reads them |
 | `--film-grain <f32>` | `0` | Animated film grain (0 = off; 0.02–0.05 is subtle) |
 | `--grain-time <s>` | `0.0` | Post time for grain and render-mode animation. Deterministic: two renders at the same value are identical |
+| `--style <name[:k=v,...]>` | (none) | Turn on any registered style over the scene's post-processing: `ascii`, `ascii:cell=12,ramp=blocks`, `invert:strength=0.5`, `kuwahara:radius=6`, `ascii:off`. Repeatable; a later word wins; `--style help` lists every style and its keys ([Stylize Passes](../concepts/stylize-passes.md#using-a-style)) |
+| `--style-time <s>` | `0.0` | Post time animated styles read; the same clock as `--grain-time`, and it wins when both are given |
 | `--particle-time <s>` | (none) | Simulate particle emitters and effects for this long at a fixed 1/60 s step before capturing. Deterministic; without it no particles are drawn |
 | `--grade-lift <r,g,b>` | `0,0,0` | Colour-grade lift (per-channel add after ACES) |
 | `--grade-gamma <r,g,b>` | `1,1,1` | Colour-grade gamma (per-channel curve) |
@@ -414,6 +450,7 @@ integrated GPU.
 | `--sequence-loop` | `false` | Loop the sequence regardless of its `loop` setting |
 | `--anim-time <s>` | (none) | With `--render`: sample the animation (or replay the sequence) at this time |
 | `--render <path>` | (none) | Render to PNG instead of opening a window |
+| `--style <name[:k=v,...]>` / `--style-time <s>` | (none) | With `--render`: a registered style over the snapshot, as on `flint render` (also for `.particles.toml`) |
 
 ### Particle Editor Flags
 
@@ -523,13 +560,39 @@ flint gen specs/oak_tree.procgen.toml --batch 10 --seed-start 0
 | `--seed <u64>` | (from spec) | Override the spec's seed |
 | `--dry-run` | `false` | Print estimated cost without generating |
 | `--format <fmt>` | (auto) | Force output format: `glb` or `png` |
-| `--batch <N>` | (none) | Generate N variants with sequential seeds |
-| `--seed-start <u64>` | `0` | Starting seed for batch generation |
-| `--register` | `false` | Store output in content store with provenance |
-| `--force` | `false` | Regenerate even if cached |
+| `--batch <N>` | (none) | Generate N (at least 1) variants with sequential seeds, named `<stem>_<seed>.<ext>` |
+| `--seed-start <u64>` | `0` | First seed of a batch (requires `--batch`) |
+| `--register` | `false` | Store output in the content store with a provenance sidecar; reuse a stored result for the same spec + seed |
+| `--force` | `false` | With `--register`, regenerate even if this spec + seed is stored |
 | `--validate` | `false` | Validate output after generation |
 | `--strict` | `false` | Treat warnings as failures |
 | `--style-guide <path>` | (none) | Style guide TOML for validation constraints |
+| `--report <fmt>` | `human` | Validation report format: `human`, or `json` (one object per variant on stdout, with each check's `actual` and `limit`; human output moves to stderr). Requires `--validate` |
+
+AI assistance runs before generation; the agent's feedback goes to stderr:
+
+```bash
+ANTHROPIC_API_KEY=... flint gen --ai-create "twisted dead tree" -o tree.glb
+flint gen specs/oak_tree.procgen.toml --ai-assist --max-cost 0.50 -o tree.glb
+flint gen specs/stone_wall.procgen.toml --ai-refine --reference photo.png -o wall.png
+flint gen --cost-report --since 2026-10-01
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--ai-create <text>` | (none) | Create a spec from a description, then generate it (no spec file) |
+| `--ai-generator <name>` | (guessed) | With `--ai-create`: `tree_v1`, `texture_v1` or `creature_v1` |
+| `--ai-assist` | `false` | Interpret the spec, then refine it |
+| `--ai-refine` | `false` | Refine against `--reference <image>` |
+| `--refine-rounds <N>` | `--ai-iterations` | With `--reference`: most measured refine rounds (1-8). Each round's result is rendered (meshes headlessly) and measured against the reference; the refine asks again while the distance falls and keeps the closest spec |
+| `--ai-provider <name>` | `anthropic` | `anthropic` or `mock` (offline, free) |
+| `--ai-model <id>` | `claude-opus-5-5` | Model; `.flint/procgen_ai.toml` can set the default |
+| `--ai-iterations <N>` | `3` | Rounds per AI step (1-20) |
+| `--print-spec` | `false` | Print the final spec as TOML on stdout (the summary moves to stderr) |
+| `--save-spec <path>` | (none) | Write the final spec to a file |
+| `--max-cost <USD>` | (none) | Refuse any AI call that could take the run past this amount |
+| `--cost-report` | `false` | Summarize `.flint/procgen_costs.json` by provider, model and spec |
+| `--since <date>` | (none) | With `--cost-report`: only calls from `YYYY-MM-DD` on |
 
 ## The `prefab view` Command
 

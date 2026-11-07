@@ -165,11 +165,28 @@ pub struct EditArgs {
     /// fire, smoke, sparks or rain (particles)
     #[arg(long)]
     pub preset: Option<String>,
+
+    /// `--style name[:key=value,...]` and `--style-time` (the scene viewer,
+    /// kept through hot reloads; model and particles with --render)
+    #[command(flatten)]
+    pub style: crate::commands::common_args::StyleArgs,
 }
 
 pub fn run(args: EditArgs) -> Result<()> {
     let path = Path::new(&args.file);
     let file_kind = detect_file_kind(path)?;
+    let styled = !args.style.styles.is_empty() || args.style.style_time.is_some();
+    let renders =
+        args.render.is_some() && matches!(file_kind, FileKind::Model | FileKind::ParticleEffect);
+    // The scene viewer takes them too (#328), but not the spline editor
+    let scene_viewer = matches!(file_kind, FileKind::Scene) && !args.spline;
+    if styled && !renders && !scene_viewer {
+        eprintln!(
+            "warning: --style / --style-time apply to the scene viewer and to \
+             `--render` of a model or a .particles.toml; this editor ignores them \
+             (`flint render --style` takes a scene)"
+        );
+    }
 
     match file_kind {
         FileKind::Scene => {
@@ -191,6 +208,10 @@ pub fn run(args: EditArgs) -> Result<()> {
                     schemas_path,
                     !args.no_inspector,
                     args.auto_orbit,
+                    flint_viewer::app::ViewerStyle {
+                        specs: args.style.styles.clone(),
+                        time: args.style.style_time,
+                    },
                 )
             }
         }
@@ -244,6 +265,7 @@ pub fn run(args: EditArgs) -> Result<()> {
                 pitch: args.pitch,
                 target: args.target,
                 fov: args.fov,
+                style: args.style,
             })
         }
         FileKind::Model => {
@@ -269,6 +291,7 @@ pub fn run(args: EditArgs) -> Result<()> {
                 sequence: args.sequence,
                 sequence_loop: args.sequence_loop,
                 auto_orbit: args.auto_orbit,
+                style: args.style,
             })
         }
     }

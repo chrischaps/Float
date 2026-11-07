@@ -13,7 +13,7 @@
 //! play sound before the first click anyway. Then it checks the bundle
 //! against itself before writing anything: every scene must load with its
 //! prefabs, every archetype must be in the bundled schemas, and every file a
-//! scene, prefab, particle effect or script names must be packed. A missing
+//! scene, prefab, particle effect, glyph set or script names must be packed. A missing
 //! file fails here rather than as a pink texture deep in play.
 //!
 //! `bundle.toml` in the game root (every key optional):
@@ -282,6 +282,10 @@ fn looks_like_file(s: &str) -> bool {
         return false;
     }
     let name = s.rsplit(['/', '\\']).next().unwrap_or(s);
+    // ".scene.toml" names a suffix (a script stripping it), not a file
+    if name.starts_with('.') {
+        return false;
+    }
     match name.rsplit_once('.') {
         Some((stem, ext)) => {
             !stem.is_empty() && ASSET_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str())
@@ -380,7 +384,9 @@ fn check_references(files: &BTreeMap<String, Vec<u8>>) -> Vec<Missing> {
         let refs = if path.ends_with(".scene.toml")
             || path.ends_with(".prefab.toml")
             || path.ends_with(".particles.toml")
+            || path.ends_with(".glyphs.toml")
             || path.ends_with(".chunk.toml")
+            || path.ends_with(flint_render::stylize::custom::SUFFIX)
         {
             let Ok(text) = std::str::from_utf8(bytes) else {
                 continue;
@@ -480,8 +486,39 @@ fn check_scenes(source: Arc<MemorySource>, scenes: &[String], schemas: &[String]
                 }),
             }
         }
+        problems.extend(check_user_styles(scenes));
         problems
     })
+}
+
+/// Load the user styles (ADR 0112) each scene sees from the packed files,
+/// as the web player will: a description that doesn't read, a shader that
+/// isn't packed or doesn't compile (naga, natively) is a problem now
+/// rather than a passthrough in the browser (#275). Runs inside the
+/// bundle's vfs scope.
+fn check_user_styles(scenes: &[String]) -> Vec<Missing> {
+    let dirs: BTreeSet<String> = scenes.iter().map(|s| parent_of(s)).collect();
+    let mut problems = Vec::new();
+    for dir in dirs {
+        for message in flint_render::stylize::custom::load_dir(Path::new(&dir)) {
+            // Check warnings (loop counts, texture reads) are for the author,
+            // not reasons to refuse a bundle
+            if message.contains(": warning: ") {
+                continue;
+            }
+            // Messages lead with the file they're about (bundle paths are
+            // relative, so the first ": " ends it)
+            let (from, what) = message
+                .split_once(": ")
+                .map(|(f, w)| (normalize(Path::new(f)), w.to_string()))
+                .unwrap_or_else(|| (format!("{dir}/styles"), message.clone()));
+            problems.push(Missing {
+                from,
+                what: format!("(user style doesn't load: {})", what.trim_end()),
+            });
+        }
+    }
+    problems
 }
 
 fn mb(bytes: u64) -> String {
@@ -708,6 +745,7 @@ mod tests {
         assert!(looks_like_file("raft.rhai"));
         assert!(looks_like_file("textures\\rain_drop.png"));
         assert!(!looks_like_file(".ogg"));
+        assert!(!looks_like_file(".scene.toml"));
         assert!(!looks_like_file("audio/music_"));
         assert!(!looks_like_file("https://x.com/a.png"));
         assert!(!looks_like_file("Press any key.png now"));
@@ -780,6 +818,28 @@ mod tests {
     }
 
     #[test]
+    fn a_glyph_set_must_pack_its_font() {
+        let files = pack(&[
+            (
+                "fonts/terminal.glyphs.toml",
+                "[font]\nfile = \"Mono.ttf\"\n[ramps.a]\nglyphs = \" .\"\n",
+            ),
+            (
+                "fonts/crt.glyphs.toml",
+                "[font]\nfile = \"crt.png\"\ncell = [8, 8]\n",
+            ),
+            ("fonts/Mono.ttf", ""),
+        ]);
+        assert_eq!(
+            check_references(&files),
+            [Missing {
+                from: "fonts/crt.glyphs.toml".into(),
+                what: "crt.png".into()
+            }]
+        );
+    }
+
+    #[test]
     fn scenes_load_from_the_bundle_with_prefabs_and_archetypes() {
         let files = pack(&[
             ("schemas/archetypes/prop.toml", "[archetype.prop]\ncomponents = []\n"),
@@ -801,5 +861,57 @@ mod tests {
         assert_eq!(problems.len(), 2, "{problems:?}");
         assert!(problems[0].what.contains("\"ghost\""));
         assert_eq!(problems[1].from, "levels/b.scene.toml");
+    }
+
+    /// #275: a user style must pack its shader, and the shader must
+    /// compile, since the web player would only draw a passthrough.
+    #[test]
+    fn user_styles_are_checked_from_the_bundle() {
+        let files = pack(&[
+            (
+                "styles/bundle_ok.shader.toml",
+                "version = 1\nname = \"bundle_ok\"\nshader = \"ok.wgsl\"\n",
+            ),
+            (
+                "styles/ok.wgsl",
+                "fn style(p: StylePixel) -> vec4<f32> {\n    return p.color;\n}\n",
+            ),
+            (
+                "styles/bundle_broken.shader.toml",
+                "version = 1\nname = \"bundle_broken\"\nshader = \"broken.wgsl\"\n",
+            ),
+            (
+                "styles/broken.wgsl",
+                "fn style(p: StylePixel) -> vec4<f32> {\n    return p.colour;\n}\n",
+            ),
+            (
+                "styles/bundle_unpacked.shader.toml",
+                "version = 1\nname = \"bundle_unpacked\"\nshader = \"gone.wgsl\"\n",
+            ),
+            ("levels/a.scene.toml", "[scene]\nname = \"a\"\n"),
+        ]);
+        // The description names its shader: a missing one is a reference
+        assert_eq!(
+            check_references(&files),
+            [Missing {
+                from: "styles/bundle_unpacked.shader.toml".into(),
+                what: "gone.wgsl".into()
+            }]
+        );
+        let source: MemorySource = files.iter().map(|(p, b)| (p.as_str(), b.clone())).collect();
+        let problems = vfs::scoped(Arc::new(source), || {
+            check_user_styles(&["levels/a.scene.toml".into()])
+        });
+        assert_eq!(problems.len(), 2, "{problems:?}");
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.from.starts_with("styles/broken.wgsl:2:") && p.what.contains("colour")),
+            "{problems:?}"
+        );
+        assert!(
+            problems.iter().any(|p| p.from.contains("gone.wgsl")),
+            "{problems:?}"
+        );
     }
 }

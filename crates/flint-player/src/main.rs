@@ -17,11 +17,11 @@
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use flint_core::bundle::Bundle;
+use flint_core::vfs;
 use flint_player::PlayerApp;
 use flint_scene::load_scene;
 use flint_schema::SchemaRegistry;
-use flint_core::bundle::Bundle;
-use flint_core::vfs;
 use std::sync::Arc;
 use winit::event_loop::{ControlFlow, EventLoop};
 
@@ -63,17 +63,45 @@ struct Args {
     #[arg(long, default_value_t = 1)]
     msaa: u32,
 
+    /// Don't generate procgen assets during load: show placeholders (a
+    /// magenta box or texel) and swap each real asset in as the
+    /// frame-budgeted queue makes it (#32)
+    #[arg(long)]
+    procgen_defer: bool,
+
     /// Draw the 3D scene at this fraction of the window's pixels on each
     /// side (0.25-1), upscaled under a full-resolution HUD; `auto` steps
     /// down to hold 60 fps and back up when it can (#122)
     #[arg(long, value_name = "SCALE|auto")]
     render_scale: Option<String>,
 
+    /// Quality settings as `key=value,...`, applied over --msaa and
+    /// --render-scale (FlintKart#55). Keys: render_scale, render_scale_auto,
+    /// msaa, shadows, shadow_resolution, shadow_cascades, shadow_distance,
+    /// post_process, bloom, ssao, ssao_samples, fog, volumetric. Scripts
+    /// change them while running with set_quality()
+    #[arg(long, value_name = "KEY=VALUE,...")]
+    quality: Option<String>,
+
     /// On-screen touch controls from the input config's `[touch_controls]`
     /// block (#133): `auto` shows them once a finger touches, `always`
     /// shows them and lets the mouse's left button drive them, `never`
     #[arg(long, value_name = "auto|always|never", default_value = "auto")]
     touch_controls: String,
+
+    /// Turn on a registered style over the scene's post-processing, as
+    /// `flint render --style` does (#328): `name[:key=value,...]`, e.g.
+    /// `ascii`, `ascii:cell=12,ramp=blocks`, `pencil:spacing=5`,
+    /// `ascii:off`. Repeatable; a later word wins. Written over every
+    /// scene's `[post_process]` again after each transition, so it survives
+    /// them. `--style help` lists every style and its keys
+    #[arg(long = "style", value_name = "NAME[:KEY=VALUE,...]")]
+    styles: Vec<String>,
+
+    /// Hold the post time animated styles see (and the ocean, grain and
+    /// render modes, which share it) at this many seconds
+    #[arg(long, value_name = "SECONDS")]
+    style_time: Option<f32>,
 
     /// GPU adapter to use (case-insensitive substring of the adapter name,
     /// e.g. "NVIDIA"). Overrides WGPU_ADAPTER_NAME; default prefers the
@@ -180,6 +208,13 @@ fn main() -> Result<()> {
         SchemaRegistry::new()
     };
 
+    // --style words, checked once the scene's own styles are registered
+    // (a user style is known only then, #274) so a typo stops here
+    if !args.styles.is_empty() {
+        flint_player::load_user_styles(&args.scene);
+        flint_render::stylize::check_style_specs(&args.styles).map_err(anyhow::Error::msg)?;
+    }
+
     // Load scene
     let (world, scene_file) = load_scene(&args.scene, &registry).context("Failed to load scene")?;
 
@@ -216,14 +251,29 @@ fn main() -> Result<()> {
     );
 
     app.msaa_sample_count = args.msaa;
+    // A bundle's files aren't on the disk: nothing to key a disk cache by.
+    app.procgen_disk_cache = args.bundle.is_none();
+    if args.procgen_defer {
+        app.procgen_mode = flint_player::ProcGenMode::Deferred;
+    }
     if let Some(value) = &args.render_scale {
         app.render_scale = flint_player::RenderScaleSetting::default()
             .parse(value)
             .ok_or_else(|| anyhow::anyhow!("--render-scale {value}: a number or auto"))?;
     }
+    if let Some(quality) = &args.quality {
+        // Refuse a typo here rather than run with a setting silently dropped.
+        let errors = flint_render::QualitySettings::default().apply_str(quality);
+        if let Some(e) = errors.first() {
+            anyhow::bail!("--quality: {e}");
+        }
+        app.quality_overrides = quality.clone();
+    }
     let touch_mode = flint_runtime::TouchControlsMode::parse(&args.touch_controls)
         .ok_or_else(|| anyhow::anyhow!("--touch-controls: auto, always or never"))?;
     app.input.touch_controls_mut().set_mode(touch_mode);
+    app.style_specs = args.styles.clone();
+    app.style_time = args.style_time;
     // Skybox, ambient, shading levers, camera and post from the scene file
     app.apply_scene_settings(&scene_file);
     app.window_size = (args.width, args.height);

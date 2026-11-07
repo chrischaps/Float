@@ -13,10 +13,9 @@ use crate::grass_pipeline::{
 };
 use crate::particle_pipeline::ParticleUniforms;
 use crate::pipeline::TransformUniforms;
-use crate::shadow::{ShadowDrawUniforms, CASCADE_COUNT, SHADOW_DRAW_STRIDE};
+use crate::shadow::{ShadowDrawUniforms, SHADOW_DRAW_STRIDE};
 use crate::skybox_pipeline::SkyboxUniforms;
 use crate::sprite2d_pipeline::Sprite2dUniforms;
-use wgpu::util::DeviceExt;
 
 /// Which slice of the main pass to render. `All` is the classic single-pass
 /// path; Pre/PostOcean split around the refraction grab (opaque scene is
@@ -37,6 +36,9 @@ impl RenderPhase {
     }
 }
 
+/// Shadow cascades the grass casts into: the nearest ones.
+const GRASS_SHADOW_CASCADES: usize = 2;
+
 impl SceneRenderer {
     /// Render depth from light perspective for cascaded shadow mapping.
     #[profiling::function]
@@ -44,6 +46,7 @@ impl SceneRenderer {
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
         camera: &Camera,
         camera_pos: [f32; 3],
     ) {
@@ -53,8 +56,13 @@ impl SceneRenderer {
         };
 
         if !shadow_pass.enabled || self.light_uniforms.directional_count == 0 {
+            // The shaders sample the maps whatever this pass does, so a pass
+            // turned off at runtime would leave the last frame's shadows
+            // standing (FlintKart#55). Zero splits read as "no shadows".
+            shadow_pass.write_off_uniforms(queue);
             return;
         }
+        shadow_pass.shadows_written_off = false;
 
         // Use the first directional light for shadows
         let light = &self.light_uniforms.directional_lights[0];
@@ -63,12 +71,16 @@ impl SceneRenderer {
         // punctual) rides along as tan() for PCSS penumbra math (ADR 0057).
         let camera_inv = camera.inverse_view_projection_matrix();
         let sun_tan_angular = light.angular_size.tan().max(0.0);
+        // Quality settings (FlintKart#55): how far shadows reach and how many
+        // cascades cover it, 200 m and 3 unless a tier says otherwise. The
+        // camera's own planes map the split depths to its frustum.
+        let cascades = shadow_pass.cascades();
         shadow_pass.update_cascades(
             light.direction,
             camera_pos,
             camera_inv,
-            0.1,
-            200.0,
+            camera.near,
+            camera.far,
             100.0,
             sun_tan_angular,
         );
@@ -87,7 +99,7 @@ impl SceneRenderer {
         // ~800 allocations a frame in a 270-entity scene and dominated the
         // CPU frame time).
         let mut draw_uniforms: Vec<ShadowDrawUniforms> = Vec::new();
-        for cascade in 0..CASCADE_COUNT {
+        for cascade in 0..cascades {
             let cascade_vp = shadow_pass.shadow_uniforms().cascade_view_proj[cascade];
             let cascade_frustum = crate::frustum::Frustum::from_view_projection(&cascade_vp);
             let slot = |model| ShadowDrawUniforms {
@@ -115,6 +127,46 @@ impl SceneRenderer {
         }
         shadow_pass.ensure_draw_capacity(device, draw_uniforms.len() as u32);
         shadow_pass.write_draw_uniforms(queue, &draw_uniforms);
+
+        // Grass casts into the nearest two cascades, each through a view
+        // buffer and bind group kept across frames (#139; they were made
+        // per cascade per frame).
+        let grass_casts = self.grass_drawing && self.grass_pipeline.is_some();
+        if grass_casts {
+            while self.grass_shadow_binds.len() < GRASS_SHADOW_CASCADES {
+                let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("Grass Shadow Transform"),
+                    size: std::mem::size_of::<TransformUniforms>() as u64,
+                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    layout: &self.pipeline.transform_bind_group_layout,
+                    entries: &[wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: buffer.as_entire_binding(),
+                    }],
+                    label: Some("Grass Shadow Transform Bind Group"),
+                });
+                self.grass_shadow_binds.push((buffer, bind));
+            }
+            for (cascade, (buffer, _)) in self
+                .grass_shadow_binds
+                .iter()
+                .enumerate()
+                .take(GRASS_SHADOW_CASCADES)
+            {
+                // Grass shadow pipeline uses TransformUniforms (same layout as PBR)
+                let uniforms = TransformUniforms {
+                    view_proj: shadow_pass.shadow_uniforms().cascade_view_proj[cascade],
+                    model: identity_matrix(),
+                    model_inv_transpose: identity_matrix(),
+                    camera_pos: [0.0; 3],
+                    _pad: 0.0,
+                };
+                queue.write_buffer(buffer, 0, bytemuck::cast_slice(&[uniforms]));
+            }
+        }
         let mut next_slot: u32 = 0;
         let bind_next = |pass: &mut wgpu::RenderPass<'_>, next_slot: &mut u32| {
             let offset = (*next_slot as u64 * SHADOW_DRAW_STRIDE) as u32;
@@ -123,16 +175,12 @@ impl SceneRenderer {
         };
 
         // Render each cascade
-        for cascade in 0..CASCADE_COUNT {
+        for cascade in 0..cascades {
             let cascade_vp = shadow_pass.shadow_uniforms().cascade_view_proj[cascade];
-
-            let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some(&format!("Shadow Cascade {} Encoder", cascade)),
-            });
 
             {
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some(&format!("Shadow Cascade {} Pass", cascade)),
+                    label: Some("Shadow Cascade Pass"),
                     color_attachments: &[],
                     depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                         view: &shadow_pass.cascade_views[cascade],
@@ -177,40 +225,17 @@ impl SceneRenderer {
                 }
 
                 // Render grass into shadow cascade (nearest 2 only)
-                if cascade < 2 {
+                if grass_casts && cascade < GRASS_SHADOW_CASCADES {
                     if let (Some(gp), Some(render_bg), Some(instance_bg), Some(args)) = (
                         &self.grass_pipeline,
                         &self.grass_render_uniform_bind_group,
                         &self.grass_render_instance_bind_group,
                         &self.grass_draw_args_buffer,
                     ) {
-                        if self.grass_drawing {
-                            // Grass shadow pipeline uses TransformUniforms (same layout as PBR)
-                            let grass_shadow_uniforms = TransformUniforms {
-                                view_proj: cascade_vp,
-                                model: identity_matrix(),
-                                model_inv_transpose: identity_matrix(),
-                                camera_pos: [0.0; 3],
-                                _pad: 0.0,
-                            };
-                            let grass_shadow_buffer =
-                                device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                                    label: Some("Grass Shadow Transform"),
-                                    contents: bytemuck::cast_slice(&[grass_shadow_uniforms]),
-                                    usage: wgpu::BufferUsages::UNIFORM,
-                                });
-                            let grass_shadow_bind =
-                                device.create_bind_group(&wgpu::BindGroupDescriptor {
-                                    layout: &self.pipeline.transform_bind_group_layout,
-                                    entries: &[wgpu::BindGroupEntry {
-                                        binding: 0,
-                                        resource: grass_shadow_buffer.as_entire_binding(),
-                                    }],
-                                    label: Some("Grass Shadow Transform Bind Group"),
-                                });
-
+                        {
+                            let grass_shadow_bind = &self.grass_shadow_binds[cascade].1;
                             pass.set_pipeline(&gp.shadow_pipeline);
-                            pass.set_bind_group(0, &grass_shadow_bind, &[]);
+                            pass.set_bind_group(0, grass_shadow_bind, &[]);
                             pass.set_bind_group(1, render_bg, &[]);
                             pass.set_bind_group(2, &gp.shadow_dummy_bind_group, &[]);
                             pass.set_bind_group(3, instance_bg, &[]);
@@ -250,8 +275,6 @@ impl SceneRenderer {
                     pass.draw_indexed(0..draw.index_count, 0, 0..1);
                 }
             }
-
-            queue.submit(std::iter::once(encoder.finish()));
         }
     }
 
@@ -265,6 +288,42 @@ impl SceneRenderer {
         tonemapping_u32: u32,
         camera: &Camera,
     ) {
+        // Sort transparent draws back-to-front (descending distance from camera)
+        {
+            let cam = camera_pos;
+            for draw in &mut self.transparent_draws {
+                let dx = draw.model[3][0] - cam[0];
+                let dy = draw.model[3][1] - cam[1];
+                let dz = draw.model[3][2] - cam[2];
+                draw.sort_depth = dx * dx + dy * dy + dz * dz;
+            }
+            self.transparent_draws.sort_by(|a, b| {
+                b.sort_depth
+                    .partial_cmp(&a.sort_depth)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+
+            for draw in &mut self.transparent_skinned_draws {
+                let dx = draw.model[3][0] - cam[0];
+                let dy = draw.model[3][1] - cam[1];
+                let dz = draw.model[3][2] - cam[2];
+                draw.sort_depth = dx * dx + dy * dy + dz * dz;
+            }
+            self.transparent_skinned_draws.sort_by(|a, b| {
+                b.sort_depth
+                    .partial_cmp(&a.sort_depth)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+        }
+
+        // Cached draws' transforms are staged in the arena and go up a page
+        // at a time at the end (#139); others are written at once.
+        // Taken for the function, so `self`'s methods stay callable.
+        let mut arena = std::mem::take(&mut self.draw_bind_cache.arena);
+        let mut put = |target: &super::TransformTarget, uniforms: &TransformUniforms| {
+            target.write(queue, &mut arena, uniforms);
+        };
+
         // Update grid transform
         if let Some(grid) = &self.grid_draw {
             let uniforms = TransformUniforms {
@@ -274,14 +333,12 @@ impl SceneRenderer {
                 camera_pos,
                 _pad: 0.0,
             };
-            queue.write_buffer(&grid.transform_buffer, 0, bytemuck::cast_slice(&[uniforms]));
+            put(&grid.transform, &uniforms);
         }
 
-        // Update entity transforms and write debug_mode + tonemapping into each material buffer.
-        // Draws of the same look share a material buffer (`SharedMaterial`), so
-        // each buffer's flags are written once.
-        let mut flagged: std::collections::HashSet<*const wgpu::Buffer> =
-            std::collections::HashSet::new();
+        // Update entity transforms and write debug_mode + tonemapping into each
+        // material buffer whose flags changed. Draws of the same look share a
+        // material buffer (`SharedMaterial`).
         for draw in &self.entity_draws {
             let uniforms = TransformUniforms {
                 view_proj,
@@ -290,25 +347,10 @@ impl SceneRenderer {
                 camera_pos,
                 _pad: 0.0,
             };
-            queue.write_buffer(&draw.transform_buffer, 0, bytemuck::cast_slice(&[uniforms]));
+            put(&draw.transform, &uniforms);
 
-            if flagged.insert(std::ptr::from_ref::<wgpu::Buffer>(&draw.material_buffer)) {
-                // Write debug_mode at byte offset 28 in the material buffer
-                // Layout: base_color(16) + metallic(4) + roughness(4) + use_vertex_color(4) = 28
-                queue.write_buffer(
-                    &draw.material_buffer,
-                    28,
-                    bytemuck::cast_slice(&[debug_mode_u32]),
-                );
-
-                // Write enable_tonemapping at byte offset 32
-                // Layout: ... + debug_mode(4) = 32
-                queue.write_buffer(
-                    &draw.material_buffer,
-                    32,
-                    bytemuck::cast_slice(&[tonemapping_u32]),
-                );
-            }
+            draw.material_buffer
+                .write_flags(queue, debug_mode_u32, tonemapping_u32);
         }
 
         // Update skinned entity transforms
@@ -320,20 +362,10 @@ impl SceneRenderer {
                 camera_pos,
                 _pad: 0.0,
             };
-            queue.write_buffer(&draw.transform_buffer, 0, bytemuck::cast_slice(&[uniforms]));
+            put(&draw.transform, &uniforms);
 
-            if flagged.insert(std::ptr::from_ref::<wgpu::Buffer>(&draw.material_buffer)) {
-                queue.write_buffer(
-                    &draw.material_buffer,
-                    28,
-                    bytemuck::cast_slice(&[debug_mode_u32]),
-                );
-                queue.write_buffer(
-                    &draw.material_buffer,
-                    32,
-                    bytemuck::cast_slice(&[tonemapping_u32]),
-                );
-            }
+            draw.material_buffer
+                .write_flags(queue, debug_mode_u32, tonemapping_u32);
         }
 
         // Update transparent entity transforms
@@ -345,20 +377,10 @@ impl SceneRenderer {
                 camera_pos,
                 _pad: 0.0,
             };
-            queue.write_buffer(&draw.transform_buffer, 0, bytemuck::cast_slice(&[uniforms]));
+            put(&draw.transform, &uniforms);
 
-            if flagged.insert(std::ptr::from_ref::<wgpu::Buffer>(&draw.material_buffer)) {
-                queue.write_buffer(
-                    &draw.material_buffer,
-                    28,
-                    bytemuck::cast_slice(&[debug_mode_u32]),
-                );
-                queue.write_buffer(
-                    &draw.material_buffer,
-                    32,
-                    bytemuck::cast_slice(&[tonemapping_u32]),
-                );
-            }
+            draw.material_buffer
+                .write_flags(queue, debug_mode_u32, tonemapping_u32);
         }
 
         // Update transparent skinned entity transforms
@@ -370,20 +392,10 @@ impl SceneRenderer {
                 camera_pos,
                 _pad: 0.0,
             };
-            queue.write_buffer(&draw.transform_buffer, 0, bytemuck::cast_slice(&[uniforms]));
+            put(&draw.transform, &uniforms);
 
-            if flagged.insert(std::ptr::from_ref::<wgpu::Buffer>(&draw.material_buffer)) {
-                queue.write_buffer(
-                    &draw.material_buffer,
-                    28,
-                    bytemuck::cast_slice(&[debug_mode_u32]),
-                );
-                queue.write_buffer(
-                    &draw.material_buffer,
-                    32,
-                    bytemuck::cast_slice(&[tonemapping_u32]),
-                );
-            }
+            draw.material_buffer
+                .write_flags(queue, debug_mode_u32, tonemapping_u32);
         }
 
         // Update terrain chunk transforms
@@ -537,34 +549,6 @@ impl SceneRenderer {
             }
         }
 
-        // Sort transparent draws back-to-front (descending distance from camera)
-        {
-            let cam = camera_pos;
-            for draw in &mut self.transparent_draws {
-                let dx = draw.model[3][0] - cam[0];
-                let dy = draw.model[3][1] - cam[1];
-                let dz = draw.model[3][2] - cam[2];
-                draw.sort_depth = dx * dx + dy * dy + dz * dz;
-            }
-            self.transparent_draws.sort_by(|a, b| {
-                b.sort_depth
-                    .partial_cmp(&a.sort_depth)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-
-            for draw in &mut self.transparent_skinned_draws {
-                let dx = draw.model[3][0] - cam[0];
-                let dy = draw.model[3][1] - cam[1];
-                let dz = draw.model[3][2] - cam[2];
-                draw.sort_depth = dx * dx + dy * dy + dz * dz;
-            }
-            self.transparent_skinned_draws.sort_by(|a, b| {
-                b.sort_depth
-                    .partial_cmp(&a.sort_depth)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-        }
-
         // Update wireframe overlay transforms
         for draw in &self.wireframe_overlay_draws {
             let uniforms = TransformUniforms {
@@ -574,7 +558,7 @@ impl SceneRenderer {
                 camera_pos,
                 _pad: 0.0,
             };
-            queue.write_buffer(&draw.transform_buffer, 0, bytemuck::cast_slice(&[uniforms]));
+            put(&draw.transform, &uniforms);
         }
 
         // Update billboard uniforms with camera vectors
@@ -638,7 +622,7 @@ impl SceneRenderer {
                 camera_pos,
                 _pad: 0.0,
             };
-            queue.write_buffer(&draw.transform_buffer, 0, bytemuck::cast_slice(&[uniforms]));
+            put(&draw.transform, &uniforms);
         }
 
         // Update skeleton + debug overlay transforms
@@ -654,8 +638,11 @@ impl SceneRenderer {
                 camera_pos,
                 _pad: 0.0,
             };
-            queue.write_buffer(&draw.transform_buffer, 0, bytemuck::cast_slice(&[uniforms]));
+            put(&draw.transform, &uniforms);
         }
+
+        arena.upload(queue);
+        self.draw_bind_cache.arena = arena;
     }
 
     /// Execute the main render pass: skybox → grid → terrain → entities → sprites → particles → debug.
@@ -1291,11 +1278,16 @@ impl SceneRenderer {
 
     /// Run post-processing: SSAO, bloom, composite HDR → sRGB.
     #[profiling::function]
+    /// `depth_owned`: `depth_view` is the scaled scene's own, made with the
+    /// HDR chain, so bind groups over it can be kept with the chain (#139).
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn render_postprocess(
         &self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
         depth_view: &wgpu::TextureView,
+        depth_owned: bool,
         target_view: &wgpu::TextureView,
         camera: &Camera,
         mut timer: Option<&mut crate::gpu_timer::GpuTimer>,
@@ -1309,71 +1301,171 @@ impl SceneRenderer {
             None => return,
         };
 
-        // GPU timing (ADR 0108): each effect is a scope of its own (#120,
-        // so a slow frame names its pass), and the pass that writes the
-        // target another, timed inside its own submission. Under vsync the
-        // GPU waits for the swapchain image before that submission runs,
-        // and a scope across it would count the wait.
-        let mut scoped = |label: &'static str, run: &mut dyn FnMut()| {
-            let scope = timer
-                .as_deref_mut()
-                .map(|t| t.begin_submit(device, queue, label));
-            run();
+        // GPU timing (ADR 0108): each effect is a scope of its own (#120),
+        // so a slow frame names its pass. All of them are in the frame's
+        // one encoder (#139).
+        let mut scoped = |label: &'static str,
+                          encoder: &mut wgpu::CommandEncoder,
+                          run: &mut dyn FnMut(&mut wgpu::CommandEncoder)| {
+            let scope = timer.as_deref_mut().map(|t| t.begin(encoder, label));
+            run(encoder);
             if let (Some(t), Some(scope)) = (timer.as_deref_mut(), scope) {
-                t.end_submit(device, queue, scope);
+                t.end(encoder, scope);
             }
         };
+        let config = &self.postprocess_config;
 
-        // Run Kuwahara filter if enabled
-        if self.postprocess_config.enabled && self.postprocess_config.kuwahara_enabled {
-            scoped("Kuwahara", &mut || {
-                pp.run_kuwahara(device, queue, resources, &self.postprocess_config)
-            });
+        // Stylize passes (#262). The frame every style reads; each stage
+        // sets its own size and format.
+        let ids = &self.style_ids;
+        // The `style` debug view shows the mask over the plain scene (#334):
+        // mask_view runs alone, so no other style's output speckles its hues
+        let solo = (self.debug_state.mode == DebugMode::StyleMask).then_some("mask_view");
+        let hdr_styles = crate::stylize::solo(
+            pp.styles
+                .active(crate::stylize::StyleStage::Hdr, config, ids),
+            solo,
+        );
+        let display_styles = crate::stylize::solo(
+            pp.styles
+                .active(crate::stylize::StyleStage::Display, config, ids),
+            solo,
+        );
+        // The entity style mask (#263), drawn this frame by encode_to while
+        // a style that reads it is on
+        let style_mask = crate::stylize::any_uses_mask(config, ids).then(|| {
+            resources.styles.get(
+                device,
+                crate::style_mask::MASK_TARGET,
+                crate::style_mask::STYLE_MASK_FORMAT,
+                resources.width,
+                resources.height,
+            )
+        });
+        let mut style_frame = (!hdr_styles.is_empty() || !display_styles.is_empty()).then(|| {
+            crate::stylize::StyleFrame {
+                device,
+                queue,
+                config,
+                descriptor: hdr_styles.first().or(display_styles.first()).unwrap().0,
+                width: resources.width,
+                height: resources.height,
+                format: crate::postprocess::HDR_FORMAT,
+                depth: depth_view,
+                depth_size: [resources.width, resources.height],
+                depth_owned,
+                camera: crate::stylize::StyleCamera {
+                    view_proj: camera.view_projection_matrix(),
+                    inv_view_proj: camera.inverse_view_projection_matrix(),
+                    position: camera.position_array(),
+                    near: camera.near,
+                    far: camera.far,
+                },
+                mask: style_mask.as_ref().map(|m| &m.view),
+                style_ids: &self.style_ids,
+                edges: None,
+                linear_sampler: &pp.linear_sampler,
+                time: (self.ocean_time % 100_000.0) as f32,
+                frame: self
+                    .style_frame_serial
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                history_epoch: self.style_history_epoch,
+                pixels_per_point: self.pixels_per_point,
+                scene_dir: self.scene_dir.as_deref(),
+                binds: &resources.binds,
+                targets: &resources.styles,
+            }
+        });
+
+        // Shared geometry edges (#301): once, before either stage, for every
+        // style on this frame that needs them
+        if let Some(frame) = &mut style_frame {
+            let both: Vec<_> = hdr_styles.iter().chain(&display_styles).copied().collect();
+            frame.edges =
+                pp.styles
+                    .encode_edges(&both, frame, encoder, &mut |label, encoder, run| {
+                        scoped(label, encoder, run)
+                    });
         }
 
+        // HDR stage: Kuwahara and friends, in linear HDR at scene resolution
+        let hdr_result = match &mut style_frame {
+            Some(frame) if !hdr_styles.is_empty() => crate::stylize::run_stage(
+                &hdr_styles,
+                &crate::stylize::plan(hdr_styles.len(), false),
+                frame,
+                crate::stylize::StyleStage::Hdr,
+                encoder,
+                crate::stylize::StyleInput {
+                    view: &resources.hdr_view,
+                    id: crate::stylize::input_id::HDR,
+                },
+                None,
+                &mut |label, encoder, run| scoped(label, encoder, run),
+            ),
+            _ => None,
+        };
+        let hdr_scene = hdr_result.as_ref().map(|(t, id)| (&t.view, *id));
+
         // Run SSAO if enabled
-        if self.postprocess_config.enabled && self.postprocess_config.ssao_enabled {
-            scoped("SSAO", &mut || {
+        if config.enabled && config.ssao_enabled {
+            scoped("SSAO", encoder, &mut |encoder| {
                 pp.run_ssao(
-                    device,
                     queue,
+                    encoder,
+                    device,
                     resources,
-                    &self.postprocess_config,
+                    config,
                     depth_view,
+                    depth_owned,
                     camera,
                 )
             });
         }
 
         // Run volumetric (god rays) if enabled and shadows are available
-        if self.postprocess_config.enabled && self.postprocess_config.volumetric_enabled {
+        if config.enabled && config.volumetric_enabled {
             if let Some(shadow_pass) = &self.shadow_pass {
                 if shadow_pass.enabled {
-                    scoped("Volumetric", &mut || {
+                    scoped("Volumetric", encoder, &mut |encoder| {
                         pp.run_volumetric(
-                            device,
                             queue,
+                            encoder,
+                            device,
                             resources,
-                            &self.postprocess_config,
+                            config,
                             depth_view,
+                            depth_owned,
                             camera,
-                            &shadow_pass.shadow_view,
-                            &shadow_pass.shadow_sampler,
-                            &shadow_pass.shadow_uniforms_buffer,
-                            &self.light_buffer,
+                            crate::postprocess::VolumetricShadow {
+                                id: shadow_pass.id,
+                                view: &shadow_pass.shadow_view,
+                                sampler: &shadow_pass.shadow_sampler,
+                                uniforms: &shadow_pass.shadow_uniforms_buffer,
+                                lights: &self.light_buffer,
+                            },
                         )
                     });
                 }
             }
         }
 
-        // Run bloom if post-processing effects are enabled
-        if self.postprocess_config.enabled
-            && self.postprocess_config.bloom_enabled
-            && resources.bloom_mip_count > 0
-        {
-            scoped("Bloom", &mut || {
-                pp.run_bloom(device, queue, resources, &self.postprocess_config)
+        // Run bloom if post-processing effects are enabled. It reads the
+        // unstylized scene, unless an HDR style that ran says it feeds
+        // bloom (#300): then the stage's result, so the style's own bright
+        // shapes glow.
+        if config.enabled && config.bloom_enabled && resources.bloom_mip_count > 0 {
+            let source = match hdr_scene {
+                Some((view, id)) if hdr_styles.iter().any(|(d, _)| d.feeds_bloom_in(config)) => {
+                    crate::stylize::StyleInput { view, id }
+                }
+                _ => crate::stylize::StyleInput {
+                    view: &resources.hdr_view,
+                    id: crate::stylize::input_id::HDR,
+                },
+            };
+            scoped("Bloom", encoder, &mut |encoder| {
+                pp.run_bloom(queue, encoder, device, resources, config, &source)
             });
         }
 
@@ -1385,25 +1477,59 @@ impl SceneRenderer {
             && self.postprocess_config.fxaa_enabled
             && pp.fxaa.is_some()
             && resources.fxaa.is_some();
-        let composite_target = if fxaa_active {
+        let final_target = if fxaa_active {
             &resources.fxaa.as_ref().unwrap().view
         } else {
             target_view
         };
+        // Display stage (#262): with display styles on, the composite draws
+        // into the stage's input at output resolution, and the last style
+        // writes what the composite would have. The plan (#302) reuses the
+        // input as a ping, and with FXAA on its intermediate as the other
+        // texture, so the stage adds at most one full-size texture to
+        // FXAA's (two without FXAA, from three styles on: in + one ping).
+        let display_size = self.surface_size;
+        let (composite_slot, display_steps) =
+            crate::stylize::display_plan(display_styles.len(), fxaa_active);
+        let display_in = (!display_styles.is_empty()).then(|| {
+            resources.styles.get(
+                device,
+                "style display in",
+                pp.surface_format,
+                display_size.0,
+                display_size.1,
+            )
+        });
+        let composite_target = match (&display_in, composite_slot) {
+            (Some(input), crate::stylize::Slot::Input) => &input.view,
+            _ => final_target,
+        };
+        // The scene the composite reads: the HDR styles' result, or the
+        // HDR buffer
+        let scene = match hdr_scene {
+            Some((view, id)) => crate::stylize::StyleInput { view, id },
+            None => crate::stylize::StyleInput {
+                view: &resources.hdr_view,
+                id: crate::stylize::input_id::HDR,
+            },
+        };
         // Composite: HDR + bloom + SSAO + volumetric + fog → tonemapped sRGB surface
         // (always runs — this is what converts Rgba16Float → surface format)
         pp.composite(
-            device,
             queue,
+            encoder,
+            device,
             resources,
             &self.postprocess_config,
             composite_target,
             depth_view,
+            depth_owned,
             camera,
             // Same f64 phase wrap as the ocean upload — keeps mode animation
             // precise over long sessions. Headless render leaves this 0.0.
             (self.ocean_time % 100_000.0) as f32,
             self.ground_fog.as_ref(),
+            &scene,
             if fxaa_active {
                 None
             } else {
@@ -1411,8 +1537,37 @@ impl SceneRenderer {
             },
         );
 
+        if let (Some(frame), Some(input)) = (&mut style_frame, &display_in) {
+            frame.width = input.width;
+            frame.height = input.height;
+            frame.format = pp.surface_format;
+            crate::stylize::run_stage(
+                &display_styles,
+                &display_steps,
+                frame,
+                crate::stylize::StyleStage::Display,
+                encoder,
+                crate::stylize::StyleInput {
+                    view: &input.view,
+                    id: crate::stylize::input_id::DISPLAY_IN,
+                },
+                // Read back only when it's FXAA's intermediate
+                Some(crate::stylize::StyleInput {
+                    view: final_target,
+                    id: crate::stylize::input_id::FXAA_IN,
+                }),
+                &mut |label, encoder, run| {
+                    let scope = timer.as_deref_mut().map(|t| t.begin(encoder, label));
+                    run(encoder);
+                    if let (Some(t), Some(scope)) = (timer.as_deref_mut(), scope) {
+                        t.end(encoder, scope);
+                    }
+                },
+            );
+        }
+
         if fxaa_active {
-            pp.run_fxaa(device, queue, resources, target_view, timer);
+            pp.run_fxaa(queue, encoder, device, resources, target_view, timer);
         }
     }
 

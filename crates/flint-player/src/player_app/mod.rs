@@ -30,10 +30,13 @@ mod music_session;
 mod pacing;
 mod perf;
 mod persist;
+mod quality;
 pub mod render_scale;
 mod touch_overlay;
 pub(crate) mod scene_loading;
+pub mod procgen_assets;
 mod script_commands;
+pub mod style_commands;
 #[cfg(feature = "debug-hud")]
 mod timeline_panel;
 mod transition;
@@ -135,7 +138,10 @@ pub struct CaptureConfig {
     pub(crate) perf_draws: u64,
     pub(crate) perf_entity_draws: u64,
     pub(crate) perf_culled: u64,
+    /// Of those, set aside by level of detail / draw distance (#56)
+    pub(crate) perf_lod_culled: u64,
     pub(crate) perf_triangles: u64,
+    pub(crate) perf_shadow_triangles: u64,
     /// GPU frame times summed over frames that had one (ADR 0108)
     pub(crate) perf_gpu_ms: f64,
     pub(crate) perf_gpu_frames: u64,
@@ -258,11 +264,26 @@ pub struct PlayerApp {
     /// MSAA sample count for the scene renderer (1 = off, 4 = on; ADR 0058).
     /// Set from the --msaa CLI flag before the window/renderer exist.
     pub msaa_sample_count: u32,
+    /// When scene procgen assets are made (#32): during load, or behind
+    /// placeholders on the frame-budgeted queue (`--procgen-defer`).
+    pub procgen_mode: procgen_assets::ProcGenMode,
     /// The scene's render scale: a ceiling (fixed, and capped by pixel
     /// ratio) and whether to step under it to hold the frame rate (#122).
     /// The desktop's default draws at the surface; a page's caps DPR 1.5.
     pub render_scale: render_scale::RenderScaleSetting,
+    /// Keep procgen outputs on disk between runs (#181), in the project's
+    /// `.flint/procgen-cache/` (or `FLINT_PROCGEN_CACHE=<dir>`; `=0` turns
+    /// it off). On by default natively; off for a bundle, whose files are
+    /// not on the disk, and always off on the web.
+    pub procgen_disk_cache: bool,
     dynamic_scale: render_scale::DynamicScale,
+    /// `key=value,...` quality settings applied over `msaa_sample_count`,
+    /// `render_scale` and the `FLINT_SHADOW*` switches at startup
+    /// (FlintKart#55): `--quality`, the page's `?quality=`, an Android dev
+    /// profile's `[quality]`. Scripts change them later with `set_quality`.
+    pub quality_overrides: String,
+    /// The quality settings in force (see `quality.rs`).
+    quality: flint_render::QualitySettings,
     /// Which refreshes the web player draws (#140, `?fps=`); `None` draws
     /// every one, as the desktop always does. See `set_frame_rate`.
     frame_pacer: Option<frame_rate::FramePacer>,
@@ -282,6 +303,14 @@ pub struct PlayerApp {
 
     // Scene-level post-processing overrides
     pub scene_post_process: Option<flint_scene::PostProcessDef>,
+    /// `--style name[:key=value,...]` words (#328), written over every
+    /// scene's `[post_process]` at load, after each transition and after a
+    /// user style's hot reload, so they keep winning. See
+    /// [`PlayerApp::scene_post_config`].
+    pub style_specs: Vec<String>,
+    /// `--style-time`: hold the post time styles (and the ocean, grain and
+    /// render modes, which share it) see at this many seconds.
+    pub style_time: Option<f32>,
 
     // Script-driven post-processing overrides (applied per-frame before render)
     pp_vignette_override: Option<f32>,

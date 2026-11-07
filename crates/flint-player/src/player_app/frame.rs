@@ -7,7 +7,6 @@ use super::hud_render::render_draw_commands;
 #[cfg(feature = "debug-hud")]
 use super::music_guide_panel;
 use super::music_session;
-use super::scene_loading;
 #[cfg(feature = "debug-hud")]
 use super::timeline_panel;
 use super::PlayerApp;
@@ -252,8 +251,8 @@ impl PlayerApp {
                 let flags = rp.take_flags();
                 if flags.pp_changed {
                     renderer.set_post_process_config(rp.pp.clone());
-                    if flags.kuwahara_needs_resources {
-                        renderer.ensure_kuwahara_resources(&context.device, &context.queue);
+                    if flags.style_needs_resources {
+                        renderer.ensure_style_resources(&context.device);
                     }
                     if flags.fxaa_needs_resources {
                         renderer.ensure_fxaa_resources(&context.device);
@@ -290,6 +289,46 @@ impl PlayerApp {
                     renderer.lighting_levers(),
                     self.camera.fov,
                 );
+            }
+            rp.set_style_ids(renderer.style_ids());
+        }
+
+        // F3 Styles panel (#268): the same write-through as F4, for the
+        // style table alone. Entity rows only while it is open.
+        #[cfg(feature = "debug-hud")]
+        {
+            let rows = self
+                .debug_panels
+                .iter()
+                .any(|p| p.name() == flint_debug_ui::STYLES_DEBUG_PANEL && p.is_open())
+                .then(|| {
+                    super::debug_panels::styled_entity_rows(&self.world, renderer.style_ids())
+                });
+            for panel in &mut self.debug_panels {
+                if panel.name() != flint_debug_ui::STYLES_DEBUG_PANEL {
+                    continue;
+                }
+                let Some(sp) = panel
+                    .as_any_mut()
+                    .downcast_mut::<flint_debug_ui::StylesDebugPanel>()
+                else {
+                    continue;
+                };
+                if flint_debug_ui::DebugPanel::is_dirty(sp) {
+                    let edit = sp.take_edit();
+                    if edit.changed {
+                        let mut config = renderer.post_process_config().clone();
+                        config.styles = sp.pp.styles.clone();
+                        renderer.set_post_process_config(config);
+                        if edit.needs_resources {
+                            renderer.ensure_style_resources(&context.device);
+                        }
+                    }
+                    flint_debug_ui::DebugPanel::clear_dirty(sp);
+                } else {
+                    let entities = rows.clone().unwrap_or_else(|| sp.entities().to_vec());
+                    sp.refresh(renderer.post_process_config(), entities);
+                }
             }
         }
 
@@ -565,9 +604,27 @@ impl PlayerApp {
             self.stats_gpu_timing = false;
         }
 
-        if let Err(e) = renderer.render(context, &self.camera, &view) {
-            tracing::warn!("Render error: {:?}", e);
+        // The whole frame (scene, HUD, the GPU timer's resolve) goes into
+        // one encoder and one submission (#139): on the web each submission
+        // crosses into JS.
+        let mut encoder = context
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("Frame Encoder"),
+            });
+        // Styles sized in points (ASCII cells, #265) follow the window's
+        // scale factor, which changes when it moves to another monitor
+        if let Some(window) = &self.window {
+            renderer.pixels_per_point = window.scale_factor() as f32;
         }
+        renderer.encode_to(
+            &context.device,
+            &context.queue,
+            &mut encoder,
+            &context.depth_view,
+            &self.camera,
+            &view,
+        );
         // A field borrow, not `perf_mark`: `context` is still held.
         if let Some(perf) = &mut self.perf {
             perf.mark(super::perf::Phase::Render);
@@ -580,9 +637,11 @@ impl PlayerApp {
             format: Some(context.hud_format),
             ..Default::default()
         });
-        self.render_hud(&hud_view);
+        self.render_hud(&hud_view, &mut encoder);
         if let (Some(context), Some(renderer)) = (&self.render_context, &mut self.scene_renderer) {
-            renderer.finish_gpu_timings(&context.device, &context.queue);
+            renderer.encode_gpu_timings(&context.device, &mut encoder);
+            context.queue.submit(std::iter::once(encoder.finish()));
+            renderer.frame_submitted();
         }
         self.perf_mark(super::perf::Phase::Hud);
 
@@ -611,6 +670,8 @@ impl PlayerApp {
                     self.capture.perf_draws += stats.draw_calls as u64;
                     self.capture.perf_entity_draws += stats.entity_draws as u64;
                     self.capture.perf_culled += stats.culled_draws as u64;
+                    self.capture.perf_lod_culled += stats.lod_culled_draws as u64;
+                    self.capture.perf_shadow_triangles += stats.shadow_triangles as u64;
                     self.capture.perf_triangles += stats.triangles as u64;
                     if stats.gpu_frame_ms > 0.0 {
                         self.capture.perf_gpu_ms += stats.gpu_frame_ms as f64;
@@ -642,11 +703,13 @@ impl PlayerApp {
                     // can compare draw counts and culling headlessly (H9).
                     let avg = |sum: u64| sum as f64 / frames as f64;
                     eprintln!(
-                        "[perf] avg per frame: {:.0} draw calls ({:.0} entity draws, {:.0} culled), {:.0} triangles",
+                        "[perf] avg per frame: {:.0} draw calls ({:.0} entity draws, {:.0} culled, {:.0} of them by LOD), {:.0} triangles, {:.0} in shadows",
                         avg(self.capture.perf_draws),
                         avg(self.capture.perf_entity_draws),
                         avg(self.capture.perf_culled),
-                        avg(self.capture.perf_triangles)
+                        avg(self.capture.perf_lod_culled),
+                        avg(self.capture.perf_triangles),
+                        avg(self.capture.perf_shadow_triangles)
                     );
                     // GPU time, when the frames were timed (--stats, ADR 0108).
                     let gpu_frames = self.capture.perf_gpu_frames;
@@ -838,6 +901,12 @@ impl PlayerApp {
             perf.record_scripts(self.script.update_times());
         }
 
+        // set_time_scale: this frame's physics already has its accumulator,
+        // so the new scale starts with the next tick
+        if let Some(scale) = self.script.take_time_scale_request() {
+            self.clock.time_scale = scale;
+        }
+
         // Fixed-timestep physics + FPS camera/listener follow, against the
         // poses and joint targets the scripts just wrote
         self.tick_fixed_physics(&config, has_fps_player);
@@ -880,6 +949,10 @@ impl PlayerApp {
 
         // Script post-override drain + music-session ladder merge (ADR 0021)
         self.drain_post_overrides();
+
+        // A script's set_quality (FlintKart#55), applied here, between the
+        // frame's scripts and its draw
+        self.apply_script_quality();
 
         // Script audio/cursor frame overrides, then per-frame input clear
         self.finish_frame();
@@ -936,6 +1009,20 @@ impl PlayerApp {
         // A menu put the touch controls away, or play brought them back.
         if let Some(enabled) = self.script.take_touch_controls_override() {
             self.input.touch_controls_mut().set_enabled(enabled);
+        }
+
+        // A quality setting moved the distance levers (#56).
+        if let Some(renderer) = &mut self.scene_renderer {
+            let (lod, draw) = self.script.take_lod_requests();
+            let mut s = renderer.lod_settings();
+            if lod.is_some() || draw.is_some() {
+                s.lod_scale = lod.unwrap_or(s.lod_scale);
+                s.draw_distance_scale = draw.unwrap_or(s.draw_distance_scale);
+                renderer.set_lod_settings(s);
+                s = renderer.lod_settings();
+            }
+            self.script
+                .set_lod_state(s.lod_scale, s.draw_distance_scale);
         }
 
         // Apply cursor capture request from scripts (skipped while a debug
@@ -1353,23 +1440,69 @@ impl PlayerApp {
         {
             let camera_pos = self.camera.position_array();
             let completed = self.procgen_resolver.process_frame(camera_pos);
-            if !completed.is_empty() {
+            let failures = self.procgen_resolver.take_failures();
+            if !completed.is_empty() || !failures.is_empty() {
                 if let (Some(renderer), Some(ctx)) =
                     (&mut self.scene_renderer, &self.render_context)
                 {
-                    scene_loading::upload_completed_procgen_assets(
-                        &completed,
+                    // Catalog names never reach the queue, so the file
+                    // fallback needs only the scene's own search paths.
+                    let config =
+                        flint_render::model_loader::ModelLoadConfig::from_scene_path(
+                            &self.scene_path,
+                        );
+                    let mut sink = super::procgen_assets::GpuSink {
                         renderer,
-                        &ctx.device,
-                        &ctx.queue,
-                    );
+                        device: &ctx.device,
+                        queue: &ctx.queue,
+                        config: &config,
+                    };
+                    super::procgen_assets::apply_completed(&completed, &mut sink);
+                    super::procgen_assets::apply_failures(&failures, &mut sink);
                 }
             }
         }
     }
 
     #[profiling::function]
+    /// Hot reload of user styles' descriptions (#275, natively): a few
+    /// times a second, look for edited or new `styles/*.shader.toml`, and
+    /// read the scene's settings again for each style that changed, since
+    /// its tables were checked against the old parameters. The WGSL files
+    /// are polled by the styles themselves.
+    fn poll_user_styles(&mut self) {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            use std::sync::atomic::{AtomicU32, Ordering};
+            static FRAMES: AtomicU32 = AtomicU32::new(0);
+            if FRAMES.fetch_add(1, Ordering::Relaxed) % 15 != 0 {
+                return;
+            }
+            let scene_dir = std::path::Path::new(&self.scene_path)
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new("."))
+                .to_path_buf();
+            let reload = flint_render::stylize::custom::reload_changed(&scene_dir);
+            for message in &reload.messages {
+                tracing::warn!("{message}");
+            }
+            if !reload.changed() {
+                return;
+            }
+            // What the scene authors, with --style over it, so a reloaded
+            // style a word names keeps the word's settings (#328)
+            let authored = self.scene_post_config().unwrap_or_default();
+            if let Some(renderer) = &mut self.scene_renderer {
+                let mut config = renderer.post_process_config().clone();
+                flint_render::stylize::custom::refresh_settings(&mut config, &authored, &reload);
+                renderer.set_post_process_config(config);
+            }
+        }
+    }
+
     fn sync_renderer(&mut self) {
+        self.poll_user_styles();
+
         // Refresh renderer with updated transforms
         if let (Some(renderer), Some(context)) = (&mut self.scene_renderer, &self.render_context) {
             renderer.camera_offset = [self.camera.position.x, self.camera.position.y];
@@ -1404,6 +1537,10 @@ impl PlayerApp {
             // Ocean waves run on the same clock scripts see via total_time(),
             // keeping script-side ocean_height() queries in sync with the GPU.
             renderer.ocean_time = self.clock.total_time;
+            // --style-time holds the post time, as `flint render`'s does (#328)
+            if let Some(t) = self.style_time {
+                renderer.ocean_time = t as f64;
+            }
 
             let cam_pos = self.camera.position;
             let grass_entities = vec![GrassEntityPosition {
@@ -1462,7 +1599,11 @@ impl PlayerApp {
     }
 
     #[profiling::function]
-    fn render_hud(&mut self, target_view: &wgpu::TextureView) {
+    fn render_hud(
+        &mut self,
+        target_view: &wgpu::TextureView,
+        encoder: &mut wgpu::CommandEncoder,
+    ) {
         // Lazy-load any sprite textures referenced by draw commands
         // (must happen before egui_winit borrow)
         self.load_pending_sprites();
@@ -1528,6 +1669,10 @@ impl PlayerApp {
             None
         };
 
+        // User styles that don't compile (#275): shown until they do
+        #[cfg(feature = "debug-hud")]
+        let style_errors = flint_render::stylize::custom::errors();
+
         let full_output = self.egui_ctx.run(raw_input, |ctx| {
             // Layers, back to front: script UI, game egui, debug panels.
             // Script UI first: it shares the background layer with any game
@@ -1540,13 +1685,8 @@ impl PlayerApp {
             // World text is laid out here, so the glyphs it needs go up
             // with this pass's font atlas.
             if let Some(view) = &text_view {
-                laid_text = super::world_text::lay_out(
-                    ctx,
-                    &world_texts,
-                    view,
-                    ui_fonts,
-                    ui_fonts_warned,
-                );
+                laid_text =
+                    super::world_text::lay_out(ctx, &world_texts, view, ui_fonts, ui_fonts_warned);
             }
 
             // The game's own egui (PlayerExtension::ui). Its panels sit on
@@ -1570,6 +1710,9 @@ impl PlayerApp {
             if let Some(ref stats) = stats_data {
                 render_stats_overlay(ctx, stats, debug_width);
             }
+
+            #[cfg(feature = "debug-hud")]
+            flint_debug_ui::paint_style_errors(ctx, &style_errors, 0.0);
         });
 
         self.draw_commands = draw_commands;
@@ -1598,17 +1741,12 @@ impl PlayerApp {
 
         let mut egui_renderer = self.egui_renderer.take().unwrap();
 
-        let mut encoder = context
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("HUD Encoder"),
-            });
         // The HUD's GPU time, with the renderer's phases (ADR 0108).
         let ui_scope = self
             .scene_renderer
             .as_mut()
             .and_then(|r| r.gpu_timer_mut())
-            .map(|t| t.begin(&mut encoder, "UI"));
+            .map(|t| t.begin(encoder, "UI"));
 
         for (id, image_delta) in &full_output.textures_delta.set {
             egui_renderer.update_texture(&context.device, &context.queue, *id, image_delta);
@@ -1617,7 +1755,7 @@ impl PlayerApp {
         egui_renderer.update_buffers(
             &context.device,
             &context.queue,
-            &mut encoder,
+            encoder,
             &paint_jobs,
             &screen_descriptor,
         );
@@ -1630,7 +1768,7 @@ impl PlayerApp {
             pipeline.draw(
                 &context.device,
                 &context.queue,
-                &mut encoder,
+                encoder,
                 target_view,
                 &context.depth_view,
                 &glyphs,
@@ -1662,9 +1800,8 @@ impl PlayerApp {
             self.scene_renderer.as_mut().and_then(|r| r.gpu_timer_mut()),
             ui_scope,
         ) {
-            timer.end(&mut encoder, scope);
+            timer.end(encoder, scope);
         }
-        context.queue.submit(std::iter::once(encoder.finish()));
 
         for id in &full_output.textures_delta.free {
             egui_renderer.free_texture(id);
@@ -1756,6 +1893,16 @@ fn render_stats_overlay(ctx: &egui::Context, stats: &flint_render::RenderStats, 
                         ui.label(format!(
                             "Grass: {} inst",
                             format_count(stats.grass_instances)
+                        ));
+                    }
+                    // Style chain memory (#302): every target, and how
+                    // many are full output size (FXAA's included)
+                    if stats.style_targets > 0 {
+                        ui.label(format!(
+                            "Style targets: {} ({:.1} MB, {} full-size)",
+                            stats.style_targets,
+                            stats.style_target_bytes as f64 / (1024.0 * 1024.0),
+                            stats.full_size_targets
                         ));
                     }
 
