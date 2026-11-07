@@ -10,14 +10,17 @@ use super::scene_loading::{
     build_model_load_config, load_animations_from_world, load_audio_from_world,
     load_particle_textures_from_world, load_scripts_from_world, load_sequences_from_world,
     load_sprite_animations_from_world, load_terrain_from_world_inner, register_node_animation_data,
-    register_skeletal_data, resolve_procgen_assets,
+    register_skeletal_data,
 };
+#[cfg(target_os = "android")]
+use super::AndroidGamepadTracker;
 use super::TransitionPhase;
 use super::{CaptureConfig, PlayerApp};
 use anyhow::{Context, Result};
 use flint_animation::AnimationSystem;
 use flint_asset::{AssetCatalog, ContentStore};
 use flint_audio::AudioSystem;
+use flint_core::vfs;
 use flint_ecs::FlintWorld;
 use flint_particles::ParticleSystem;
 use flint_physics::PhysicsSystem;
@@ -29,7 +32,6 @@ use flint_runtime::{
 use flint_script::context::DrawCommand;
 use flint_script::ScriptSystem;
 use gilrs::Gilrs;
-use flint_core::vfs;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
@@ -90,8 +92,12 @@ impl PlayerApp {
             skybox_path: None,
             scene_ambient: None,
             msaa_sample_count: 1,
+            procgen_disk_cache: cfg!(not(target_arch = "wasm32")),
+            procgen_mode: super::procgen_assets::ProcGenMode::Immediate,
             render_scale: Default::default(),
             dynamic_scale: Default::default(),
+            quality_overrides: String::new(),
+            quality: Default::default(),
             frame_pacer: None,
             hold_at: None,
             scene_diffuse_wrap: None,
@@ -99,6 +105,8 @@ impl PlayerApp {
             scene_sheen: None,
             scene_camera: None,
             scene_post_process: None,
+            style_specs: Vec::new(),
+            style_time: None,
             pp_vignette_override: None,
             pp_bloom_override: None,
             pp_exposure_override: None,
@@ -217,6 +225,9 @@ impl PlayerApp {
         }
 
         self.scene_camera = scene_file.camera.clone();
+        // User styles first: the post_process tables are read against the
+        // registry, and a table for an unloaded style is dropped
+        super::scene_loading::load_user_styles(&self.scene_path);
         self.scene_post_process = scene_file.post_process.clone();
     }
 
@@ -231,6 +242,25 @@ impl PlayerApp {
     #[cfg(target_os = "android")]
     pub fn set_android_axis_reader(&mut self, reader: fn() -> [f32; 4]) {
         self.android_axis_reader = Some(reader);
+    }
+
+    /// The post-processing config a scene starts with: its `[post_process]`
+    /// with the `--style` words written over it (#328). `None` when the
+    /// scene authors no block and there are no words, so the renderer keeps
+    /// what it has, as before.
+    pub fn scene_post_config(&self) -> Option<flint_render::PostProcessConfig> {
+        if self.scene_post_process.is_none() && self.style_specs.is_empty() {
+            return None;
+        }
+        let mut config = self
+            .scene_post_process
+            .as_ref()
+            .map(scene_loading::post_process_config_from_def)
+            .unwrap_or_default();
+        for e in flint_render::stylize::apply_style_specs(&mut config, &self.style_specs) {
+            tracing::warn!("{e}");
+        }
+        Some(config)
     }
 
     /// Apply scene-level camera configuration from `CameraDef`
@@ -319,6 +349,9 @@ impl PlayerApp {
         self.render_context = Some(render_context);
         self.scene_renderer = Some(scene_renderer);
         self.update_vsync_pacing();
+        // Quality settings (FlintKart#55) before any script's on_init, so
+        // get_quality() and gpu_info() answer from the first frame.
+        self.init_quality();
 
         // Saved persistent store (save/persist.toml) before any script's
         // on_init runs, so persist_get sees last session's values.
@@ -385,14 +418,8 @@ impl PlayerApp {
                 ..Default::default()
             },
         );
-        // FLINT_SHADOWS=0 starts with the shadow pass off (the debug panel
-        // toggle) so a perf run can A/B shadow cost headlessly.
-        if std::env::var("FLINT_SHADOWS")
-            .map(|v| v == "0")
-            .unwrap_or(false)
-        {
-            scene_renderer.set_shadows(false);
-        }
+        // FLINT_SHADOWS / FLINT_SHADOW_RES and the rest of the quality
+        // settings are applied by init_quality once the renderer is stored.
 
         // Rebuild component index as a safety net after scene loading
         self.world.rebuild_component_index();
@@ -410,32 +437,40 @@ impl PlayerApp {
             self.content_store.as_ref(),
         );
 
-        // Discover procgen specs and resolve unresolved assets before model loading
-        {
+        // The procgen disk tier (#181), set up once, before the first scene's
+        // assets are resolved.
+        if self.procgen_resolver.disk_stats().is_none() {
             let scene_dir = Path::new(&self.scene_path)
                 .parent()
                 .unwrap_or(Path::new("."));
-            let mut spec_dirs = vec![scene_dir.join("specs")];
-            if let Some(parent) = scene_dir.parent() {
-                spec_dirs.push(parent.join("specs"));
+            if let Some(disk) = self
+                .procgen_disk_cache
+                .then(|| procgen_disk_config(scene_dir))
+                .flatten()
+            {
+                println!("[procgen] disk cache: {}", disk.dir.display());
+                self.procgen_resolver = flint_procgen::ProcGenResolver::with_config(
+                    flint_procgen::ProcGenCacheConfig {
+                        disk: Some(disk),
+                        ..Default::default()
+                    },
+                );
             }
-            spec_dirs.push(scene_dir.join("models"));
-            let dir_refs: Vec<&Path> = spec_dirs
-                .iter()
-                .filter(|d| vfs::is_dir(d))
-                .map(|d| d.as_path())
-                .collect();
-            self.procgen_resolver.discover_and_index(&dir_refs);
-
-            resolve_procgen_assets(
-                &self.world,
-                &mut self.procgen_resolver,
-                &mut scene_renderer,
-                &render_context.device,
-                &render_context.queue,
-                &config,
-            );
         }
+
+        // Procgen before the model loader: catalog > procgen > file (#32).
+        super::procgen_assets::resolve_scene(
+            &self.scene_path,
+            &self.world,
+            &mut self.procgen_resolver,
+            self.procgen_mode,
+            super::procgen_assets::GpuSink {
+                renderer: &mut scene_renderer,
+                device: &render_context.device,
+                queue: &render_context.queue,
+                config: &config,
+            },
+        );
 
         let load_result = model_loader::load_models_from_world(
             &mut self.world,
@@ -499,6 +534,7 @@ impl PlayerApp {
             scene_renderer,
             Some(&mut self.physics),
             &render_context.device,
+            &render_context.queue,
         );
 
         // Refresh renderer with any new procedural meshes
@@ -564,10 +600,9 @@ impl PlayerApp {
         self.apply_camera_tuning();
 
         // Apply scene-level post-processing config
-        if let Some(pp_def) = &self.scene_post_process {
-            scene_renderer
-                .set_post_process_config(scene_loading::post_process_config_from_def(pp_def));
-            scene_renderer.ensure_kuwahara_resources(&render_context.device, &render_context.queue);
+        if let Some(config) = self.scene_post_config() {
+            scene_renderer.set_post_process_config(config);
+            scene_renderer.ensure_style_resources(&render_context.device);
             scene_renderer.ensure_fxaa_resources(&render_context.device);
         }
     }
@@ -674,11 +709,9 @@ impl PlayerApp {
             self.create_dead_calm_debug_panel();
             self.create_camera_debug_panel();
             self.create_particles_debug_panel();
-            // Rendering & Effects (ADR 0053): unconditional — every scene has
-            // a renderer to tune. Registered closed; F4 summons it. show_freeze
-            // is true here because player scripts drive post fields.
-            self.debug_panels
-                .push(Box::new(flint_debug_ui::RenderDebugPanel::new(true)));
+            self.create_styles_debug_panel();
+            // Rendering & Effects (ADR 0053): unconditional, F4 summons it
+            self.create_render_debug_panel();
             // The game's own (ADR 0107), after the engine's.
             self.create_extension_debug_panels();
         }
@@ -914,5 +947,77 @@ impl PlayerApp {
         for name in sprite_names {
             self.load_ui_texture(&name);
         }
+    }
+}
+
+/// Where the procgen disk tier goes for a scene in `scene_dir` (#181):
+/// `FLINT_PROCGEN_CACHE=<dir>` if set (`0`, `off` or empty: no disk tier),
+/// else `.flint/procgen-cache/` in the project, the scene folder's parent
+/// when that holds `schemas/` or `specs/` (a `levels/` layout, as in
+/// `showcase_game`), otherwise the scene folder itself. Until projects have
+/// a root marker and a config file (#179), that guess is the project.
+fn procgen_disk_config(scene_dir: &Path) -> Option<flint_procgen::DiskCacheConfig> {
+    if let Ok(value) = std::env::var("FLINT_PROCGEN_CACHE") {
+        return match value.trim() {
+            "" | "0" | "off" | "false" => None,
+            dir => Some(flint_procgen::DiskCacheConfig::new(dir)),
+        };
+    }
+    let project = scene_dir
+        .parent()
+        .filter(|p| vfs::is_dir(p.join("schemas")) || vfs::is_dir(p.join("specs")))
+        .unwrap_or(scene_dir);
+    Some(flint_procgen::DiskCacheConfig::in_project(project))
+}
+
+#[cfg(test)]
+mod style_word_tests {
+    use super::PlayerApp;
+
+    fn app() -> PlayerApp {
+        PlayerApp::new(
+            flint_ecs::FlintWorld::new(),
+            "style_words.scene.toml".into(),
+            false,
+            None,
+            None,
+        )
+    }
+
+    fn scene(post: &str) -> flint_scene::PostProcessDef {
+        let doc: toml::Table = post.parse().unwrap();
+        doc["post_process"].clone().try_into().unwrap()
+    }
+
+    #[test]
+    fn without_words_or_a_block_the_renderer_keeps_its_config() {
+        assert!(app().scene_post_config().is_none());
+    }
+
+    #[test]
+    fn style_words_win_over_every_scene_they_meet() {
+        let mut app = app();
+        app.style_specs = vec!["ascii:cell=12".into()];
+
+        // A scene with no [post_process] still gets the style
+        let config = app.scene_post_config().unwrap();
+        assert!(config.styles.is_enabled("ascii"));
+        assert_eq!(config.styles.param("ascii", "cell"), Some(12.0));
+
+        // A scene that authors the same style, and keeps its own bloom:
+        // the word wins on the style and leaves the rest alone. This is
+        // what a transition re-reads (#328)
+        app.scene_post_process = Some(scene(
+            "[post_process]\nbloom_intensity = 0.3\n\
+             [post_process.styles.ascii]\ncell = 6\nramp = \"blocks\"\n",
+        ));
+        let config = app.scene_post_config().unwrap();
+        assert_eq!(config.styles.param("ascii", "cell"), Some(12.0));
+        assert_eq!(config.styles.option("ascii", "ramp"), Some("blocks"));
+        assert!((config.bloom_intensity - 0.3).abs() < 1e-6);
+
+        // ascii:off turns off a style the scene has on
+        app.style_specs = vec!["ascii:off".into()];
+        assert!(!app.scene_post_config().unwrap().styles.is_enabled("ascii"));
     }
 }

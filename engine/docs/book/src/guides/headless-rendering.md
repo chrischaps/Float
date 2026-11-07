@@ -36,6 +36,8 @@ flint render levels/tavern.scene.toml \
 | `--no-grid` | `false` | Disable ground grid |
 | `--schemas <path>` | `schemas` | Path to schemas directory (repeatable) |
 | `--msaa <1\|4>` | `1` | Scene-pass MSAA sample count |
+| `--render-scale <f32>` | `1` | Draw the scene at this fraction of the image (0.25--1), upscaled |
+| `--gpu-time <frames>` | (none) | Render this many frames with GPU timing and print each pass's ms |
 
 ## Post-Processing Flags
 
@@ -79,15 +81,47 @@ flint render scene.toml --ssao-samples 16 --dof 0.6 --dof-focus 10 --dof-range 5
 | `--kuwahara-sharpness <f32>` | `8.0` | Kuwahara sector sharpness |
 | `--kuwahara-hardness <f32>` | `8.0` | Kuwahara sector hardness |
 | `--kuwahara-anisotropy <f32>` | `1.0` | Kuwahara anisotropy, 0--1 |
+| `--edge-depth <f32>` / `--edge-normal <f32>` | `0.6` / `2.5` | Shared geometry edges' thresholds (`--style edges_view` shows what they find) |
 | `--render-mode <0-5>` | `0` | Stylized render mode |
 | `--mode-mix <f32>` | `0` | Render mode blend, 0--1 |
 | `--mode-params <x,y,z,w>` | `0,0,0,0` | Per-mode parameters |
 | `--film-grain <f32>` | `0` | Film grain intensity |
 | `--grain-time <f32>` | `0` | Post time driving grain and mode animation |
+| `--style <name[:k=v,...]>` | (none) | Turn on any registered style over the scene, e.g. `ascii:cell=12,ramp=blocks`, `invert`, `kuwahara:radius=6`, `ascii:off`; repeatable; `--style help` lists them, `--list-styles [--json]` with stages and ranges ([Stylize Passes](../concepts/stylize-passes.md#using-a-style)) |
+| `--style-time <f32>` | `0` | Post time animated styles read (the same clock as `--grain-time`) |
+| `--look <name\|path>` | (none) | A preset `[post_process]` block merged over the scene's: `ascii_noir`, `matrix`, `ink_wash`, `graphite`, or a `styles/<name>.look.toml`; other flags apply over it; `--look help` lists them ([Looks and sweeps](../concepts/stylize-passes.md#looks-and-sweeps)) |
+| `--sweep <key=v1,v2,...>` | (none) | One labelled contact sheet of the frame at each value: `ascii.cell=6,8,12`, `post.exposure=0.8,1.2`, `look=a,b`; cells default to 640x360 |
 | `--grade-lift <r,g,b>` | `0,0,0` | Color grade lift |
 | `--grade-gamma <r,g,b>` | `1,1,1` | Color grade gamma |
 | `--grade-gain <r,g,b>` | `1,1,1` | Color grade gain |
 | `--fxaa` | `false` | Run the FXAA pass |
+| `--ascii` | (off) | The full-screen ASCII style (#265): one glyph per cell on one grid |
+| `--ascii-font` / `--ascii-ramp` / `--ascii-color` | `builtin` / the set's / `source` | ASCII style glyph set, ramp and colour mode (`source`, `tint`, `raw`, `mono`, `palette`) |
+| `--ascii-palette` / `--ascii-ground` / `--ascii-glow` | `phosphor` / `dim` / `0` | ASCII style palette (`cga`, `cga16`, `amber`... or a `.palette.toml`), ground (`dim`, `black`, `inverse`) and glyph halo |
+| `--ascii-tint <r,g,b>` / `--ascii-background <f32>` | phosphor green / `0.15` | ASCII style tint and how much cell colour fills behind glyphs |
+| `--ascii-brightness` / `--ascii-contrast` / `--ascii-ink` | `0` / `1` / `1` | ASCII style luminance remap and ink brightness |
+| `--ascii-dither` | `0` | ASCII style ordered dither, fixed to the cell grid (#277) |
+| `--ascii-exposure` / `--ascii-normalize` | `0` / `0` | ASCII style exposure in stops, and per-style-id tone normalisation so dark props stay legible (#289) |
+| `--ascii-text <file>` / `--ascii-text-ansi <file>` | (none) | Also write the ASCII style's character grid as UTF-8 text, or with 24-bit ANSI colours ([Reading a render as text](#reading-a-render-as-text), #317) |
+
+### Reading a render as text
+
+An ASCII render is a real character grid, so it can also be read rather than looked at. `--ascii-text` writes the grid the frame drew: one line per cell row, one character per cell, the same cells as the PNG (part cells at the borders included). A cell the picture passes through, under `scope = "entities"` or where a later style draws its own entity, is a space.
+
+```bash
+flint render demo/pbr_test.scene.toml --ascii --ascii-text frame.txt
+#   Wrote 240x135 ASCII grid to frame.txt
+flint render demo/pbr_test.scene.toml --ascii --ascii-text-ansi frame.ans && cat frame.ans
+```
+
+The text fits in a prompt, diffs line by line between two runs, and lets a test say "the box is `#`" without pixel tolerances. The ANSI file paints each glyph in its ink over its ground, for a 24-bit terminal. The grid comes from the GPU: a pass of one fragment a cell records which glyph the glyph pass draws at the cell's centre, and the frame copies it back. It runs only while capture is on (`SceneRenderer::set_style_text_capture` / `style_text`). A cell on a styled entity's silhouette holds that glyph plus the outline ink the entity draws (#288), so there the text names the centre's glyph.
+| `--pixels-per-point <f32>` | `1` | High-DPI scale factor for styles sized in points |
+| `--ascii-cell <n>` | `8` | ASCII cell width in points |
+| `--ascii-levels <n>` / `--ascii-footprint <cells>` | `0` / `1` | ASCII tone bands and tone footprint |
+| `--ascii-no-edges` | `false` | No line glyphs on edges |
+| `--ascii-edges <f32>` | `1` | ASCII style edge glyph strength (0 off) |
+| `--ascii-edge-threshold <f32>` / `--ascii-edge-max <f32>` | `0.5` / `3` | ASCII style: cell widths of edge that make a line glyph, and past which it's texture |
+| `--ascii-edge-depth <f32>` / `--ascii-edge-normal <f32>` | `0.6` / `2.5` | Edge sensitivity |
 
 ## Lighting Flags
 
@@ -112,7 +146,7 @@ flint render scene.toml --debug-mode wireframe --output wireframe.png
 # Surface normals
 flint render scene.toml --debug-mode normals --output normals.png
 
-# Other modes: depth, uv, unlit, metalrough
+# Other modes: depth, uv, unlit, metalrough, style
 flint render scene.toml --debug-mode depth --output depth.png
 
 # Wireframe overlay on solid geometry
@@ -127,7 +161,7 @@ flint render scene.toml --no-tonemapping --output linear.png
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--debug-mode <mode>` | (none) | `wireframe`, `normals`, `depth`, `uv`, `unlit`, `metalrough` |
+| `--debug-mode <mode>` | (none) | `wireframe`, `normals`, `depth`, `uv`, `unlit`, `metalrough`, `style` |
 | `--wireframe-overlay` | `false` | Draw wireframe edges over solid shading |
 | `--show-normals` | `false` | Draw face-normal direction arrows |
 | `--no-tonemapping` | `false` | Disable tonemapping for raw linear output |
@@ -138,7 +172,7 @@ Both wireframe modes include skinned meshes, drawn in their bind pose.
 
 `flint render` is built to be byte-stable so that pixel-diff gates can trust it. Identical scene, flags and GPU driver produce identical PNGs, with these caveats:
 
-- **Time is pinned.** Film grain and render-mode animation read a post time that headless render fixes at 0. Pass `--grain-time` to pick a different but equally repeatable frame; two renders at the same value match, different values differ.
+- **Time is pinned.** Film grain, render-mode animation and animated styles read a post time that headless render fixes at 0. Pass `--style-time` (or `--grain-time`) to pick a different but equally repeatable frame; two renders at the same value match, different values differ.
 - **MSAA and FXAA default off** precisely so the default path stays single-sample and single-pass. Turn them on for hero shots, not for baselines.
 - **Animation does not run.** Skinned meshes render at bind pose. For a posed headless frame use the model previewer's render mode instead: `flint edit model.glb --render out.png --anim-time 1.5`, or `--sequence file.sequence.toml --anim-time 2.0` to replay a timed sequence deterministically.
 - **Particles start at t = 0**, so emitters appear empty unless you pass `--particle-time <s>`, which steps them deterministically before the capture.
@@ -163,9 +197,64 @@ Headless rendering works on machines without a display. Use it in CI to catch vi
     path: screenshots/
 ```
 
+## Golden Suites
+
+`flint render-suite` given a `*.goldens.toml` renders a list of cases with `flint render` and compares each with a golden PNG (#271). It exits non-zero when any case moves past its tolerance, so it works as a gate in a script or a test:
+
+```bash
+flint render-suite crates/flint-cli/tests/golden/stylize.goldens.toml
+#   PASS  ascii-full      0.00% past 48 (limit 2.00%), mean 0.00 (limit 3.00), max 0, 1316 ms
+#   ...
+flint render-suite my.goldens.toml --case tavern --out-dir out/goldens
+flint render-suite my.goldens.toml --bless          # write the renders over the goldens
+```
+
+```toml
+[suite]
+name = "stylize"
+root = "../../../.."            # cases run from here; scene paths are relative to it
+width = 640                     # default 640 x 360
+height = 360
+args = ["--schemas", "schemas"] # before every case's own flags
+
+[tolerance]                     # the defaults below; a case may override any
+level = 48                      # a pixel differs past this many levels (largest channel, 0-255)
+share = 0.02                    # fail when more than this share of pixels differ...
+mean = 3.0                      # ...or the mean difference passes this
+
+[[case]]
+name = "ascii-full"
+scene = "demo/pbr_test.scene.toml"
+golden = "ascii_pbr_test.png"   # beside the manifest; default "<name>.png"
+args = ["--style", "ascii"]     # any flint render flags
+# width, height and tolerance = { ... } override the suite's
+text = "ascii_pbr_test.txt"     # optional: the ASCII grid too, compared exactly (#317)
+text_cells = 0                  # ...or with at most this many cells different
+```
+
+A case with `text` is also a structural golden. It renders with `--ascii-text`, and its character grid must match the checked-in one cell for cell, with the PNG kept as the visual check. When cells move, `<case>.text.diff` lands beside the render. It shows each row that moved, the golden's line over the render's, with a caret under each cell, so a drift can be read without opening an image:
+
+```text
+row 4: 2 cell(s)
+  golden |-----------------------------=====++++++++++++=====-----------------------------|
+  render |-----------------------------=====+=+=++++++++=====-----------------------------|
+                                             ^ ^
+```
+
+That's `ascii-full` with `brightness=-0.004` added. The PNG check passes it, with 0.19% of pixels moved against a 2% limit. The text check fails it, because 28 cells in 8 rows changed glyph. A structural golden is much stricter than a pixel tolerance, so give a case `text_cells` if its glyphs sit on a tone boundary that another GPU may round the other way.
+
+| Flag | Description |
+|------|-------------|
+| `--bless` | Write each render (and each `text` grid) over its golden instead of comparing. Look at them before committing |
+| `--case <name>` | Only this case, or every case whose name contains it; repeatable |
+| `--out-dir <dir>` | Where renders, `<case>.diff.png` (the golden dimmed, amber where a pixel moved, red past the level) and `report.json` go; default a folder in the system temp dir |
+| `--require-gpu` | Fail instead of skipping when there is no GPU adapter |
+
+Without a GPU adapter every case is skipped and the suite passes, which is what happens on CI today. Engine styles are pinned by `crates/flint-cli/tests/golden/stylize.goldens.toml` ([Stylize Passes](../concepts/stylize-passes.md#goldens)).
+
 ## Visual Regression Testing
 
-A basic visual regression workflow:
+For a game's own scenes, a golden suite as above is the shortest path. By hand, the same workflow is:
 
 1. **Baseline** --- render a reference image and commit it:
    ```bash

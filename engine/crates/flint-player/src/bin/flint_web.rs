@@ -27,6 +27,13 @@
 //!                   that scale instead, whatever the DPR (`scale=1` is
 //!                   native); `auto` keeps the cap and steps under it when
 //!                   frames run over budget for seconds
+//!   quality=k=v,... quality settings over msaa and scale (FlintKart#55), as
+//!                   flint-player's --quality: `quality=shadow_cascades=1,ssao=0`
+//!                   (comma-separated; scripts change them with set_quality)
+//!   style=<word>    a style over the scene's post-processing, as
+//!                   flint-player's --style (#328): `style=ascii:cell=12`;
+//!                   repeat the key for more (`style=ascii&style=invert`),
+//!                   kept through scene transitions
 //!   width=, height= fix the canvas to this many CSS pixels instead of the page
 //!   frame_step=<s>  step game time exactly s per frame (`--frame-step`)
 //!   hold_at=<s>     stop game time at s seconds, for a screenshot of an
@@ -94,10 +101,17 @@ mod web {
         perf: Option<bool>,
         /// `loop=poll`: the old flat-out loop, for comparison (#121).
         poll: bool,
+        /// `mix=old`: placed sounds on kira spatial tracks and every sound
+        /// mixed, heard or not, for comparison (#138).
+        old_mix: bool,
         /// `touch=always|never`: the on-screen touch controls (#133).
         touch: flint_runtime::TouchControlsMode,
         /// `fps=`: which refreshes are drawn (#140).
         fps: flint_player::FrameRateSetting,
+        /// `quality=key=value,...`: quality settings (FlintKart#55).
+        quality: String,
+        /// `style=name[:key=value,...]`, repeatable (#328).
+        styles: Vec<String>,
     }
 
     impl WebArgs {
@@ -130,6 +144,7 @@ mod web {
                     _ => Some(true),
                 }),
                 poll: get("loop").as_deref() == Some("poll"),
+                old_mix: get("mix").as_deref() == Some("old"),
                 touch: get("touch")
                     .and_then(|v| flint_runtime::TouchControlsMode::parse(&v))
                     .unwrap_or_default(),
@@ -142,6 +157,17 @@ mod web {
                             flint_player::FrameRateSetting::Native
                         }
                     }),
+                quality: get("quality").unwrap_or_default(),
+                styles: params
+                    .as_ref()
+                    .map(|p| {
+                        p.get_all("style")
+                            .iter()
+                            .filter_map(|v| v.as_string())
+                            .filter(|s| !s.is_empty())
+                            .collect()
+                    })
+                    .unwrap_or_default(),
             }
         }
     }
@@ -229,6 +255,10 @@ mod web {
         );
         app.msaa_sample_count = args.msaa;
         app.render_scale = args.render_scale;
+        app.quality_overrides = args.quality;
+        // A bad word is a warning in the console, not a page that won't
+        // start: the scene's user styles register later, at init (#274)
+        app.style_specs = args.styles;
         app.input.touch_controls_mut().set_mode(args.touch);
         app.clock.frame_step = args.frame_step;
         app.hold_at = args.hold_at;
@@ -236,6 +266,7 @@ mod web {
         if let Some(gpu) = args.perf {
             app.enable_perf(gpu);
         }
+        app.audio.set_old_mix(args.old_mix);
         app.apply_scene_settings(&loaded.scene_file);
         app.set_schema_paths(loaded.schemas);
         app.set_event_proxy(event_loop.create_proxy());
