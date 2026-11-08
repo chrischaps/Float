@@ -169,6 +169,18 @@ pub struct PostProcessDef {
     /// headless pixel-diff gates run without it; ADR 0050).
     #[serde(default)]
     pub fxaa: bool,
+    /// A look (#356): a `styles/<name>.look.toml` beside the scene (or its
+    /// parent's `styles/`), or a built-in (`ascii_noir`, `graphite`, ...),
+    /// laid under this block's own keys. `flint_render::look::resolve`
+    /// applies it; until then the struct holds the scene's keys alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub look: Option<String>,
+    /// The keys the scene's `[post_process]` wrote, as written (the loader
+    /// records them), so a look goes under exactly those and a later
+    /// `set_look` can re-lay a different one. `None` for a block built in
+    /// code, which then counts every field as its own.
+    #[serde(skip)]
+    pub authored: Option<toml::Table>,
 }
 
 fn default_grade_one() -> [f32; 3] {
@@ -320,6 +332,36 @@ pub fn fold_legacy_style_keys(post_process: &mut toml::Table) {
     }
 }
 
+/// The name in `known` closest to `key` by edit distance, if within 3.
+fn closest_name(key: &str, known: &[String]) -> Option<String> {
+    known
+        .iter()
+        .map(|k| (edit_distance(key, k), k))
+        .filter(|(d, _)| *d <= 3)
+        .min_by_key(|(d, _)| *d)
+        .map(|(_, k)| k.clone())
+}
+
+/// Levenshtein distance, small and good enough for field names.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let b: Vec<char> = b.chars().collect();
+    let mut row: Vec<usize> = (0..=b.len()).collect();
+    for (i, ca) in a.chars().enumerate() {
+        let mut prev = row[0];
+        row[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            let cur = row[j + 1];
+            row[j + 1] = if ca == *cb {
+                prev
+            } else {
+                1 + prev.min(row[j]).min(row[j + 1])
+            };
+            prev = cur;
+        }
+    }
+    row[b.len()]
+}
+
 fn default_edge_depth() -> f32 {
     0.6
 }
@@ -329,6 +371,87 @@ fn default_edge_normal() -> f32 {
 }
 
 impl PostProcessDef {
+    /// Every key a `[post_process]` block can name, sorted: the struct's
+    /// own fields, read back from a serialized one (so a new field is
+    /// known the moment it exists), with the ones skipped when empty
+    /// (`kuwahara_*`, `styles`) filled in so they serialize too.
+    pub fn field_names() -> Vec<String> {
+        let mut def: PostProcessDef = toml::Value::Table(toml::Table::new())
+            .try_into()
+            .expect("an empty [post_process] deserializes");
+        def.kuwahara_enabled = Some(false);
+        def.kuwahara_radius = Some(0);
+        def.kuwahara_sharpness = Some(0.0);
+        def.kuwahara_hardness = Some(0.0);
+        def.kuwahara_anisotropy = Some(0.0);
+        def.styles.insert("_".into(), toml::Table::new());
+        def.look = Some(String::new());
+        let mut names: Vec<String> = toml::Table::try_from(&def)
+            .map(|t| t.keys().cloned().collect())
+            .unwrap_or_default();
+        names.sort();
+        names
+    }
+
+    /// The known field closest to `key`, when one is within three edits.
+    pub fn closest_field(key: &str) -> Option<String> {
+        closest_name(key, &Self::field_names())
+    }
+
+    /// The keys of a raw `[post_process]` table that are no field of
+    /// this struct (#354), each with the closest known name. Serde drops
+    /// them without a word, so a typo would leave the default in place.
+    pub fn unknown_fields(raw: &toml::Table) -> Vec<(String, Option<String>)> {
+        let known = Self::field_names();
+        raw.keys()
+            .filter(|key| !known.iter().any(|k| k == *key))
+            .map(|key| (key.clone(), closest_name(key, &known)))
+            .collect()
+    }
+
+    /// [`Self::unknown_fields`] of a whole scene file's text, as warning
+    /// lines naming `source` (the file, when there is one). Empty when
+    /// the text has no `[post_process]` or doesn't parse (the loader
+    /// reports a parse error itself).
+    pub fn unknown_field_warnings(scene_text: &str, source: Option<&str>) -> Vec<String> {
+        let Ok(doc) = toml::from_str::<toml::Table>(scene_text) else {
+            return Vec::new();
+        };
+        let Some(toml::Value::Table(post)) = doc.get("post_process") else {
+            return Vec::new();
+        };
+        let at = source.map(|s| format!("{s}: ")).unwrap_or_default();
+        Self::unknown_fields(post)
+            .into_iter()
+            .map(|(key, near)| {
+                let hint = near
+                    .map(|n| format!(", did you mean '{n}'?"))
+                    .unwrap_or_default();
+                format!("{at}[post_process] has no field '{key}'{hint} (ignored)")
+            })
+            .collect()
+    }
+
+    /// A scene file's `[post_process]` table as written, for
+    /// [`Self::authored`]. `None` when there is none or the text doesn't
+    /// parse.
+    pub fn authored_table(scene_text: &str) -> Option<toml::Table> {
+        let mut doc = toml::from_str::<toml::Table>(scene_text).ok()?;
+        match doc.remove("post_process") {
+            Some(toml::Value::Table(post)) => Some(post),
+            _ => None,
+        }
+    }
+
+    /// A `[post_process]` block from its table, remembering the table as
+    /// what it authors (as the loader does), for blocks built in code that
+    /// a look should go under (#356).
+    pub fn from_authored(table: toml::Table) -> Result<Self, toml::de::Error> {
+        let mut def: Self = toml::Value::Table(table.clone()).try_into()?;
+        def.authored = Some(table);
+        Ok(def)
+    }
+
     /// The style tables, with the old `kuwahara_*` keys folded in
     /// ([`fold_legacy_style_keys`]). What the renderer reads.
     pub fn style_tables(&self) -> std::collections::BTreeMap<String, toml::Table> {
@@ -602,6 +725,47 @@ mod legacy_style_key_tests {
         assert_eq!(k["radius"].as_integer(), Some(5));
         // An authored table is on unless it says otherwise
         assert!(!k.contains_key("enabled"));
+    }
+
+    #[test]
+    fn unknown_post_process_fields_warn_with_the_closest_name() {
+        let scene = "[scene]\nname = \"t\"\n\n[post_process]\n\
+                     bloom_intensty = 0.1\nexposure = 1.5\nzzzzzzzzzz = 1\n\
+                     kuwahara_radius = 4\n[post_process.styles.ascii]\ncell = 8\n";
+        let warnings = PostProcessDef::unknown_field_warnings(scene, Some("levels/a.scene.toml"));
+        assert_eq!(
+            warnings,
+            [
+                "levels/a.scene.toml: [post_process] has no field 'bloom_intensty', \
+                 did you mean 'bloom_intensity'? (ignored)",
+                "levels/a.scene.toml: [post_process] has no field 'zzzzzzzzzz' (ignored)",
+            ]
+        );
+        // Known fields, the legacy kuwahara keys and `styles` pass
+        assert!(PostProcessDef::unknown_field_warnings(
+            "[post_process]\nfxaa = true\nkuwahara_enabled = true\n[post_process.styles.x]\n",
+            None
+        )
+        .is_empty());
+        assert!(PostProcessDef::unknown_field_warnings("[scene]\nname = \"t\"\n", None).is_empty());
+    }
+
+    #[test]
+    fn field_names_cover_every_field() {
+        let names = PostProcessDef::field_names();
+        for f in [
+            "bloom_intensity",
+            "fxaa",
+            "styles",
+            "kuwahara_anisotropy",
+            "grade_gain",
+        ] {
+            assert!(names.iter().any(|n| n == f), "{f} missing");
+        }
+        assert_eq!(
+            PostProcessDef::closest_field("expsure").as_deref(),
+            Some("exposure")
+        );
     }
 
     #[test]
