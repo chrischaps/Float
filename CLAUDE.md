@@ -441,8 +441,11 @@ Polish backlog: real M6/M8 + weather SFX from
 `specs/elevenlabs_audio_prompts.md`; the palm is still a sharp-edged box
 (reads as a card in close-up); live playtest of the scoot with the
 new passive-arm ride.
-Engine changes live on Flint branch `feature/ocean-pipeline` (merge to main
-when ready). Plan: `C:\Users\chris\.claude\plans\please-make-a-plan-fluffy-pearl.md`
+Engine: `engine/` tracks Flint `main` (last pull 2026-11-08, Flint
+`7e9285e`; everything Float pioneered is upstream). Engine tests:
+`cargo test --release --workspace --exclude flint-android` (the Android
+crate only compiles for Android). Plan (historical):
+`C:\Users\chris\.claude\plans\please-make-a-plan-fluffy-pearl.md`
 
 ## Showcase capture (tools/showcase/)
 
