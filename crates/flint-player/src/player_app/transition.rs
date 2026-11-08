@@ -377,7 +377,10 @@ impl PlayerApp {
                 });
                 self.scene_camera = scene_file.camera.clone();
                 super::scene_loading::load_user_styles(&new_scene_path);
-                self.scene_post_process = scene_file.post_process.clone();
+                self.scene_post_process = scene_file
+                    .post_process
+                    .as_ref()
+                    .map(|d| flint_render::look::resolve_scene(d, &new_scene_path));
                 self.scene_input_config = scene_file.scene.input_config.clone();
                 self.scene_preload_audio = scene_file.scene.preload_audio;
             }
@@ -451,6 +454,8 @@ impl PlayerApp {
             // The new scene's first frame has no past: styles that keep
             // history (ASCII's temporal stability, #277) start over
             renderer.reset_style_history();
+            // ...and the new scene's first camera is no cut from the old one's
+            self.camera_cut.forget();
 
             // Scene-authored hemisphere ambient + wrap; reset first so the
             // previous scene's values never leak into one that doesn't
