@@ -468,9 +468,12 @@ external views, stops writing the camera + underwater mode), and add
 makes contact sheets; `encode.py` makes the site media; `cover.py` builds the
 time-slice cover from the `slice_*` stills (same instant, eight hours — weather,
 idle fidgets, birds and blooms OFF so the water and pose match across strips).
-Script random draws are NOT seeded: weather gusts reshape the spectrum, so a
-preview's swell/dunk timing can differ from the final run — shoot generously
-and trim. Narrow an event's window to pin its timing (the whale shot does).
+Script random draws: since Flint #635 (pulled 2026-11-12) `--frame-step`
+seeds `random()`/`random_range()` with a fixed seed (`--seed N` picks
+another), so a re-run of the same shot at the same step repeats. A preview at
+a different fps takes a different number of draws per second, so weather gusts
+(which reshape the spectrum) can still put its swell/dunk timing off the final
+run's. Shoot generously and trim. Narrow an event's window to pin its timing (the whale shot does).
 
 ## Debug controls in play
 
