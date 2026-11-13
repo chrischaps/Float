@@ -1,11 +1,14 @@
 //! Scene renderer - converts FlintWorld entities to GPU meshes
 
 mod extract;
+mod grass_ground;
 mod helpers;
 mod particles;
 mod render_passes;
+mod selection;
 
-pub use particles::load_particle_textures;
+pub use grass_ground::{load_grass_ground_in, load_scene_grass_ground, LoadedGrassGround};
+pub use particles::load_scene_particle_textures;
 use render_passes::RenderPhase;
 
 use helpers::{identity_matrix, mat4_inv_transpose};
@@ -37,6 +40,9 @@ use crate::skybox_pipeline::{SkyboxPipeline, SkyboxUniforms};
 use crate::sprite2d_pipeline::{Sprite2dInstanceGpu, Sprite2dPipeline};
 use crate::terrain_pipeline::{TerrainDrawCall, TerrainPipeline, TerrainUniforms};
 use crate::texture_cache::{open_image, TextureCache};
+use crate::wooze_pipeline::{
+    grow_bounds, ShallowWoozeDraw, ShallowWoozeUniforms, WoozePipelineSet,
+};
 use flint_core::components as comp;
 use flint_core::toml_util::toml_f32;
 use flint_core::vfs;
@@ -47,6 +53,12 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 use wgpu::util::DeviceExt;
+
+/// A scope and the `scene_dir` it was made for.
+type AssetScopeFor = (
+    Option<std::path::PathBuf>,
+    Arc<flint_core::project::AssetScope>,
+);
 
 /// Default main-pass clear colour (linear RGBA), matching the historical
 /// dark slate background.
@@ -101,6 +113,11 @@ pub(super) struct DrawCall {
     /// The camera distances this draw is drawn at: its mesh's level of detail
     /// and the entity's `lod.draw_distance`. `None` draws at every distance.
     lod: Option<DrawLod>,
+    /// Its drift this frame, if its entity has shallow wooze (#215).
+    wooze: Option<ShallowWoozeUniforms>,
+    /// Drawn with no face culled, in the scene and shadow passes: its
+    /// material is glTF `doubleSided` (#623).
+    double_sided: bool,
 }
 
 /// A draw's level of detail in world space: the band of camera distances it
@@ -239,7 +256,11 @@ impl DrawBindCache {
             }
             keep
         });
-        self.materials.retain(|_, m| m.touched == frame);
+        // Kept a little past their last draw: a living prop's leaves flick
+        // between a few shared tints (#212), which shouldn't remake a buffer and
+        // a bind group each time one goes unused for a frame.
+        self.materials
+            .retain(|_, m| frame.saturating_sub(m.touched) < MATERIAL_GRACE_FRAMES);
     }
 }
 
@@ -263,6 +284,18 @@ impl TransformTarget {
                 queue.write_buffer(buffer, 0, bytemuck::bytes_of(uniforms));
             }
             TransformTarget::Slot(slot) => arena.stage(*slot, bytemuck::bytes_of(uniforms)),
+        }
+    }
+
+    /// Put shallow wooze's drift in the rest of the slot (#215). Only cached draws
+    /// have the room, and only they can have drift.
+    fn write_wooze(&self, arena: &mut TransformArena, wooze: &ShallowWoozeUniforms) {
+        if let TransformTarget::Slot(slot) = self {
+            arena.stage_at(
+                *slot,
+                std::mem::size_of::<TransformUniforms>(),
+                bytemuck::bytes_of(wooze),
+            );
         }
     }
 
@@ -401,6 +434,31 @@ pub(super) struct CachedBoneBind {
     pub touched: u64,
 }
 
+/// Write `matrices` into a bone buffer from bone `first`, stopping at its end.
+fn write_bones(
+    queue: &wgpu::Queue,
+    buffer: &wgpu::Buffer,
+    first: usize,
+    matrices: &[[[f32; 4]; 4]],
+) {
+    let room = crate::skinned_pipeline::MAX_BONES.saturating_sub(first);
+    let matrices = &matrices[..matrices.len().min(room)];
+    if !matrices.is_empty() {
+        queue.write_buffer(
+            buffer,
+            (first * std::mem::size_of::<[[f32; 4]; 4]>()) as u64,
+            bytemuck::cast_slice(matrices),
+        );
+    }
+}
+
+/// How long a material nothing draws with stays in the cache: about 2 s.
+const MATERIAL_GRACE_FRAMES: u64 = 120;
+
+/// The `skinned_bone_binds` key bit for a draw's shadow bones, when it has its
+/// own apart from the bones it's drawn with.
+pub(super) const SHADOW_BONE_KEY: u32 = 1 << 30;
+
 /// The `draw_bind_cache` key bit that keeps a skinned draw's binds apart
 /// from a static draw's of the same entity and sub-mesh index.
 pub(super) const SKINNED_DRAW_KEY: u32 = 1 << 31;
@@ -419,6 +477,9 @@ struct SkinnedDrawCall {
     material_buffer: Arc<MaterialBuffer>,
     material_bind_group: Arc<wgpu::BindGroup>,
     bone_bind_group: Arc<wgpu::BindGroup>,
+    /// What the shadow pass binds: `bone_bind_group`, unless the entity has
+    /// shadow bones of its own (`write_entity_shadow_bones`).
+    shadow_bone_bind_group: Arc<wgpu::BindGroup>,
     /// Unique-edge index buffer for wireframe debug modes (shares the
     /// skinned vertex buffer, so the lines follow the animated pose).
     wire_index_buffer: Option<wgpu::Buffer>,
@@ -434,6 +495,57 @@ struct SkinnedDrawCall {
     /// under every bone matrix, which holds any blend of them. `None`
     /// when the bones aren't known on the CPU.
     world_aabb: Option<([f32; 3], [f32; 3])>,
+    /// As [`DrawCall::wooze`].
+    wooze: Option<ShallowWoozeUniforms>,
+    /// As [`DrawCall::double_sided`].
+    double_sided: bool,
+    /// Translucent only for its soft edge (#582): it still casts a whole
+    /// shadow, since softness is how the outline looks to the eye, not how
+    /// much light the body stops.
+    soft_edge_only: bool,
+}
+
+impl SceneRenderer {
+    /// The skinned draws that go into the shadow map, in the order every
+    /// shadow loop walks them: the opaque ones that cast, then the translucent
+    /// ones that are translucent only for their softness (#582).
+    /// Over the two lists, not `self`, so the shadow pass can hold its own
+    /// borrow of the renderer's shadow state.
+    fn skinned_shadow_draws<'a>(
+        opaque: &'a [SkinnedDrawCall],
+        translucent: &'a [SkinnedDrawCall],
+    ) -> impl Iterator<Item = &'a SkinnedDrawCall> + Clone {
+        let opaque = opaque.iter().filter(|d| d.casts_shadow);
+        let soft = (translucent.iter()).filter(|d| d.casts_shadow && d.soft_edge_only);
+        opaque.chain(soft)
+    }
+}
+
+/// One faint copy of a skinned entity (#228): bones of its own and how opaque
+/// it draws. The rest it takes from the entity's own draw at extraction.
+struct EntityEcho {
+    bones: wgpu::Buffer,
+    bind_group: Arc<wgpu::BindGroup>,
+    opacity: f32,
+}
+
+/// A draw of one part of one echo. It reads the entity's transform slot rather
+/// than having one of its own, and a material shared by content.
+struct EchoDrawCall {
+    vertex_buffer: Arc<wgpu::Buffer>,
+    index_buffer: Arc<wgpu::Buffer>,
+    index_count: u32,
+    transform_bind_group: Arc<wgpu::BindGroup>,
+    material_buffer: Arc<MaterialBuffer>,
+    material_bind_group: Arc<wgpu::BindGroup>,
+    bone_bind_group: Arc<wgpu::BindGroup>,
+    /// Whether it may only add light: its entity's `[living] echo_blend`.
+    lighten: bool,
+    /// Where the entity stands, since all its echoes sort as one.
+    origin: [f32; 3],
+    /// Which echo: they draw in this order, so farthest from now first.
+    echo: usize,
+    sort_depth: f32,
 }
 
 /// Configuration for creating a SceneRenderer
@@ -479,6 +591,11 @@ pub struct LightingLevers {
 pub struct SceneRenderer {
     pipeline: RenderPipeline,
     skinned_pipeline: Option<SkinnedPipeline>,
+    /// Shallow wooze (#215): each entity's drift this frame, from the caller, and
+    /// the pipelines its draws use, built when the first one needs them.
+    shallow_wooze: HashMap<flint_core::EntityId, ShallowWoozeDraw>,
+    wooze_standard: Option<WoozePipelineSet>,
+    wooze_skinned: Option<WoozePipelineSet>,
     billboard_pipeline: Option<BillboardPipeline>,
     archetype_visuals: HashMap<String, ArchetypeVisual>,
     mesh_cache: MeshCache,
@@ -490,14 +607,15 @@ pub struct SceneRenderer {
     /// Bumped once per `update_from_world`; stamps cache entries.
     extract_frame: u64,
     /// Runtime meshes uploaded as ray targets, by name (ADR 0105).
-    ray_meshes: HashMap<String, Arc<flint_core::ray_mesh::RayMesh>>,
+    ray_meshes: HashMap<String, Arc<flint_geometry::ray_mesh::RayMesh>>,
     /// Where the ray targets stood at the last `update_from_world`.
-    ray_scene: Arc<flint_core::ray_mesh::RayScene>,
+    ray_scene: Arc<flint_geometry::ray_mesh::RayScene>,
     grid_draw: Option<DrawCall>,
     entity_draws: Vec<DrawCall>,
     skinned_entity_draws: Vec<SkinnedDrawCall>,
     transparent_draws: Vec<DrawCall>,
     transparent_skinned_draws: Vec<SkinnedDrawCall>,
+    echo_draws: Vec<EchoDrawCall>,
     /// Draws outside the camera frustum in the last `render_to`, set aside
     /// from `entity_draws` / `transparent_draws` after the shadow pass.
     culled_entity_draws: Vec<DrawCall>,
@@ -515,6 +633,14 @@ pub struct SceneRenderer {
     /// the built-in default; stored so the zero-light fallback in
     /// `extract_lights_from_world` cannot stomp it.
     ambient_override: Option<([f32; 3], [f32; 3])>,
+    /// The scene's `[environment] shadows` (#627): false keeps the shadow
+    /// pass from drawing whatever the quality tier or F4 say. True unless
+    /// a scene says otherwise.
+    scene_shadows: bool,
+    /// The scene's `[environment] default_lights` (#627): false lights a
+    /// scene with no light entities by its ambient alone, instead of the
+    /// built-in key and fill. True unless a scene says otherwise.
+    default_lights: bool,
     /// Scene-authored diffuse terminator wrap. Rides ambient_sky.w encoded as
     /// (1 + wrap) so legacy writes of 1.0 decode to wrap = 0 in the shader.
     diffuse_wrap_override: Option<f32>,
@@ -523,6 +649,12 @@ pub struct SceneRenderer {
     texture_cache: Option<TextureCache>,
     shadow_pass: Option<ShadowPass>,
     selected_entity: Option<flint_core::EntityId>,
+    /// Each entity's children, as the last `update_from_world` saw them,
+    /// so the selection outline covers a selected entity's subtree (#602)
+    entity_children: HashMap<flint_core::EntityId, Vec<flint_core::EntityId>>,
+    /// The selection outline's pipelines and mask, made the first frame
+    /// something is selected (#602)
+    selection_outline: Option<crate::selection_outline::SelectionOutline>,
     // Skybox
     skybox_pipeline: Option<SkyboxPipeline>,
     skybox_uniform_buffer: Option<wgpu::Buffer>,
@@ -564,6 +696,8 @@ pub struct SceneRenderer {
     gpu_timer: Option<crate::gpu_timer::GpuTimer>,
     /// The entity style mask's pass (#263); `None` until a frame needs it.
     style_mask_pass: Option<crate::style_mask::StyleMaskPass>,
+    /// The style albedo's pass (#869), made the first frame a style reads it.
+    style_albedo_pass: Option<crate::style_albedo::StyleAlbedoPass>,
     /// Style names entities ask for, numbered for the mask.
     style_ids: crate::style_mask::StyleIds,
     /// Styled entities -> their mask id, rebuilt each `update_from_world`
@@ -574,6 +708,8 @@ pub struct SceneRenderer {
     style_scissor: bool,
     /// The blend of each styled entity drawn at less than 1 (#278).
     style_blend_by_entity: HashMap<flint_core::EntityId, f32>,
+    /// The styled entities whose blend follows the reality tear (#397).
+    style_torn_entities: std::collections::HashSet<flint_core::EntityId>,
     /// Whether the last style mask drew a veil over its entities (#290):
     /// something unstyled in front, so the mask's blend is below 1 there
     /// even with every entity fully styled (#396 cross-fades by it).
@@ -633,7 +769,7 @@ pub struct SceneRenderer {
     /// when the component didn't describe a mesh; the warning said why.
     scene_water_bodies:
         std::collections::BTreeMap<String, (toml::Value, Option<crate::water_body::GpuWaterBody>)>,
-    ocean_spectrum: Option<flint_core::ocean::WaveSpectrum>,
+    ocean_spectrum: Option<flint_geometry::ocean::WaveSpectrum>,
     ocean_visuals: crate::ocean_pipeline::OceanVisuals,
     ocean_active: bool,
     /// Contact-foam hull: ([x, z, cos_yaw, sin_yaw], [half_x, half_z]).
@@ -655,6 +791,9 @@ pub struct SceneRenderer {
     /// the game clock — the same clock scripts see via total_time(), which is
     /// what keeps script-side ocean_height() queries in sync with the GPU.
     pub ocean_time: f64,
+    /// Motion on twos (#405): who is drawn on ticks, what they last showed,
+    /// and the clock hosts stamp with [`Self::set_motion_time`].
+    motion_hold: crate::motion_hold::MotionHold,
     /// Seconds of game time this frame stepped, for styles whose history
     /// is a rate (ASCII's smoothing, #342): the player sets it from its
     /// clock's `delta_time` (so it follows `--frame-step`), the viewer from
@@ -725,10 +864,20 @@ pub struct SceneRenderer {
     pub camera_offset: [f32; 2],
     pub ortho_height: f32,
     pub aspect_ratio: f32,
-    // Bitmap font cache for ui_text rendering
-    bitmap_font_cache: HashMap<String, BitmapFont>,
-    /// Scene directory for resolving relative font/texture paths
+    /// `ui_text` fonts by what the component named, each uploaded once
+    /// (`load_ui_font`); `None` for one that failed, warned about once.
+    bitmap_font_cache: HashMap<String, Option<BitmapFont>>,
+    /// The scope `bitmap_font_cache` was filled from. A name means another
+    /// font in another scene's folder (#312), so a load from a different
+    /// scope forgets them all first.
+    bitmap_font_scope: Option<flint_core::project::AssetScope>,
+    /// Scene directory for resolving relative font/texture paths. A host
+    /// that holds the scene's project sets it through
+    /// [`set_asset_scope`](Self::set_asset_scope).
     pub scene_dir: Option<std::path::PathBuf>,
+    /// The project and folder styles search from, with the `scene_dir` it
+    /// was made for: found once a scene, not once a lookup.
+    asset_scope: std::sync::Mutex<Option<AssetScopeFor>>,
     /// Physical pixels per logical point of the window it draws into: the
     /// OS scale factor. Styles sized in points (ASCII cells, #265) scale by
     /// it. Hosts with a window set it; 1 headless.
@@ -740,6 +889,9 @@ pub struct SceneRenderer {
     style_history_epoch: u64,
     /// Time in seconds, used for grass wind animation. Set by the player before render().
     pub grass_time: f32,
+    /// The comb of woozy grass this frame (#252), from the clock the player set
+    /// `grass_time` on. `None`, the default, combs nothing.
+    pub grass_wooze: Option<ShallowWoozeDraw>,
     /// Set when GPU device is lost (e.g. driver crash); skips all rendering
     device_lost: bool,
     /// Per-entity bone matrix buffers. The `GpuSkinnedMesh` bone buffer is
@@ -751,6 +903,17 @@ pub struct SceneRenderer {
     /// for the per-entity style scissor (#385).
     entity_bone_matrices: HashMap<flint_core::EntityId, Vec<[[f32; 4]; 4]>>,
     asset_bone_matrices: HashMap<String, Vec<[[f32; 4]; 4]>>,
+    /// Entities whose shadow follows other bones than they're drawn with.
+    entity_shadow_bone_buffers: HashMap<flint_core::EntityId, wgpu::Buffer>,
+    /// Per entity, what each skinned part's vertex colour is multiplied by.
+    entity_part_tints: HashMap<flint_core::EntityId, Vec<[f32; 3]>>,
+    /// Per entity, how soft each skinned part's silhouette is (#582); a part
+    /// missing or at 0 is a hard edge.
+    entity_part_softness: HashMap<flint_core::EntityId, Vec<f32>>,
+    /// Living props' echoes, in the order they draw. Empty costs nothing.
+    entity_echoes: HashMap<flint_core::EntityId, Vec<EntityEcho>>,
+    /// The entities whose echoes may only add light.
+    entity_echo_lighten: std::collections::HashSet<flint_core::EntityId>,
     /// Bone bind groups of skinned draws, by entity and sub-mesh.
     skinned_bone_binds: HashMap<(flint_core::EntityId, u32), CachedBoneBind>,
 }
@@ -847,15 +1010,15 @@ impl SceneRenderer {
         let postprocess_config = PostProcessConfig::default();
         let postprocess_pipeline =
             PostProcessPipeline::new(&context.device, &context.queue, surface_format);
-        let postprocess_resources = PostProcessResources::new(
-            &context.device,
-            context.config.width,
-            context.config.height,
-        );
+        let postprocess_resources =
+            PostProcessResources::new(&context.device, context.config.width, context.config.height);
 
         Self {
             pipeline,
             skinned_pipeline: Some(skinned_pipeline),
+            shallow_wooze: HashMap::new(),
+            wooze_standard: None,
+            wooze_skinned: None,
             billboard_pipeline: Some(billboard_pipeline),
             archetype_visuals,
             mesh_cache: MeshCache::new(),
@@ -867,12 +1030,18 @@ impl SceneRenderer {
             entity_bone_buffers: HashMap::new(),
             entity_bone_matrices: HashMap::new(),
             asset_bone_matrices: HashMap::new(),
+            entity_shadow_bone_buffers: HashMap::new(),
+            entity_part_tints: HashMap::new(),
+            entity_part_softness: HashMap::new(),
+            entity_echoes: HashMap::new(),
+            entity_echo_lighten: std::collections::HashSet::new(),
             skinned_bone_binds: HashMap::new(),
             grid_draw,
             entity_draws: Vec::new(),
             skinned_entity_draws: Vec::new(),
             transparent_draws: Vec::new(),
             transparent_skinned_draws: Vec::new(),
+            echo_draws: Vec::new(),
             culled_entity_draws: Vec::new(),
             culled_transparent_draws: Vec::new(),
             billboard_draws: Vec::new(),
@@ -885,12 +1054,16 @@ impl SceneRenderer {
             light_bind_group,
             light_uniforms,
             ambient_override: None,
+            scene_shadows: true,
+            default_lights: true,
             diffuse_wrap_override: None,
             oren_nayar_override: None,
             sheen_override: None,
             texture_cache: Some(texture_cache),
             shadow_pass: Some(shadow_pass),
             selected_entity: None,
+            entity_children: HashMap::new(),
+            selection_outline: None,
             skybox_pipeline: Some(skybox_pipeline),
             skybox_uniform_buffer: None,
             skybox_uniform_bind_group: None,
@@ -916,10 +1089,12 @@ impl SceneRenderer {
             grass_shadow_binds: Vec::new(),
             gpu_timer: None,
             style_mask_pass: None,
+            style_albedo_pass: None,
             style_ids: Default::default(),
             style_by_entity: HashMap::new(),
             style_scissor: crate::stylize::scissor_enabled(),
             style_blend_by_entity: HashMap::new(),
+            style_torn_entities: std::collections::HashSet::new(),
             style_mask_veiled: false,
             mask_view_forced: false,
             ascii_forced: false,
@@ -971,6 +1146,7 @@ impl SceneRenderer {
             ocean_grab_this_frame: false,
             ocean_camera_near_far: (0.1, 1000.0),
             ocean_time: 0.0,
+            motion_hold: Default::default(),
             style_dt: 1.0 / 60.0,
             particle_pipeline: Some(particle_pipeline),
             particle_draws: Vec::new(),
@@ -1008,11 +1184,14 @@ impl SceneRenderer {
             ortho_height: 10.0,
             aspect_ratio: 16.0 / 9.0,
             bitmap_font_cache: HashMap::new(),
+            bitmap_font_scope: None,
             scene_dir: None,
+            asset_scope: std::sync::Mutex::new(None),
             pixels_per_point: 1.0,
             style_frame_serial: std::sync::atomic::AtomicU64::new(0),
             style_history_epoch: 0,
             grass_time: 0.0,
+            grass_wooze: None,
             device_lost: false,
         }
     }
@@ -1247,6 +1426,18 @@ impl SceneRenderer {
         layer_paths: &[String; 4],
         scene_dir: &Path,
     ) {
+        // The splat map and the layers are paths the scene names: found by
+        // the project's one search (`AssetKind::Files`, ADR 0114), and a
+        // missing one is a warning listing every path tried.
+        let scope = self.asset_scope();
+        let find = |what: &str, name: &str| -> Option<std::path::PathBuf> {
+            scope
+                .project
+                .resolve(flint_core::project::AssetKind::Files, name, scene_dir)
+                .map_err(|not_found| tracing::warn!("{what}: {not_found}"))
+                .ok()
+        };
+
         let tp = match &self.terrain_pipeline {
             Some(tp) => tp,
             None => return,
@@ -1260,8 +1451,7 @@ impl SceneRenderer {
 
         // Load splat map
         if !splat_path.is_empty() {
-            let path = scene_dir.join(splat_path);
-            if vfs::exists(&path) {
+            if let Some(path) = find("terrain splat map", splat_path) {
                 let _ = tc.load_file(device, queue, "terrain_splat", &path);
             }
         }
@@ -1269,8 +1459,7 @@ impl SceneRenderer {
         // Load layer textures
         for (i, layer_path) in layer_paths.iter().enumerate() {
             if !layer_path.is_empty() {
-                let path = scene_dir.join(layer_path);
-                if vfs::exists(&path) {
+                if let Some(path) = find("terrain layer texture", layer_path) {
                     let name = format!("terrain_layer{}", i);
                     let _ = tc.load_file(device, queue, &name, &path);
                 }
@@ -2279,6 +2468,7 @@ impl SceneRenderer {
         self.skinned_entity_draws.clear();
         self.transparent_draws.clear();
         self.transparent_skinned_draws.clear();
+        self.echo_draws.clear();
         self.culled_entity_draws.clear();
         self.culled_transparent_draws.clear();
         self.billboard_draws.clear();
@@ -2290,6 +2480,7 @@ impl SceneRenderer {
         self.particle_draws.clear();
         self.particle_texture_bind_groups.clear();
         self.bitmap_font_cache.clear();
+        self.bitmap_font_scope = None;
     }
 
     /// Create a renderer for headless (offscreen) use with explicit device and format
@@ -2385,6 +2576,9 @@ impl SceneRenderer {
         Self {
             pipeline,
             skinned_pipeline: Some(skinned_pipeline),
+            shallow_wooze: HashMap::new(),
+            wooze_standard: None,
+            wooze_skinned: None,
             billboard_pipeline: Some(billboard_pipeline),
             archetype_visuals,
             mesh_cache: MeshCache::new(),
@@ -2396,12 +2590,18 @@ impl SceneRenderer {
             entity_bone_buffers: HashMap::new(),
             entity_bone_matrices: HashMap::new(),
             asset_bone_matrices: HashMap::new(),
+            entity_shadow_bone_buffers: HashMap::new(),
+            entity_part_tints: HashMap::new(),
+            entity_part_softness: HashMap::new(),
+            entity_echoes: HashMap::new(),
+            entity_echo_lighten: std::collections::HashSet::new(),
             skinned_bone_binds: HashMap::new(),
             grid_draw,
             entity_draws: Vec::new(),
             skinned_entity_draws: Vec::new(),
             transparent_draws: Vec::new(),
             transparent_skinned_draws: Vec::new(),
+            echo_draws: Vec::new(),
             culled_entity_draws: Vec::new(),
             culled_transparent_draws: Vec::new(),
             billboard_draws: Vec::new(),
@@ -2414,12 +2614,16 @@ impl SceneRenderer {
             light_bind_group,
             light_uniforms,
             ambient_override: None,
+            scene_shadows: true,
+            default_lights: true,
             diffuse_wrap_override: None,
             oren_nayar_override: None,
             sheen_override: None,
             texture_cache: Some(texture_cache),
             shadow_pass: Some(shadow_pass),
             selected_entity: None,
+            entity_children: HashMap::new(),
+            selection_outline: None,
             skybox_pipeline: Some(skybox_pipeline),
             skybox_uniform_buffer: None,
             skybox_uniform_bind_group: None,
@@ -2445,10 +2649,12 @@ impl SceneRenderer {
             grass_shadow_binds: Vec::new(),
             gpu_timer: None,
             style_mask_pass: None,
+            style_albedo_pass: None,
             style_ids: Default::default(),
             style_by_entity: HashMap::new(),
             style_scissor: crate::stylize::scissor_enabled(),
             style_blend_by_entity: HashMap::new(),
+            style_torn_entities: std::collections::HashSet::new(),
             style_mask_veiled: false,
             mask_view_forced: false,
             ascii_forced: false,
@@ -2500,6 +2706,7 @@ impl SceneRenderer {
             ocean_grab_this_frame: false,
             ocean_camera_near_far: (0.1, 1000.0),
             ocean_time: 0.0,
+            motion_hold: Default::default(),
             style_dt: 1.0 / 60.0,
             // Headless particles (ADR 0068): zero instances until a caller
             // steps a ParticleSystem, so existing pixel gates are unchanged.
@@ -2539,11 +2746,14 @@ impl SceneRenderer {
             ortho_height: 10.0,
             aspect_ratio: 16.0 / 9.0,
             bitmap_font_cache: HashMap::new(),
+            bitmap_font_scope: None,
             scene_dir: None,
+            asset_scope: std::sync::Mutex::new(None),
             pixels_per_point: 1.0,
             style_frame_serial: std::sync::atomic::AtomicU64::new(0),
             style_history_epoch: 0,
             grass_time: 0.0,
+            grass_wooze: None,
             device_lost: false,
         }
     }
@@ -2672,6 +2882,13 @@ impl SceneRenderer {
         if self.device_lost {
             return;
         }
+        // A pose held on twos (#405) is written once a tick; the frames
+        // between draw the buffer as it was, CPU copies included
+        if self.entity_bone_buffers.contains_key(&entity_id)
+            && !self.motion_hold.bones_due(entity_id)
+        {
+            return;
+        }
         let bytes: &[u8] = bytemuck::cast_slice(matrices);
         let capacity = crate::skinned_pipeline::MAX_BONES * std::mem::size_of::<[[f32; 4]; 4]>();
         let buffer = self
@@ -2728,12 +2945,302 @@ impl SceneRenderer {
         self.style_bounds(&camera.view_projection_matrix())
     }
 
+    /// Write part of an entity's own bones, from bone `first`, and nothing else.
+    ///
+    /// This is [`update_bone_matrices`](Self::update_bone_matrices) for a palette
+    /// that changes every frame on many entities (#212): that one writes the
+    /// asset's shared buffer too, which forty trees would do forty times to no
+    /// effect, since each draws from its own.
+    pub fn write_entity_bones(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        entity_id: flint_core::EntityId,
+        first: usize,
+        matrices: &[[[f32; 4]; 4]],
+    ) {
+        if self.device_lost {
+            return;
+        }
+        let buffer = self
+            .entity_bone_buffers
+            .entry(entity_id)
+            .or_insert_with(|| Self::create_entity_bones(device, "Entity Bone Buffer"));
+        write_bones(queue, buffer, first, matrices);
+    }
+
+    /// Give an entity's shadow its own bones, from the shadow pass's next frame,
+    /// or write them again.
+    pub fn write_entity_shadow_bones(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        entity_id: flint_core::EntityId,
+        matrices: &[[[f32; 4]; 4]],
+    ) {
+        if self.device_lost {
+            return;
+        }
+        let buffer = self
+            .entity_shadow_bone_buffers
+            .entry(entity_id)
+            .or_insert_with(|| Self::create_entity_bones(device, "Entity Shadow Bone Buffer"));
+        write_bones(queue, buffer, 0, matrices);
+    }
+
+    fn create_entity_bones(device: &wgpu::Device, label: &str) -> wgpu::Buffer {
+        device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(label),
+            size: (crate::skinned_pipeline::MAX_BONES * std::mem::size_of::<[[f32; 4]; 4]>())
+                as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        })
+    }
+
+    /// Write part of the bones of echo `echo` of a skinned entity, from bone
+    /// `first`, and say how opaque it draws. Writing an echo is what makes it
+    /// exist. It then draws from the next extraction, after everything opaque,
+    /// in the entity's own colours and with no depth write, in `echo` order. An
+    /// entity that's never written one pays nothing.
+    ///
+    /// Write the whole palette first: until then its bones are zero, which puts
+    /// it nowhere.
+    #[allow(clippy::too_many_arguments)]
+    pub fn write_entity_echo_bones(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        entity_id: flint_core::EntityId,
+        echo: usize,
+        opacity: f32,
+        first: usize,
+        matrices: &[[[f32; 4]; 4]],
+    ) {
+        if self.device_lost {
+            return;
+        }
+        let Some(pipeline) = &self.skinned_pipeline else {
+            return;
+        };
+        let echoes = self.entity_echoes.entry(entity_id).or_default();
+        while echoes.len() <= echo {
+            let bones = Self::create_entity_bones(device, "Entity Echo Bone Buffer");
+            let bind_group =
+                Self::create_bone_bind(device, &pipeline.bone_bind_group_layout, &bones);
+            echoes.push(EntityEcho {
+                bones,
+                bind_group: Arc::new(bind_group),
+                opacity: 0.0,
+            });
+        }
+        echoes[echo].opacity = opacity;
+        write_bones(queue, &echoes[echo].bones, first, matrices);
+    }
+
+    /// Stop drawing an entity's echoes from `count` on. Their buffers stay, ready
+    /// for the next write, so a slider sweeping a count allocates nothing on its
+    /// way back up: an opacity of 0 is what leaves one out at extraction.
+    pub fn set_entity_echo_count(&mut self, entity_id: flint_core::EntityId, count: usize) {
+        if let Some(echoes) = self.entity_echoes.get_mut(&entity_id) {
+            for echo in echoes.iter_mut().skip(count) {
+                echo.opacity = 0.0;
+            }
+        }
+    }
+
+    /// How an entity's echoes meet what's behind them: over it at their
+    /// opacity (`false`, the default), or `lighten`, the brighter of the two,
+    /// so an echo can only add light and never darken the form it's behind.
+    pub fn set_entity_echo_lighten(&mut self, entity_id: flint_core::EntityId, lighten: bool) {
+        if lighten {
+            self.entity_echo_lighten.insert(entity_id);
+        } else {
+            self.entity_echo_lighten.remove(&entity_id);
+        }
+    }
+
+    /// Multiply the vertex colour of one part of an entity's skinned mesh by
+    /// `tint`. Materials are shared by content, so a few distinct tints cost a
+    /// few materials, however many entities use them: keep them few.
+    pub fn set_entity_part_tint(
+        &mut self,
+        entity_id: flint_core::EntityId,
+        part: usize,
+        tint: [f32; 3],
+    ) {
+        let tints = self.entity_part_tints.entry(entity_id).or_default();
+        if tints.len() <= part {
+            tints.resize(part + 1, [1.0; 3]);
+        }
+        tints[part] = tint;
+    }
+
+    /// How soft one part of an entity's skinned mesh is at its silhouette
+    /// (#582), 0 to 1: above 0 its alpha falls where the surface turns away
+    /// from the eye, so the outline feathers, and the part draws translucent,
+    /// after everything opaque; its echoes feather with it. 0 is a hard edge,
+    /// drawn exactly as with no softness at all. Shared by content like a
+    /// tint, so a few distinct values cost a few materials.
+    pub fn set_entity_part_softness(
+        &mut self,
+        entity_id: flint_core::EntityId,
+        part: usize,
+        softness: f32,
+    ) {
+        let softness = if softness.is_finite() {
+            softness.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let parts = self.entity_part_softness.entry(entity_id).or_default();
+        if parts.len() <= part {
+            parts.resize(part + 1, 0.0);
+        }
+        parts[part] = softness;
+    }
+
+    /// This frame's game time, for motion held on twos (#405): call it each
+    /// frame before uploading bones and before `update_from_world`, with the
+    /// clock the post time follows (the player's `total_time`, a capture's
+    /// moment), so poses and a style's `boil` turn on the same frames. A
+    /// renderer never stamped holds nothing: every pose is live.
+    pub fn set_motion_time(&mut self, seconds: f64) {
+        self.motion_hold.set_time(seconds);
+    }
+
+    /// The post time styles, grain and the tear read this frame: the
+    /// `ocean_time` clock wrapped as [`motion_hold::post_time`]
+    /// (crate::motion_hold::post_time) does, held to the start of its tick
+    /// under a whole-frame `[post_process] motion_hold` (#405).
+    pub fn post_time(&self) -> f32 {
+        let time = crate::motion_hold::post_time(self.ocean_time);
+        crate::motion_hold::held_time(time, self.postprocess_config.motion_hold)
+    }
+
+    /// Whether anything is drawn on ticks this frame (#405).
+    pub fn motion_held(&self) -> bool {
+        self.motion_hold.any()
+    }
+
+    /// Let `entity`'s next pose and position through a hold now, and hold
+    /// those (#871): what an editor calls when it changed the pose by hand
+    /// (a layer weight, a posed bone) rather than by time, so the change
+    /// shows within the tick, paused or not.
+    pub fn release_motion_hold(&mut self, entity: flint_core::EntityId) {
+        self.motion_hold.release(entity);
+    }
+
     /// Drop per-entity bone buffers (call when a scene is unloaded).
     pub fn clear_entity_bone_buffers(&mut self) {
+        self.motion_hold.clear();
         self.entity_bone_buffers.clear();
         self.entity_bone_matrices.clear();
         self.asset_bone_matrices.clear();
+        self.entity_shadow_bone_buffers.clear();
+        self.entity_part_tints.clear();
+        self.entity_part_softness.clear();
+        self.entity_echoes.clear();
+        self.entity_echo_lighten.clear();
         self.skinned_bone_binds.clear();
+    }
+
+    /// Tell the renderer the scene's project and folder: where its styles
+    /// find palettes, glyph sets, papers and strokes (ADR 0114). Sets
+    /// `scene_dir` too. A host that only sets `scene_dir` gets the project
+    /// found from that folder, once.
+    pub fn set_asset_scope(&mut self, scope: flint_core::project::AssetScope) {
+        self.scene_dir = Some(scope.scene_dir.clone());
+        *self.asset_scope.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some((self.scene_dir.clone(), Arc::new(scope)));
+    }
+
+    /// The project and folder the styles' files are searched from: the
+    /// scope the host set, else the project found from `scene_dir`, else
+    /// (no scene) the working directory's.
+    pub fn asset_scope(&self) -> Arc<flint_core::project::AssetScope> {
+        let mut kept = self.asset_scope.lock().unwrap_or_else(|e| e.into_inner());
+        match &*kept {
+            Some((dir, scope)) if *dir == self.scene_dir => scope.clone(),
+            _ => {
+                let dir = self.scene_dir.as_deref().unwrap_or(Path::new("."));
+                let scope = Arc::new(flint_core::project::AssetScope::for_dir(dir));
+                *kept = Some((self.scene_dir.clone(), scope.clone()));
+                scope
+            }
+        }
+    }
+
+    /// Load the font a `ui_text.font` names (`builtin`, a glyph set, or a
+    /// `.font.toml`; ADR 0113) and upload its atlas to the texture cache,
+    /// once per name and scope. Returns whether the font is ready to draw.
+    ///
+    /// A name is only a name within one scope: after a transition into
+    /// another folder, `pixel` is that folder's `fonts/pixel.glyphs.toml`.
+    /// So a load from a scope other than the last one's forgets every font
+    /// loaded before it, their atlases too (#312).
+    pub fn load_ui_font(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        spec: &str,
+        scope: &flint_core::project::AssetScope,
+    ) -> bool {
+        if self.bitmap_font_scope.as_ref() != Some(scope) {
+            self.forget_ui_fonts();
+            self.bitmap_font_scope = Some(scope.clone());
+        }
+        if let Some(found) = self.bitmap_font_cache.get(spec) {
+            return found.is_some();
+        }
+        let font = match BitmapFont::resolve(spec, scope) {
+            Ok(font) => match &mut self.texture_cache {
+                Some(cache) => {
+                    let (rgba, [w, h]) = font.rgba();
+                    match cache.upload_rgba(device, queue, &font.texture, w, h, &rgba, false) {
+                        Ok(_) => Some(font),
+                        Err(e) => {
+                            tracing::warn!("ui_text font `{spec}`: {e}");
+                            None
+                        }
+                    }
+                }
+                None => None,
+            },
+            Err(e) => {
+                tracing::warn!("ui_text font `{spec}`: {e}");
+                None
+            }
+        };
+        let ready = font.is_some();
+        self.bitmap_font_cache.insert(spec.to_string(), font);
+        ready
+    }
+
+    /// Drop every loaded `ui_text` font and its uploaded atlas, so the next
+    /// [`load_ui_font`](Self::load_ui_font) reads and uploads afresh (the
+    /// texture cache keeps a name's first upload otherwise).
+    fn forget_ui_fonts(&mut self) {
+        for font in self.bitmap_font_cache.drain().filter_map(|(_, f)| f) {
+            if let Some(cache) = &mut self.texture_cache {
+                cache.remove_texture(&font.texture);
+            }
+        }
+        self.bitmap_font_scope = None;
+    }
+
+    /// The `ui_text` font `spec` names, if it loaded and its atlas is
+    /// uploaded: what the scene's `ui_text` draws with.
+    pub fn loaded_ui_font(&self, spec: &str) -> Option<&BitmapFont> {
+        self.ui_font(self.texture_cache.as_ref()?, spec)
+    }
+
+    /// A loaded `ui_text` font whose atlas is in `tex_cache`.
+    pub(super) fn ui_font(&self, tex_cache: &TextureCache, spec: &str) -> Option<&BitmapFont> {
+        self.bitmap_font_cache
+            .get(spec)?
+            .as_ref()
+            .filter(|f| tex_cache.contains(&f.texture))
     }
 
     /// Load a texture from an image file into the texture cache
@@ -2864,7 +3371,11 @@ impl SceneRenderer {
     /// the positions and indices the mesh was uploaded with. `None` stops it
     /// being one. Uploading the mesh again, or removing it, also stops it,
     /// so set it again after each upload.
-    pub fn set_ray_mesh(&mut self, name: &str, mesh: Option<Arc<flint_core::ray_mesh::RayMesh>>) {
+    pub fn set_ray_mesh(
+        &mut self,
+        name: &str,
+        mesh: Option<Arc<flint_geometry::ray_mesh::RayMesh>>,
+    ) {
         match mesh {
             Some(m) => {
                 self.ray_meshes.insert(name.to_string(), m);
@@ -2880,7 +3391,7 @@ impl SceneRenderer {
     /// at its world matrix (ADR 0105). Cast rays through it to find what's
     /// drawn along a line. A new scene is made each update, so a clone held
     /// across frames goes on answering for the frame it came from.
-    pub fn ray_scene(&self) -> Arc<flint_core::ray_mesh::RayScene> {
+    pub fn ray_scene(&self) -> Arc<flint_geometry::ray_mesh::RayScene> {
         self.ray_scene.clone()
     }
 
@@ -2928,8 +3439,10 @@ impl SceneRenderer {
         let entity_draws = self.entity_draws.len() as u32;
         let skinned_draws = self.skinned_entity_draws.len() as u32;
         let terrain_draws = self.terrain_visible_chunks;
-        let transparent_draws =
-            (self.transparent_draws.len() + self.transparent_skinned_draws.len()) as u32;
+        let echo_draws = self.echo_draws.len() as u32;
+        let transparent_draws = (self.transparent_draws.len()
+            + self.transparent_skinned_draws.len()
+            + self.echo_draws.len()) as u32;
         let billboard_draws = self.billboard_draws.len() as u32;
         let particle_draws = self.particle_draws.len() as u32;
         let sprite_batches = self.sprite2d_batches.len() as u32;
@@ -2958,6 +3471,9 @@ impl SceneRenderer {
         for d in &self.transparent_skinned_draws {
             triangles += d.index_count / 3;
         }
+        for d in &self.echo_draws {
+            triangles += d.index_count / 3;
+        }
         for d in &self.terrain_draws {
             triangles += d.index_count / 3;
         }
@@ -2975,11 +3491,12 @@ impl SceneRenderer {
         // Shadow stats: estimate as main pass × the cascades drawn, counting
         // only the draws that cast (ADR 0100)
         let cascade_count = match &self.shadow_pass {
-            Some(sp) if sp.enabled => sp.cascades() as u32,
+            Some(sp) if self.shadows_drawn() => sp.cascades() as u32,
             _ => 0,
         };
         let casting = self.entity_draws.iter().filter(|d| d.casts_shadow);
-        let casting_skinned = self.skinned_entity_draws.iter().filter(|d| d.casts_shadow);
+        let casting_skinned =
+            Self::skinned_shadow_draws(&self.skinned_entity_draws, &self.transparent_skinned_draws);
         let shadow_entity_draws =
             (casting.clone().count() + casting_skinned.clone().count()) as u32 + terrain_draws;
         let shadow_draw_calls = shadow_entity_draws * cascade_count;
@@ -3005,6 +3522,7 @@ impl SceneRenderer {
         crate::render_stats::RenderStats {
             draw_calls,
             triangles,
+            echo_draws,
             entity_draws,
             culled_draws: (self.culled_entity_draws.len() + self.culled_transparent_draws.len())
                 as u32,
@@ -3050,6 +3568,16 @@ impl SceneRenderer {
                     self.surface_size.1,
                 )
             })
+            .unwrap_or_default()
+    }
+
+    /// Each of the style chain's textures with its size and bytes (#412):
+    /// the built-ins' and every user style's targets (`<style>.<target>`,
+    /// `.a`/`.b` for a history pair), sorted by name.
+    pub fn style_target_entries(&self) -> Vec<crate::stylize::TargetEntry> {
+        self.postprocess_resources
+            .as_ref()
+            .map(|r| r.styles.entries())
             .unwrap_or_default()
     }
 
@@ -3206,12 +3734,19 @@ impl SceneRenderer {
         self.shadow_pass = Some(shadow_pass);
     }
 
-    /// Set the entity to highlight with a selection glow, or None to clear
-    pub fn set_selected_entity(&mut self, id: Option<flint_core::EntityId>) {
-        self.selected_entity = id;
+    /// Draw no skybox until the next [`load_skybox`](Self::load_skybox): a
+    /// scene that names none starts without the last scene's (#723).
+    pub fn clear_skybox(&mut self) {
+        self.skybox_uniform_buffer = None;
+        self.skybox_uniform_bind_group = None;
+        self.skybox_texture_bind_group = None;
     }
 
-    /// Toggle shadows on/off, returns the new state
+    /// Whether a skybox is loaded and will be drawn.
+    pub fn has_skybox(&self) -> bool {
+        self.skybox_texture_bind_group.is_some()
+    }
+
     /// Load an equirectangular panorama image as a skybox
     pub fn load_skybox(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, path: &Path) {
         let skybox_pipeline = match &self.skybox_pipeline {
@@ -3332,6 +3867,38 @@ impl SceneRenderer {
         self.shadow_pass.as_ref().is_some_and(|sp| sp.enabled)
     }
 
+    /// The scene's `[environment] shadows` (#627). False keeps the shadow
+    /// pass from drawing at all, over the quality tier and F4,
+    /// which keep their own setting for the next scene.
+    pub fn set_scene_shadows(&mut self, on: bool) {
+        self.scene_shadows = on;
+    }
+
+    /// The scene's `[environment] default_lights` (#627). False lights a
+    /// scene with no light entities by its ambient alone (and emission),
+    /// instead of the built-in key and fill. Takes effect at the next
+    /// `update_from_world`.
+    pub fn set_default_lights(&mut self, on: bool) {
+        self.default_lights = on;
+    }
+
+    /// Whether this frame draws the shadow cascades (#627): shadows are on,
+    /// the scene allows them, and its strongest directional light gives
+    /// light or god rays. A sun of intensity 0 contributes nothing the
+    /// maps could darken, so its pass is skipped and every caster with it.
+    pub fn shadows_drawn(&self) -> bool {
+        self.shadows_enabled() && self.scene_shadows && self.sun_casts()
+    }
+
+    /// The light the cascades follow, directional 0 after the sort that
+    /// puts the strongest first, gives light or god rays.
+    fn sun_casts(&self) -> bool {
+        self.light_uniforms.directional_count > 0 && {
+            let sun = &self.light_uniforms.directional_lights[0];
+            sun.intensity > 0.0 || sun.volumetric_intensity > 0.0
+        }
+    }
+
     /// Current shadow map resolution per cascade
     pub fn shadow_resolution(&self) -> u32 {
         self.shadow_pass
@@ -3434,6 +4001,7 @@ impl SceneRenderer {
         self.skinned_entity_draws.clear();
         self.transparent_draws.clear();
         self.transparent_skinned_draws.clear();
+        self.echo_draws.clear();
         self.culled_entity_draws.clear();
         self.culled_transparent_draws.clear();
         self.billboard_draws.clear();
@@ -3441,6 +4009,17 @@ impl SceneRenderer {
         self.wireframe_overlay_draws.clear();
         self.normal_arrow_draws.clear();
         self.extract_frame = self.extract_frame.wrapping_add(1);
+
+        // The hierarchy, for the selection outline's subtree (#602)
+        self.entity_children.clear();
+        for entity in world.all_entities() {
+            if let Some(parent) = world.get_parent(entity.id) {
+                self.entity_children
+                    .entry(parent)
+                    .or_default()
+                    .push(entity.id);
+            }
+        }
 
         self.sync_debug_styles();
         // Ids for every styled entity: they say which styles are on for
@@ -3452,11 +4031,28 @@ impl SceneRenderer {
                 &mut self.style_ids,
                 &mut self.style_by_entity,
                 &mut self.style_blend_by_entity,
+                &mut self.style_torn_entities,
             );
         } else {
             self.style_ids.set(Vec::new());
             self.style_by_entity.clear();
             self.style_blend_by_entity.clear();
+            self.style_torn_entities.clear();
+        }
+
+        // Who is drawn on ticks this frame (#405): empty, and unwalked, in a
+        // scene with no motion_hold and no whole-frame rate. Before the
+        // lights, which a held entity carries on its ticks too (#873)
+        self.motion_hold.set_rates(crate::motion_hold::held_rates(
+            world,
+            self.postprocess_config.motion_hold,
+        ));
+        if self.motion_hold.any() {
+            // Bones went up before the rates were known: a hold that starts
+            // this frame keeps what they show
+            for id in self.entity_bone_buffers.keys() {
+                self.motion_hold.bones_shown(*id);
+            }
         }
 
         // Extract lights from scene entities
@@ -3488,9 +4084,16 @@ impl SceneRenderer {
         let tex_cache_ref = tex_cache.as_ref().unwrap();
 
         // The ray targets, placed afresh (ADR 0105).
-        let mut ray_scene = flint_core::ray_mesh::RayScene::new();
+        let mut ray_scene = flint_geometry::ray_mesh::RayScene::new();
+
+        // What `visibility { visible = false }` hides, descendants included
+        // (#628): empty and unwalked in a scene that never hides anything.
+        let hidden = world.hidden_entities();
 
         for entity in world.all_entities() {
+            if hidden.contains(&entity.id) {
+                continue;
+            }
             let archetype = entity.archetype.as_deref().unwrap_or("unknown");
             let visual =
                 self.archetype_visuals
@@ -3505,6 +4108,8 @@ impl SceneRenderer {
             let model_matrix = world
                 .get_world_matrix(entity.id)
                 .unwrap_or_else(|| Transform::default().to_matrix());
+            // Held on twos (#405): where it was drawn when its tick began
+            let model_matrix = self.motion_hold.matrix(entity.id, model_matrix);
             let world_pos = [model_matrix[3][0], model_matrix[3][1], model_matrix[3][2]];
 
             // Check if entity has a model component
@@ -3606,6 +4211,8 @@ impl SceneRenderer {
         // Sort & batch sprite2d instances
         self.batch_sprite2d_instances(device, tex_cache_ref, sprite2d_collected);
 
+        self.apply_shallow_wooze(device);
+
         // Drop cached resources nothing used this frame (despawned entities,
         // entities that changed shape/model).
         let frame = self.extract_frame;
@@ -3615,6 +4222,84 @@ impl SceneRenderer {
 
         // Put texture cache back
         self.texture_cache = tex_cache;
+    }
+
+    /// Replace which entities have shallow wooze this frame, and how far along
+    /// each is (#215). What's named here shows from the next `update_from_world`.
+    /// An empty list, the default, costs a scene nothing.
+    pub fn set_shallow_wooze(
+        &mut self,
+        draws: impl IntoIterator<Item = (flint_core::EntityId, ShallowWoozeDraw)>,
+    ) {
+        self.shallow_wooze.clear();
+        self.shallow_wooze.extend(draws);
+    }
+
+    /// Which of shallow wooze's pipelines exist: standard, skinned and shadow.
+    #[cfg(test)]
+    pub(crate) fn wooze_built(&self) -> (bool, bool, bool) {
+        (
+            self.wooze_standard.is_some(),
+            self.wooze_skinned.is_some(),
+            self.shadow_pass
+                .as_ref()
+                .is_some_and(|sp| sp.wooze.is_some()),
+        )
+    }
+
+    /// Give this frame's draws of woozy entities their drift, grow their bounds to
+    /// match, and build the pipelines they need the first time they need them.
+    fn apply_shallow_wooze(&mut self, device: &wgpu::Device) {
+        if self.shallow_wooze.is_empty() {
+            return;
+        }
+        let map = &self.shallow_wooze;
+        let drift = |id: Option<flint_core::EntityId>| Some(map.get(&id?)?.uniforms());
+
+        let mut any_standard = false;
+        for draw in self
+            .entity_draws
+            .iter_mut()
+            .chain(self.transparent_draws.iter_mut())
+            .filter(|d| !d.is_wireframe)
+        {
+            let Some(wooze) = drift(draw.entity_id) else {
+                continue;
+            };
+            if let Some(bounds) = &mut draw.world_aabb {
+                grow_bounds(bounds, &wooze);
+            }
+            draw.wooze = Some(wooze);
+            any_standard = true;
+        }
+
+        let mut any_skinned = false;
+        for draw in self
+            .skinned_entity_draws
+            .iter_mut()
+            .chain(self.transparent_skinned_draws.iter_mut())
+        {
+            let Some(wooze) = drift(draw.entity_id) else {
+                continue;
+            };
+            draw.wooze = Some(wooze);
+            any_skinned = true;
+        }
+
+        if any_standard && self.wooze_standard.is_none() {
+            self.wooze_standard = Some(WoozePipelineSet::standard(device, &self.pipeline));
+        }
+        if any_skinned && self.wooze_skinned.is_none() {
+            if let Some(skinned) = &self.skinned_pipeline {
+                self.wooze_skinned =
+                    Some(WoozePipelineSet::skinned(device, &self.pipeline, skinned));
+            }
+        }
+        if any_standard || any_skinned {
+            if let Some(shadow_pass) = &mut self.shadow_pass {
+                shadow_pass.ensure_wooze(device);
+            }
+        }
     }
 
     /// Transform + material resources for one draw of `key`, created on
@@ -3637,6 +4322,69 @@ impl SceneRenderer {
         metallic_roughness: &wgpu::TextureView,
         emissive: &wgpu::TextureView,
     ) -> &'a CachedDrawBinds {
+        let (mb, mbg) = Self::shared_material(
+            cache,
+            frame,
+            device,
+            pipeline,
+            material_uniforms,
+            material_key,
+            base_color,
+            normal,
+            metallic_roughness,
+            emissive,
+        );
+        let arena = &mut cache.arena;
+        let entry = cache.draws.entry(key).or_insert_with(|| {
+            let (slot, page) = arena.alloc(device);
+            arena.stage(slot, bytemuck::bytes_of(transform_uniforms));
+            let tbg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                layout: &pipeline.transform_bind_group_layout,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: &page,
+                        offset: slot.offset(),
+                        // The whole slot: a plain draw reads its first 208
+                        // bytes, and shallow wooze's the 48 past them too.
+                        size: wgpu::BufferSize::new(crate::bind_cache::SLOT_STRIDE),
+                    }),
+                }],
+                label: Some("Transform Bind Group (arena)"),
+            });
+            CachedDrawBinds {
+                transform: TransformTarget::Slot(slot),
+                transform_bind_group: Arc::new(tbg),
+                material_buffer: mb.clone(),
+                material_bind_group: mbg.clone(),
+                material_key,
+                touched: frame,
+            }
+        });
+        if entry.material_key != material_key {
+            entry.material_buffer = mb;
+            entry.material_bind_group = mbg;
+            entry.material_key = material_key;
+        }
+        entry.touched = frame;
+        entry
+    }
+
+    /// The material for `material_key`, made on first use and shared with every
+    /// draw of that key.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn shared_material(
+        cache: &mut DrawBindCache,
+        frame: u64,
+        device: &wgpu::Device,
+        pipeline: &RenderPipeline,
+        material_uniforms: &MaterialUniforms,
+        material_key: u64,
+        base_color: &wgpu::TextureView,
+        normal: &wgpu::TextureView,
+        metallic_roughness: &wgpu::TextureView,
+        emissive: &wgpu::TextureView,
+    ) -> (Arc<MaterialBuffer>, Arc<wgpu::BindGroup>) {
         let shared = cache.materials.entry(material_key).or_insert_with(|| {
             let (b, bg) = Self::create_material_bind_with_textures(
                 device,
@@ -3654,42 +4402,7 @@ impl SceneRenderer {
             }
         });
         shared.touched = frame;
-        let (mb, mbg) = (shared.buffer.clone(), shared.bind_group.clone());
-        let arena = &mut cache.arena;
-        let entry = cache.draws.entry(key).or_insert_with(|| {
-            let (slot, page) = arena.alloc(device);
-            arena.stage(slot, bytemuck::bytes_of(transform_uniforms));
-            let tbg =
-                device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    layout: &pipeline.transform_bind_group_layout,
-                    entries: &[wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                            buffer: &page,
-                            offset: slot.offset(),
-                            size: wgpu::BufferSize::new(
-                                std::mem::size_of::<TransformUniforms>() as u64
-                            ),
-                        }),
-                    }],
-                    label: Some("Transform Bind Group (arena)"),
-                });
-            CachedDrawBinds {
-                transform: TransformTarget::Slot(slot),
-                transform_bind_group: Arc::new(tbg),
-                material_buffer: mb.clone(),
-                material_bind_group: mbg.clone(),
-                material_key,
-                touched: frame,
-            }
-        });
-        if entry.material_key != material_key {
-            entry.material_buffer = mb;
-            entry.material_bind_group = mbg;
-            entry.material_key = material_key;
-        }
-        entry.touched = frame;
-        entry
+        (shared.buffer.clone(), shared.bind_group.clone())
     }
 
     /// The uploaded box for `key`, building it with `build` on a miss.
@@ -3750,6 +4463,8 @@ impl SceneRenderer {
             world_aabb: None,
             style_aabb: None,
             lod: None,
+            wooze: None,
+            double_sided: false,
         }
     }
 
@@ -3881,6 +4596,8 @@ impl SceneRenderer {
             world_aabb: None,
             style_aabb: None,
             lod: None,
+            wooze: None,
+            double_sided: false,
         }
     }
 
@@ -4049,22 +4766,22 @@ impl SceneRenderer {
     /// coefficient sets), so live-tweaking any field takes effect next frame.
     fn extract_ocean_from_world(&mut self, world: &FlintWorld) {
         self.ocean_active = false;
-        for &entity_id in world.entities_with_component(comp::OCEAN) {
+        for &entity_id in world.entities_with_component(flint_geometry::components::OCEAN) {
             let ocean_comp = world
                 .get_components(entity_id)
-                .and_then(|components| components.get(comp::OCEAN).cloned());
+                .and_then(|components| components.get(flint_geometry::components::OCEAN).cloned());
             let Some(ocean_comp) = ocean_comp else {
                 continue;
             };
 
-            let params = flint_core::ocean::OceanParams::from_component(&ocean_comp);
+            let params = flint_geometry::ocean::OceanParams::from_component(&ocean_comp);
             let needs_regen = self
                 .ocean_spectrum
                 .as_ref()
                 .map(|s| s.params != params)
                 .unwrap_or(true);
             if needs_regen {
-                self.ocean_spectrum = Some(flint_core::ocean::WaveSpectrum::generate(&params));
+                self.ocean_spectrum = Some(flint_geometry::ocean::WaveSpectrum::generate(&params));
             }
             self.ocean_visuals = crate::ocean_pipeline::OceanVisuals::from_component(&ocean_comp);
             self.ocean_active = self.ocean_pipeline.is_some();
@@ -4123,11 +4840,11 @@ impl SceneRenderer {
     /// only when its component changes, and dropped with its entity.
     fn extract_water_bodies_from_world(&mut self, world: &FlintWorld, device: &wgpu::Device) {
         let mut seen = std::collections::BTreeSet::new();
-        for &entity_id in world.entities_with_component(comp::WATER_BODY) {
+        for &entity_id in world.entities_with_component(flint_geometry::components::WATER_BODY) {
             let Some(components) = world.get_components(entity_id) else {
                 continue;
             };
-            let Some(value) = components.get(comp::WATER_BODY) else {
+            let Some(value) = components.get(flint_geometry::components::WATER_BODY) else {
                 continue;
             };
             let name = world
@@ -4160,8 +4877,8 @@ impl SceneRenderer {
         // Bodies take the sea's look and waves; a scene with bodies and no
         // ocean gets the default ocean's.
         if !self.ocean_active && self.has_water_bodies() && self.ocean_spectrum.is_none() {
-            self.ocean_spectrum = Some(flint_core::ocean::WaveSpectrum::generate(
-                &flint_core::ocean::OceanParams::default(),
+            self.ocean_spectrum = Some(flint_geometry::ocean::WaveSpectrum::generate(
+                &flint_geometry::ocean::OceanParams::default(),
             ));
         }
     }
@@ -4207,8 +4924,8 @@ impl SceneRenderer {
         let body = self.build_water_body(device, id, mesh, look)?;
         self.water_bodies.insert(id.to_string(), body);
         if !self.ocean_active && self.ocean_spectrum.is_none() {
-            self.ocean_spectrum = Some(flint_core::ocean::WaveSpectrum::generate(
-                &flint_core::ocean::OceanParams::default(),
+            self.ocean_spectrum = Some(flint_geometry::ocean::WaveSpectrum::generate(
+                &flint_geometry::ocean::OceanParams::default(),
             ));
         }
         Ok(())
@@ -4247,11 +4964,11 @@ impl SceneRenderer {
     fn extract_ocean_contact_from_world(&mut self, world: &FlintWorld) {
         use flint_core::toml_util::{toml_f32, toml_vec3};
         self.ocean_contact = None;
-        for &entity_id in world.entities_with_component(comp::OCEAN_CONTACT) {
+        for &entity_id in world.entities_with_component(flint_geometry::components::OCEAN_CONTACT) {
             let Some(components) = world.get_components(entity_id) else {
                 continue;
             };
-            let Some(contact) = components.get(comp::OCEAN_CONTACT) else {
+            let Some(contact) = components.get(flint_geometry::components::OCEAN_CONTACT) else {
                 continue;
             };
             let Some(tf) = components.get(comp::TRANSFORM) else {
@@ -4427,6 +5144,11 @@ impl SceneRenderer {
             .iter()
             .copied()
             .collect();
+        // A hidden entity's light goes out with it (#628)
+        let hidden = world.hidden_entities();
+        if !hidden.is_empty() {
+            light_entities.retain(|id| !hidden.contains(id));
+        }
         light_entities.sort_by(|a, b| {
             world
                 .get_name(*a)
@@ -4482,8 +5204,7 @@ impl SceneRenderer {
                     }
                     "point" => {
                         if (point_count as usize) < MAX_POINT_LIGHTS {
-                            let light_pos =
-                                world.get_world_position(entity_id).unwrap_or(Vec3::ZERO);
+                            let light_pos = self.light_position(world, entity_id);
                             let radius = light
                                 .get("range")
                                 .or_else(|| light.get("radius"))
@@ -4506,8 +5227,7 @@ impl SceneRenderer {
                     }
                     "spot" => {
                         if (spot_count as usize) < MAX_SPOT_LIGHTS {
-                            let light_pos =
-                                world.get_world_position(entity_id).unwrap_or(Vec3::ZERO);
+                            let light_pos = self.light_position(world, entity_id);
                             let direction = Self::extract_light_vec3(&light, "direction")
                                 .unwrap_or([0.0, -1.0, 0.0]);
                             let radius = light
@@ -4551,7 +5271,7 @@ impl SceneRenderer {
         });
 
         // If no lights found in scene, use defaults
-        if dir_count == 0 && point_count == 0 && spot_count == 0 {
+        if dir_count == 0 && point_count == 0 && spot_count == 0 && self.default_lights {
             self.light_uniforms = LightUniforms::default_scene_lights();
             self.apply_ambient_override();
         } else {
@@ -4564,22 +5284,20 @@ impl SceneRenderer {
         }
     }
 
+    /// Where a point or spot light shines from: its world position, or,
+    /// carried by a held entity, where it was when the tick began (#873), so
+    /// the pool of light steps with the drawing that carries it. The held
+    /// matrix is the one the entity's own draw reads later this frame.
+    fn light_position(&mut self, world: &FlintWorld, entity: flint_core::EntityId) -> Vec3 {
+        let Some(live) = world.get_world_matrix(entity) else {
+            return Vec3::ZERO;
+        };
+        let m = self.motion_hold.matrix(entity, live);
+        Vec3::new(m[3][0], m[3][1], m[3][2])
+    }
+
     fn extract_light_vec3(table: &toml::Value, key: &str) -> Option<[f32; 3]> {
-        let arr = table.get(key)?.as_array()?;
-        if arr.len() >= 3 {
-            let x = arr[0]
-                .as_float()
-                .or_else(|| arr[0].as_integer().map(|i| i as f64))? as f32;
-            let y = arr[1]
-                .as_float()
-                .or_else(|| arr[1].as_integer().map(|i| i as f64))? as f32;
-            let z = arr[2]
-                .as_float()
-                .or_else(|| arr[2].as_integer().map(|i| i as f64))? as f32;
-            Some([x, y, z])
-        } else {
-            None
-        }
+        flint_core::toml_util::toml_vec3(table.get(key)?)
     }
 
     // ── Render entry points ──
@@ -4802,6 +5520,9 @@ impl SceneRenderer {
         );
         let ids = &self.style_by_entity;
         let blends = &self.style_blend_by_entity;
+        let torn = &self.style_torn_entities;
+        let torn_of =
+            |e: &Option<flint_core::EntityId>| e.as_ref().is_some_and(|e| torn.contains(e));
         let id_of = |e: &Option<flint_core::EntityId>| e.as_ref().and_then(|e| ids.get(e).copied());
         let blend_of = |e: &Option<flint_core::EntityId>| {
             e.as_ref()
@@ -4814,24 +5535,23 @@ impl SceneRenderer {
             // each fragment's depth test decides who owns a pixel anyway
             if let Some(id) = id_of(&self.terrain_entity) {
                 let blend = blend_of(&self.terrain_entity);
+                let torn = torn_of(&self.terrain_entity);
                 let frustum = self.camera_frustum.as_ref();
                 let visible = |d: &&TerrainDrawCall| {
                     frustum.is_none_or(|f| f.aabb_visible(d.aabb_min, d.aabb_max))
                 };
-                draws.extend(
-                    self.terrain_draws
-                        .iter()
-                        .filter(visible)
-                        .map(|d| crate::style_mask::MaskDraw {
-                            vertex_buffer: &d.vertex_buffer,
-                            index_buffer: &d.index_buffer,
-                            index_count: d.index_count,
-                            transform_bind_group: &d.transform_bind_group,
-                            bones: None,
-                            id,
-                            blend,
-                        }),
-                );
+                draws.extend(self.terrain_draws.iter().filter(visible).map(|d| {
+                    crate::style_mask::MaskDraw {
+                        vertex_buffer: &d.vertex_buffer,
+                        index_buffer: &d.index_buffer,
+                        index_count: d.index_count,
+                        transform_bind_group: &d.transform_bind_group,
+                        bones: None,
+                        id,
+                        blend,
+                        torn,
+                    }
+                }));
             }
             draws.extend(
                 self.entity_draws
@@ -4846,6 +5566,7 @@ impl SceneRenderer {
                             bones: None,
                             id: id_of(&d.entity_id)?,
                             blend: blend_of(&d.entity_id),
+                            torn: torn_of(&d.entity_id),
                         })
                     }),
             );
@@ -4858,6 +5579,7 @@ impl SceneRenderer {
                     bones: Some(&d.bone_bind_group),
                     id: id_of(&d.entity_id)?,
                     blend: blend_of(&d.entity_id),
+                    torn: torn_of(&d.entity_id),
                 })
             }));
             // Styled transparents last, back to front as the scene drew
@@ -4879,6 +5601,7 @@ impl SceneRenderer {
                             bones: None,
                             id: id_of(&d.entity_id)?,
                             blend: blend_of(&d.entity_id),
+                            torn: torn_of(&d.entity_id),
                         })
                     }),
             );
@@ -4891,6 +5614,7 @@ impl SceneRenderer {
                     bones: Some(&d.bone_bind_group),
                     id: id_of(&d.entity_id)?,
                     blend: blend_of(&d.entity_id),
+                    torn: torn_of(&d.entity_id),
                 })
             }));
         }
@@ -4938,6 +5662,15 @@ impl SceneRenderer {
                     });
         }
         let veiled = !veil.is_empty();
+        // The tear the composite draws this frame (#397), for the draws
+        // whose blend follows it: the same config and post time
+        let config = &self.postprocess_config;
+        let tear = crate::style_mask::Tear {
+            on: crate::postprocess::tear_active(config),
+            mode_params: config.mode_params,
+            mix: config.mode_mix,
+            time: self.post_time(),
+        };
         if let Some(pass) = &mut self.style_mask_pass {
             pass.encode(
                 device,
@@ -4951,9 +5684,93 @@ impl SceneRenderer {
                 msaa_depth,
                 &draws,
                 &veil,
+                tear,
             );
         }
         self.style_mask_veiled = veiled;
+    }
+
+    /// Record the style albedo (#869): the frame's opaque static,
+    /// procedural and skinned draws once more, base colour only, against
+    /// the depth the scene drew (its samples under MSAA, resolved), for the
+    /// styles that divide the picture by it. Woozy draws (#215) move their
+    /// vertices in a stage of their own and are left out, as are terrain,
+    /// grass and the ocean: their pixels read as no mesh.
+    fn encode_style_albedo(
+        &mut self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        depth_view: &wgpu::TextureView,
+    ) {
+        let Some(resources) = &self.postprocess_resources else {
+            return;
+        };
+        let Some(skinned) = &self.skinned_pipeline else {
+            return;
+        };
+        let target = resources.styles.get(
+            device,
+            crate::style_albedo::ALBEDO_TARGET,
+            crate::style_albedo::ALBEDO_FORMAT,
+            resources.width,
+            resources.height,
+        );
+        // The scene's own samples while it drew 4x at this size
+        let (scene_depth, samples) = match &self.msaa_depth {
+            Some((texture, view))
+                if self.sample_count > 1
+                    && texture.size().width == resources.width
+                    && texture.size().height == resources.height =>
+            {
+                (view, self.sample_count)
+            }
+            _ => (depth_view, 1),
+        };
+        let mut meshes: Vec<crate::style_albedo::AlbedoMesh<'_>> = self
+            .entity_draws
+            .iter()
+            .filter(|d| !d.is_wireframe && d.wooze.is_none())
+            .map(|d| crate::style_albedo::AlbedoMesh {
+                vertex_buffer: &d.vertex_buffer,
+                index_buffer: &d.index_buffer,
+                index_count: d.index_count,
+                transform_bind_group: &d.transform_bind_group,
+                material_bind_group: &d.material_bind_group,
+                bones: None,
+            })
+            .collect();
+        meshes.extend(
+            self.skinned_entity_draws
+                .iter()
+                .filter(|d| d.wooze.is_none())
+                .map(|d| crate::style_albedo::AlbedoMesh {
+                    vertex_buffer: &d.vertex_buffer,
+                    index_buffer: &d.index_buffer,
+                    index_count: d.index_count,
+                    transform_bind_group: &d.transform_bind_group,
+                    material_bind_group: &d.material_bind_group,
+                    bones: Some(&d.bone_bind_group),
+                }),
+        );
+        let layouts = crate::style_albedo::AlbedoLayouts {
+            transform: &self.pipeline.transform_bind_group_layout,
+            material: &self.pipeline.material_bind_group_layout,
+            light: &self.pipeline.light_bind_group_layout,
+            bones: &skinned.bone_bind_group_layout,
+        };
+        let pass = self
+            .style_albedo_pass
+            .get_or_insert_with(|| crate::style_albedo::StyleAlbedoPass::new(device));
+        pass.encode(
+            device,
+            encoder,
+            &layouts,
+            &target,
+            scene_depth,
+            samples,
+            &self.light_bind_group,
+            &meshes,
+        );
     }
 
     /// Whether some pixel of the last style mask may hold a blend below 1
@@ -4961,7 +5778,10 @@ impl SceneRenderer {
     /// over a styled one (#290). While neither, the framework's
     /// cross-fade is skipped.
     pub fn style_mask_fades(&self) -> bool {
-        !self.style_blend_by_entity.is_empty() || self.style_mask_veiled
+        !self.style_blend_by_entity.is_empty()
+            || self.style_mask_veiled
+            || (!self.style_torn_entities.is_empty()
+                && crate::postprocess::tear_active(&self.postprocess_config))
     }
 
     /// The entity style mask's per-draw uniform bytes and how many styled
@@ -4986,9 +5806,11 @@ impl SceneRenderer {
             .map_or(self.surface_size, |r| (r.width, r.height))
     }
 
-    /// Ensure FXAA GPU resources exist (call after enabling FXAA at runtime
-    /// and after resize). No-op when `fxaa` is disabled — the default-off
-    /// path allocates nothing (ADR 0050, Kuwahara lazy pattern).
+    /// Ensure FXAA GPU resources exist. Every frame does this itself
+    /// ([`encode_to`](Self::encode_to), #297), as it builds styles; calling
+    /// it after setting a config moves the shader compile off the first
+    /// frame that draws FXAA. No-op when `fxaa` is disabled — the
+    /// default-off path allocates nothing (ADR 0050, Kuwahara lazy pattern).
     pub fn ensure_fxaa_resources(&mut self, device: &wgpu::Device) {
         if !self.postprocess_config.fxaa_enabled {
             return;
@@ -5012,6 +5834,12 @@ impl SceneRenderer {
                 ));
             }
         }
+    }
+
+    /// This frame's drawing for the shading boil (#214), from the wooze field.
+    pub fn set_boil(&mut self, boil: flint_wooze::BoilFrame) {
+        self.postprocess_config.boil = boil;
+        self.authored_postprocess.boil = boil;
     }
 
     /// The post-processing configuration as set: the scene's look, before
@@ -5109,11 +5937,10 @@ impl SceneRenderer {
         let f = RenderPipeline::new(device, format, samples);
         let p = &mut self.pipeline;
         p.pipeline = f.pipeline;
+        p.pipeline_double_sided = f.pipeline_double_sided;
         p.line_pipeline = f.line_pipeline;
         p.overlay_line_pipeline = f.overlay_line_pipeline;
         p.skeleton_line_pipeline = f.skeleton_line_pipeline;
-        p.outline_pipeline = f.outline_pipeline;
-        p.depth_prepass_pipeline = f.depth_prepass_pipeline;
         p.transparent_alpha_pipeline = f.transparent_alpha_pipeline;
         p.transparent_alpha_back_pipeline = f.transparent_alpha_back_pipeline;
         p.transparent_additive_pipeline = f.transparent_additive_pipeline;
@@ -5130,8 +5957,7 @@ impl SceneRenderer {
                 samples,
             );
             s.pipeline = f.pipeline;
-            s.outline_pipeline = f.outline_pipeline;
-            s.depth_prepass_pipeline = f.depth_prepass_pipeline;
+            s.pipeline_double_sided = f.pipeline_double_sided;
             s.wire_line_pipeline = f.wire_line_pipeline;
             s.transparent_alpha_pipeline = f.transparent_alpha_pipeline;
             s.transparent_alpha_back_pipeline = f.transparent_alpha_back_pipeline;
@@ -5141,7 +5967,6 @@ impl SceneRenderer {
         if let Some(b) = &mut self.billboard_pipeline {
             let f = BillboardPipeline::new(device, format, samples);
             b.pipeline = f.pipeline;
-            b.outline_pipeline = f.outline_pipeline;
         }
         if let Some(t) = &mut self.terrain_pipeline {
             let f = TerrainPipeline::new(
@@ -5211,15 +6036,45 @@ impl SceneRenderer {
             return;
         };
         let surface_format = pp.surface_format;
-        for failed in pp
-            .styles
-            .ensure(device, surface_format, &self.postprocess_config, &self.style_ids)
-        {
-            if !crate::stylize::is_builtin(failed.name) {
+        let mut failures = Vec::new();
+        for failed in pp.styles.ensure(
+            device,
+            surface_format,
+            &self.postprocess_config,
+            &self.style_ids,
+        ) {
+            failures.push(failed);
+        }
+        // A style built again from a changed shader file (#418) made new
+        // buffers: the kept bind groups hold the old ones
+        if pp.styles.take_rebuilt() {
+            if let Some(resources) = &self.postprocess_resources {
+                resources.binds.clear();
+            }
+        }
+        for failed in failures {
+            if !crate::stylize::is_native(failed.name) {
                 // A user style (ADR 0112) that panicked building is its
                 // author's bug, not a lost device: it stays off and says so
                 crate::stylize::custom::report_build_panic(failed.name);
-                self.postprocess_config.styles.set_enabled(failed.name, false);
+                self.postprocess_config
+                    .styles
+                    .set_enabled(failed.name, false);
+                continue;
+            }
+            if crate::stylize::is_game_style(failed.name) {
+                // A game's Rust style (#419) whose `create` panicked is the
+                // game's bug too: off, said once, the device kept
+                tracing::error!(
+                    "game style '{}' panicked building its pipelines; it stays off",
+                    failed.name
+                );
+                self.postprocess_config
+                    .styles
+                    .set_enabled(failed.name, false);
+                self.authored_postprocess
+                    .styles
+                    .set_enabled(failed.name, false);
                 continue;
             }
             tracing::warn!(
@@ -5227,8 +6082,12 @@ impl SceneRenderer {
                  Try updating your graphics drivers.",
                 failed.label
             );
-            self.postprocess_config.styles.set_enabled(failed.name, false);
-            self.authored_postprocess.styles.set_enabled(failed.name, false);
+            self.postprocess_config
+                .styles
+                .set_enabled(failed.name, false);
+            self.authored_postprocess
+                .styles
+                .set_enabled(failed.name, false);
             self.device_lost = true;
         }
     }
@@ -5494,7 +6353,16 @@ impl SceneRenderer {
         // config) is built before the frame that first needs it (#262).
         // When nothing new is on this is a walk over the registry.
         self.sync_debug_styles();
+        // A tear is a script's, set every frame, maybe after the world was
+        // read: a prop whose blend follows it (#397) is off while the
+        // config this frame draws has none
+        self.style_ids
+            .set_tear(crate::postprocess::tear_active(&self.postprocess_config));
         self.ensure_style_resources(device);
+        // FXAA likewise (#297): a host that only sets the config (the
+        // viewer's hot reload and scene/default toggle, a script's post
+        // override) drew none until a resize. Two `Option` checks when built.
+        self.ensure_fxaa_resources(device);
         if self.device_lost {
             return;
         }
@@ -5853,6 +6721,32 @@ impl SceneRenderer {
             }
         }
 
+        // The style albedo (#869): the opaque meshes' own colour, while a
+        // style divides the picture by it
+        if has_postprocess
+            && crate::stylize::any_uses_albedo(&self.postprocess_config, &self.style_ids)
+        {
+            let scope = gpu_timer.as_mut().map(|t| t.begin(encoder, "Style albedo"));
+            self.encode_style_albedo(device, encoder, depth_view);
+            if let (Some(timer), Some(scope)) = (gpu_timer.as_mut(), scope) {
+                timer.end(encoder, scope);
+            }
+        }
+
+        // The editor's selection (#602): its draws into a mask, against the
+        // same depth. Nothing selected, nothing drawn.
+        let selection = self.selection_set();
+        let outlining = !selection.is_empty();
+        if outlining {
+            let scope = gpu_timer
+                .as_mut()
+                .map(|t| t.begin(encoder, "Selection mask"));
+            self.encode_selection_mask(device, encoder, depth_view, &selection);
+            if let (Some(timer), Some(scope)) = (gpu_timer.as_mut(), scope) {
+                timer.end(encoder, scope);
+            }
+        }
+
         // Composite: always needed to convert HDR → sRGB surface
         if has_postprocess {
             self.render_postprocess(
@@ -5873,6 +6767,18 @@ impl SceneRenderer {
             upscale.record(encoder, surface_depth_view);
         }
 
+        // The selection outline, over the finished image: after every
+        // style and the tonemap, so its colour is the one asked for (#602)
+        if outlining {
+            let scope = gpu_timer
+                .as_mut()
+                .map(|t| t.begin(encoder, "Selection outline"));
+            self.encode_selection_outline(queue, encoder, target_view);
+            if let (Some(timer), Some(scope)) = (gpu_timer.as_mut(), scope) {
+                timer.end(encoder, scope);
+            }
+        }
+
         // World lines (ADR 0083) go over the finished image, tested against
         // the frame's single-sample depth. Without the HDR chain an MSAA depth
         // is never resolved, so they're skipped there.
@@ -5891,6 +6797,25 @@ impl SceneRenderer {
             }
         }
         self.gpu_timer = gpu_timer;
+    }
+
+    /// [`encode_to`](Self::encode_to) a second time in a frame, for the other
+    /// half of a split view (#238), with the GPU timer left out: its scopes are
+    /// the first drawing's. Submit the first drawing before calling this, since
+    /// what changed between the two (bones, the boil) reaches the GPU through
+    /// the queue's writes, and those land with the next submission.
+    pub fn encode_again_to(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        depth_view: &wgpu::TextureView,
+        camera: &Camera,
+        target_view: &wgpu::TextureView,
+    ) {
+        let timer = self.gpu_timer.take();
+        self.encode_to(device, queue, encoder, depth_view, camera, target_view);
+        self.gpu_timer = timer;
     }
 
     /// Start what waits on the frame [`encode_to`](Self::encode_to)
@@ -6013,6 +6938,59 @@ mod tests {
         for (got, want) in max.iter().zip([r, 1.0, r]) {
             assert!((got - want).abs() < 1e-5, "{max:?}");
         }
+    }
+
+    /// A sheared tile (#625): its culling bounds hold every corner the
+    /// matrix moves, and its normals, through the inverse transpose, stay
+    /// perpendicular to the sheared surface rather than leaning with it.
+    #[test]
+    fn a_sheared_entity_is_bounded_and_lit_by_its_own_matrix() {
+        use super::helpers::mat4_inv_transpose;
+        use flint_core::{Transform, Vec3};
+        // An 8 m tile, 20 m wide, leaning 0.5 m sideways per metre along z
+        // and climbing 0.25 m per metre along z, then yawed 30 degrees.
+        let t = Transform::default()
+            .with_position(Vec3::new(3.0, 0.0, 1.0))
+            .with_rotation(Vec3::new(0.0, 30.0, 0.0))
+            .with_shear([0.0, 0.5, 0.0, 0.25, 0.0, 0.0]);
+        let m = t.to_matrix();
+        let apply = |p: [f32; 3]| {
+            let mut out = [m[3][0], m[3][1], m[3][2]];
+            for (row, o) in out.iter_mut().enumerate() {
+                for (col, v) in p.iter().enumerate() {
+                    *o += m[col][row] * v;
+                }
+            }
+            out
+        };
+        let (lo, hi) = ([-10.0, 0.0, -4.0], [10.0, 0.1, 4.0]);
+        let (min, max) = transform_aabb(&m, lo, hi);
+        for corner in 0..8 {
+            let p = [
+                if corner & 1 == 0 { lo[0] } else { hi[0] },
+                if corner & 2 == 0 { lo[1] } else { hi[1] },
+                if corner & 4 == 0 { lo[2] } else { hi[2] },
+            ];
+            let w = apply(p);
+            for axis in 0..3 {
+                assert!(w[axis] >= min[axis] - 1e-4 && w[axis] <= max[axis] + 1e-4);
+            }
+        }
+
+        // Two edges of the tile's top face, in world space.
+        let o = apply([0.0, 0.0, 0.0]);
+        let along_x = apply([1.0, 0.0, 0.0]);
+        let along_z = apply([0.0, 0.0, 1.0]);
+        let ex: Vec<f32> = (0..3).map(|i| along_x[i] - o[i]).collect();
+        let ez: Vec<f32> = (0..3).map(|i| along_z[i] - o[i]).collect();
+        let it = mat4_inv_transpose(&m);
+        let n: Vec<f32> = (0..3).map(|row| it[1][row]).collect(); // local +Y
+        let dot = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(x, y)| x * y).sum::<f32>();
+        assert!(dot(&n, &ex).abs() < 1e-5, "normal leans along x");
+        assert!(dot(&n, &ez).abs() < 1e-5, "normal leans along z");
+        // The plain model matrix would have tilted it with the shear.
+        let naive: Vec<f32> = (0..3).map(|row| m[1][row]).collect();
+        assert!(dot(&naive, &ez).abs() > 0.1);
     }
 
     /// A render-scale step keeps the surface's size, so it keeps the

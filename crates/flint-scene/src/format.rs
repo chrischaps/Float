@@ -3,20 +3,84 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-/// Root structure of a scene TOML file
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Root structure of a scene TOML file: `[scene]`, the scene-level tables,
+/// `[prefabs.*]` and `[entities.*]`.
+///
+/// A scene-level table is any other top-level table. The ones flint-scene
+/// reads itself are fields ([`SceneFile::TYPED_TABLES`]); **every other one
+/// is kept as written in [`tables`](Self::tables)** (#686) and written back
+/// by `toml::to_string`, so a game's own `[weather]` survives a load and
+/// reaches whoever reads it (a `PlayerExtension`, through
+/// `ExtensionCtx::scene_table`). The engine's own features read theirs the
+/// same way: `[living]` and `[wooze]` are in `tables`, and the crate that
+/// owns living props gives them their types (`flint_procgen::LivingTables`).
+/// A `[table.<name>]` schema declares one;
+/// [`diagnose`](crate::diagnose) warns about one no schema declares
+/// (`unknown-table`) and checks the fields of the ones that are declared.
+#[derive(Debug, Clone, Serialize)]
 pub struct SceneFile {
     pub scene: SceneMetadata,
-    #[serde(default)]
     pub camera: Option<CameraDef>,
-    #[serde(default)]
     pub environment: Option<EnvironmentDef>,
-    #[serde(default)]
     pub post_process: Option<PostProcessDef>,
-    #[serde(default)]
+    /// Every top-level table that is none of the above, by name, as the
+    /// file wrote it: a feature's (`[living]`, `[wooze]`), a game's or an
+    /// extension's own.
+    #[serde(flatten)]
+    pub tables: toml::Table,
     pub prefabs: HashMap<String, PrefabInstance>,
-    #[serde(default)]
     pub entities: HashMap<String, EntityDef>,
+    /// The typed tables ([`SceneFile::TYPED_TABLES`]) as the file wrote
+    /// them, before their defaults were filled in: what
+    /// [`diagnose`](crate::diagnose) checks against their `[table.*]`
+    /// schemas, so a misspelled key serde dropped is still named.
+    /// [`SceneFile::parse`] and the loaders record it; a scene built in code
+    /// or read with `toml::from_str` has none, and its typed tables are not
+    /// checked.
+    #[serde(skip)]
+    pub written: toml::Table,
+}
+
+impl<'de> Deserialize<'de> for SceneFile {
+    /// Each known table straight into its type (so an error keeps its line
+    /// and column, which `#[serde(flatten)]` would lose), and every other
+    /// top-level key into [`tables`](SceneFile::tables).
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct SceneVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for SceneVisitor {
+            type Value = SceneFile;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a scene file")
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<SceneFile, A::Error> {
+                let mut scene: Option<SceneMetadata> = None;
+                let mut file = SceneFile::new("");
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "scene" => scene = Some(map.next_value()?),
+                        "camera" => file.camera = map.next_value()?,
+                        "environment" => file.environment = map.next_value()?,
+                        "post_process" => file.post_process = map.next_value()?,
+                        "prefabs" => file.prefabs = map.next_value()?,
+                        "entities" => file.entities = map.next_value()?,
+                        _ => {
+                            file.tables.insert(key, map.next_value()?);
+                        }
+                    }
+                }
+                file.scene = scene.ok_or_else(|| serde::de::Error::missing_field("scene"))?;
+                Ok(file)
+            }
+        }
+
+        deserializer.deserialize_map(SceneVisitor)
+    }
 }
 
 /// A prefab template file (.prefab.toml)
@@ -153,6 +217,39 @@ pub struct PostProcessDef {
     /// renderer checks names and parameters against its registry.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub styles: std::collections::BTreeMap<String, toml::Table>,
+    /// The old spellings of the shading boil's and the contour's settings
+    /// (#214), which are `[post_process.styles.kuwahara] boil` and
+    /// `[post_process.styles.contour]` since #599. Kept so older scenes
+    /// still load, and read through [`style_tables`](Self::style_tables)
+    /// like the `kuwahara_*` keys above.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kuwahara_boil: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contour_enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contour_width: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contour_threshold: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contour_strength: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contour_luma: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contour_color: Option<[f32; 3]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contour_fade: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contour_boil: Option<f32>,
+    /// Film frames each drawing of the shading boil is held: 1, 2 or 3 ("on
+    /// twos"). A beat of the field's `step` is six film frames. Shared by
+    /// both styles' boils.
+    #[serde(default = "default_boil_on")]
+    pub boil_on: u32,
+    /// Motion on twos for the whole frame (#405): every entity that names no
+    /// `motion_hold` rate of its own is drawn on ticks, this many a second,
+    /// and the post time styles read holds to the same ticks. 0 = off.
+    #[serde(default)]
+    pub motion_hold: f32,
     /// Animated film grain intensity (0 = off; ~0.02-0.05 is subtle).
     #[serde(default)]
     pub film_grain: f32,
@@ -284,13 +381,22 @@ fn default_volumetric_decay() -> f32 {
 }
 
 /// The `[post_process]` keys that predate the style table, and the
-/// `[post_process.styles.<style>]` key each one is now (#298).
+/// `[post_process.styles.<style>]` key each one is now (#298, #599).
 pub const LEGACY_STYLE_KEYS: &[(&str, &str, &str)] = &[
     ("kuwahara_enabled", "kuwahara", "enabled"),
     ("kuwahara_radius", "kuwahara", "radius"),
     ("kuwahara_sharpness", "kuwahara", "sharpness"),
     ("kuwahara_hardness", "kuwahara", "hardness"),
     ("kuwahara_anisotropy", "kuwahara", "anisotropy"),
+    ("kuwahara_boil", "kuwahara", "boil"),
+    ("contour_enabled", "contour", "enabled"),
+    ("contour_width", "contour", "width"),
+    ("contour_threshold", "contour", "threshold"),
+    ("contour_strength", "contour", "strength"),
+    ("contour_luma", "contour", "luma"),
+    ("contour_color", "contour", "color"),
+    ("contour_fade", "contour", "fade"),
+    ("contour_boil", "contour", "boil"),
 ];
 
 /// Move a `[post_process]` table's old style keys (`kuwahara_radius = 4`)
@@ -298,7 +404,8 @@ pub const LEGACY_STYLE_KEYS: &[(&str, &str, &str)] = &[
 /// spellings mean the same thing. A key the style table already sets is
 /// the table's, and the old key is dropped. A style table made here is on
 /// only if the old keys say so (`kuwahara_enabled = true`): before the
-/// table, `kuwahara_radius` alone left the filter off.
+/// table, `kuwahara_radius` alone left the filter off (and `contour_width`
+/// alone the ink).
 pub fn fold_legacy_style_keys(post_process: &mut toml::Table) {
     let mut made: Vec<&str> = Vec::new();
     for &(old, style, key) in LEGACY_STYLE_KEYS {
@@ -374,7 +481,7 @@ impl PostProcessDef {
     /// Every key a `[post_process]` block can name, sorted: the struct's
     /// own fields, read back from a serialized one (so a new field is
     /// known the moment it exists), with the ones skipped when empty
-    /// (`kuwahara_*`, `styles`) filled in so they serialize too.
+    /// (`kuwahara_*`, `contour_*`, `styles`) filled in so they serialize too.
     pub fn field_names() -> Vec<String> {
         let mut def: PostProcessDef = toml::Value::Table(toml::Table::new())
             .try_into()
@@ -384,6 +491,15 @@ impl PostProcessDef {
         def.kuwahara_sharpness = Some(0.0);
         def.kuwahara_hardness = Some(0.0);
         def.kuwahara_anisotropy = Some(0.0);
+        def.kuwahara_boil = Some(0.0);
+        def.contour_enabled = Some(false);
+        def.contour_width = Some(0.0);
+        def.contour_threshold = Some(0.0);
+        def.contour_strength = Some(0.0);
+        def.contour_luma = Some(0.0);
+        def.contour_color = Some([0.0; 3]);
+        def.contour_fade = Some(0.0);
+        def.contour_boil = Some(0.0);
         def.styles.insert("_".into(), toml::Table::new());
         def.look = Some(String::new());
         let mut names: Vec<String> = toml::Table::try_from(&def)
@@ -452,8 +568,33 @@ impl PostProcessDef {
         Ok(def)
     }
 
-    /// The style tables, with the old `kuwahara_*` keys folded in
-    /// ([`fold_legacy_style_keys`]). What the renderer reads.
+    /// Style `style`'s shading boil (`kuwahara` or `contour`, #214) as the
+    /// scene gives it: its table's `boil`, or the old flat key. `None` when
+    /// neither says.
+    pub fn boil(&self, style: &str) -> Option<f32> {
+        let table = self.style_tables();
+        let value = table.get(style)?.get("boil")?;
+        flint_core::toml_util::toml_f64(value).map(|v| v as f32)
+    }
+
+    /// Set style `style`'s shading boil (a wooze preset's `[boil]`, which
+    /// wins over the scene's): in its table when the scene has one, so
+    /// the table's value can't outrank it, else in the old flat key, so no
+    /// table is made and no style switched on.
+    pub fn set_boil(&mut self, style: &str, amount: f32) {
+        if let Some(table) = self.styles.get_mut(style) {
+            table.insert("boil".into(), toml::Value::Float(amount as f64));
+            return;
+        }
+        match style {
+            "kuwahara" => self.kuwahara_boil = Some(amount),
+            "contour" => self.contour_boil = Some(amount),
+            _ => {}
+        }
+    }
+
+    /// The style tables, with the old `kuwahara_*` and `contour_*` keys
+    /// folded in ([`fold_legacy_style_keys`]). What the renderer reads.
     pub fn style_tables(&self) -> std::collections::BTreeMap<String, toml::Table> {
         let mut table = toml::Table::new();
         let float = |v: Option<f32>| v.map(|v| toml::Value::Float(v as f64));
@@ -469,6 +610,23 @@ impl PostProcessDef {
             ("kuwahara_sharpness", float(self.kuwahara_sharpness)),
             ("kuwahara_hardness", float(self.kuwahara_hardness)),
             ("kuwahara_anisotropy", float(self.kuwahara_anisotropy)),
+            ("kuwahara_boil", float(self.kuwahara_boil)),
+            (
+                "contour_enabled",
+                self.contour_enabled.map(toml::Value::Boolean),
+            ),
+            ("contour_width", float(self.contour_width)),
+            ("contour_threshold", float(self.contour_threshold)),
+            ("contour_strength", float(self.contour_strength)),
+            ("contour_luma", float(self.contour_luma)),
+            (
+                "contour_color",
+                self.contour_color.map(|rgb| {
+                    toml::Value::Array(rgb.iter().map(|&c| toml::Value::Float(c as f64)).collect())
+                }),
+            ),
+            ("contour_fade", float(self.contour_fade)),
+            ("contour_boil", float(self.contour_boil)),
         ];
         for (key, value) in legacy {
             if let Some(value) = value {
@@ -499,6 +657,10 @@ impl PostProcessDef {
         }
         styles
     }
+}
+
+fn default_boil_on() -> u32 {
+    2
 }
 
 /// Camera configuration for the scene
@@ -563,6 +725,27 @@ pub struct EnvironmentDef {
     /// values over-brighten). Absent = 0 = exact legacy shading (ADR 0048).
     #[serde(default)]
     pub sheen_strength: Option<f32>,
+    /// False: the scene casts no shadows, whatever the quality tier says
+    /// (#627). Absent = true.
+    #[serde(default)]
+    pub shadows: Option<bool>,
+    /// False: a scene with no light entities is lit by its ambient (and
+    /// its emission) alone, not the renderer's built-in key and fill
+    /// (#627). Absent = true.
+    #[serde(default)]
+    pub default_lights: Option<bool>,
+}
+
+impl EnvironmentDef {
+    /// `shadows`, true when absent (#627).
+    pub fn casts_shadows(&self) -> bool {
+        self.shadows.unwrap_or(true)
+    }
+
+    /// `default_lights`, true when absent (#627).
+    pub fn uses_default_lights(&self) -> bool {
+        self.default_lights.unwrap_or(true)
+    }
 }
 
 /// Scene metadata
@@ -628,6 +811,51 @@ impl EntityDef {
 }
 
 impl SceneFile {
+    /// The scene-level tables that are fields of this struct, by the name
+    /// their header is written with. Any other top-level table is in
+    /// [`tables`](Self::tables).
+    pub const TYPED_TABLES: &'static [&'static str] = &["camera", "environment", "post_process"];
+
+    /// A scene from its text, with what its typed tables wrote kept in
+    /// [`written`](Self::written) (and in
+    /// [`PostProcessDef::authored`]). What the loaders and
+    /// [`diagnose`](crate::diagnose) parse with.
+    pub fn parse(text: &str) -> Result<Self, toml::de::Error> {
+        let mut scene: SceneFile = toml::from_str(text)?;
+        if let Ok(mut doc) = toml::from_str::<toml::Table>(text) {
+            for name in Self::TYPED_TABLES {
+                if let Some(value) = doc.remove(*name) {
+                    scene.written.insert((*name).to_string(), value);
+                }
+            }
+        }
+        if let Some(def) = &mut scene.post_process {
+            def.authored = match scene.written.get("post_process") {
+                Some(toml::Value::Table(post)) => Some(post.clone()),
+                _ => None,
+            };
+        }
+        Ok(scene)
+    }
+
+    /// The scene-level table `name` as the file wrote it: one of
+    /// [`tables`](Self::tables), or a typed one from
+    /// [`written`](Self::written).
+    pub fn table(&self, name: &str) -> Option<&toml::Value> {
+        self.tables.get(name).or_else(|| self.written.get(name))
+    }
+
+    /// Every scene-level table as the file wrote it, by name: the typed
+    /// ones ([`written`](Self::written)) and the rest
+    /// ([`tables`](Self::tables)). What the player hands its extensions.
+    pub fn scene_tables(&self) -> toml::Table {
+        let mut all = self.written.clone();
+        for (name, value) in &self.tables {
+            all.insert(name.clone(), value.clone());
+        }
+        all
+    }
+
     /// Create a new scene file
     pub fn new(name: impl Into<String>) -> Self {
         Self {
@@ -641,8 +869,10 @@ impl SceneFile {
             camera: None,
             environment: None,
             post_process: None,
+            tables: toml::Table::new(),
             prefabs: HashMap::new(),
             entities: HashMap::new(),
+            written: toml::Table::new(),
         }
     }
 
@@ -690,6 +920,85 @@ max = [10, 4, 8]
         assert_eq!(scene.scene.name, "Test Scene");
         assert!(scene.entities.contains_key("room1"));
     }
+
+    const WEATHER: &str = r#"
+[scene]
+name = "Storm"
+
+[camera]
+fov = 40.0
+fovv = 1
+
+[weather]
+wind = [1.0, 0.0, 0.0]
+rain = 0.7
+
+[[weather.front]]
+at = 12.5
+
+[entities.rock]
+"#;
+
+    /// #686: a top-level table that is no field is kept, as written, and
+    /// written back.
+    #[test]
+    fn a_table_that_is_no_field_is_kept_and_written_back() {
+        let scene: SceneFile = toml::from_str(WEATHER).unwrap();
+        assert_eq!(
+            scene.tables.keys().collect::<Vec<_>>(),
+            ["weather"],
+            "the typed tables, [scene] and [entities] are not in it"
+        );
+        let weather = &scene.tables["weather"];
+        assert_eq!(weather["rain"].as_float(), Some(0.7));
+        assert_eq!(weather["front"][0]["at"].as_float(), Some(12.5));
+        assert_eq!(scene.camera.as_ref().unwrap().fov, Some(40.0));
+        assert!(scene.written.is_empty(), "only `parse` records it");
+
+        let saved = toml::to_string_pretty(&scene).unwrap();
+        let reread: SceneFile = toml::from_str(&saved).unwrap();
+        assert_eq!(reread.tables, scene.tables, "{saved}");
+        assert!(reread.entities.contains_key("rock"));
+    }
+
+    /// `parse` also keeps what the typed tables wrote, a key serde dropped
+    /// included, and hands every table out by name.
+    #[test]
+    fn parse_keeps_what_the_typed_tables_wrote() {
+        let scene = SceneFile::parse(WEATHER).unwrap();
+        assert_eq!(scene.written.keys().collect::<Vec<_>>(), ["camera"]);
+        assert_eq!(scene.written["camera"]["fovv"].as_integer(), Some(1));
+        assert_eq!(scene.table("camera").unwrap()["fov"].as_float(), Some(40.0));
+        assert!(scene.table("weather").is_some());
+        assert!(scene.table("environment").is_none());
+        let all = scene.scene_tables();
+        assert_eq!(all.keys().collect::<Vec<_>>(), ["camera", "weather"]);
+
+        let post = SceneFile::parse("[scene]\nname = \"p\"\n[post_process]\nexposure = 2.0\n")
+            .unwrap()
+            .post_process
+            .unwrap();
+        assert_eq!(
+            post.authored.unwrap().keys().collect::<Vec<_>>(),
+            ["exposure"]
+        );
+    }
+
+    /// A mistake in a typed table still names its line (the reason the
+    /// tables are not a `#[serde(flatten)]` field on the way in), and a file
+    /// with no `[scene]` says so.
+    #[test]
+    fn a_parse_error_keeps_its_line() {
+        let err =
+            toml::from_str::<SceneFile>("[scene]\nname = \"s\"\n\n[camera]\nfov = \"wide\"\n")
+                .unwrap_err()
+                .to_string();
+        assert!(err.contains("line 5"), "{err}");
+        let err = toml::from_str::<SceneFile>("[weather]\nrain = 1\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("missing field `scene`"), "{err}");
+    }
 }
 
 #[cfg(test)]
@@ -708,6 +1017,42 @@ mod legacy_style_key_tests {
         assert_eq!(k["enabled"].as_bool(), Some(true));
         assert_eq!(k["radius"].as_integer(), Some(4));
         assert_eq!(k["sharpness"].as_float(), Some(6.0));
+    }
+
+    /// The contour's and the paint boil's flat keys (#214) are its table's
+    /// and Kuwahara's since #599, colour and all.
+    #[test]
+    fn old_contour_and_boil_keys_fold_into_their_tables() {
+        let old = def(
+            "kuwahara_boil = 0.5\ncontour_enabled = true\ncontour_width = 1.5\n\
+             contour_color = [0.1, 0.2, 0.3]\ncontour_boil = 1.0\nboil_on = 2",
+        );
+        let tables = old.style_tables();
+        let c = &tables["contour"];
+        assert_eq!(c["enabled"].as_bool(), Some(true));
+        assert_eq!(c["width"].as_float(), Some(1.5));
+        assert_eq!(c["boil"].as_float(), Some(1.0));
+        let rgb: Vec<f64> = c["color"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_float().unwrap())
+            .collect();
+        assert_eq!(rgb.len(), 3);
+        assert!((rgb[1] - 0.2).abs() < 1e-6);
+        // Boil alone never switched the filter on, and doesn't now
+        let k = &tables["kuwahara"];
+        assert_eq!(k["boil"].as_float(), Some(0.5));
+        assert_eq!(k["enabled"].as_bool(), Some(false));
+        assert_eq!(old.boil_on, 2);
+        // The ink stays off without its old switch
+        let width_only = def("contour_width = 2.0").style_tables();
+        assert_eq!(width_only["contour"]["enabled"].as_bool(), Some(false));
+        assert!(PostProcessDef::unknown_field_warnings(
+            "[post_process]\ncontour_fade = 26.0\nkuwahara_boil = 0.5\n",
+            None
+        )
+        .is_empty());
     }
 
     #[test]

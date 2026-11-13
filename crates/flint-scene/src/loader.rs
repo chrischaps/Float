@@ -1,28 +1,129 @@
 //! Scene loading from TOML files
 
+use crate::diagnose::{diagnose_scene, diagnose_scene_in};
 use crate::format::{PostProcessDef, SceneFile};
 use crate::prefab;
+use flint_core::diagnostic::{self, Diagnostic};
+use flint_core::project::Project;
 use flint_core::vfs;
-use flint_core::Result;
+use flint_core::{FlintError, Result};
 use flint_ecs::FlintWorld;
-use flint_schema::{validate_component_data, SchemaRegistry};
+use flint_schema::SchemaRegistry;
 use std::path::Path;
 
-/// Load a scene from a TOML file (with prefab expansion)
+/// Load a scene from a TOML file (with prefab expansion).
+///
+/// What is wrong with its entities (an unknown archetype or component, a
+/// field of the wrong type, a reference to an entity or an asset that isn't
+/// there: [`diagnose_scene_in`]) doesn't stop the load: it is logged once, as
+/// a summary line and the first few (ADR 0115).
+/// [`load_scene_diagnosed`] returns the list instead.
 pub fn load_scene<P: AsRef<Path>>(
     path: P,
     registry: &SchemaRegistry,
 ) -> Result<(FlintWorld, SceneFile)> {
     let path = path.as_ref();
+    let (world, scene_file, found) = load_scene_diagnosed(path, registry)?;
+    diagnostic::log_summary(&flint_core::project::shown(path), &found);
+    Ok((world, scene_file))
+}
+
+/// [`load_scene`] that hands back what [`diagnose_scene_in`] found and logs
+/// nothing about it, for a host that reports diagnostics its own way
+/// (`flint validate`).
+pub fn load_scene_diagnosed<P: AsRef<Path>>(
+    path: P,
+    registry: &SchemaRegistry,
+) -> Result<(FlintWorld, SceneFile, Vec<Diagnostic>)> {
+    let path = path.as_ref();
     let content = vfs::read_to_string(path)?;
-    let mut scene_file: SceneFile = toml::from_str(&content)?;
-    note_post_process(&mut scene_file, &content, Some(path));
+    load_text_diagnosed(&content, path, registry)
+}
+
+/// Load scene text as though it were the file at `path`: prefabs resolve
+/// from there. What `flint entity create/delete` (#678) runs on
+/// the text it is about to write, so an edit that would leave the scene
+/// unloadable is refused before the file changes. Diagnostics are logged as
+/// [`load_scene`] logs them.
+pub fn load_scene_text(
+    content: &str,
+    path: &Path,
+    registry: &SchemaRegistry,
+) -> Result<(FlintWorld, SceneFile)> {
+    let (world, scene_file, found) = load_text_diagnosed(content, path, registry)?;
+    diagnostic::log_summary(&flint_core::project::shown(path), &found);
+    Ok((world, scene_file))
+}
+
+/// What [`load_scene_diagnosed`] and [`load_scene_text`] share: parse, expand
+/// prefabs, diagnose, build the world.
+///
+/// The scene-level tables are handed back as the file wrote them. A feature
+/// that settles its own after a load does so itself: living props fill in the
+/// preset `[wooze] preset` names with `flint_procgen::settle_scene`, which
+/// this loader did while those tables were its own (#686).
+fn load_text_diagnosed(
+    content: &str,
+    path: &Path,
+    registry: &SchemaRegistry,
+) -> Result<(FlintWorld, SceneFile, Vec<Diagnostic>)> {
+    let mut scene_file = parse_scene(content, Some(path))?;
+    note_post_process(content, Some(path), registry);
 
     // Expand prefab instances into entities before building world
     prefab::expand_prefabs(&mut scene_file, path)?;
-
+    let found = diagnose_scene_in(&scene_file, path, registry, &Project::for_scene(path));
     let world = build_world(&scene_file, registry)?;
-    Ok((world, scene_file))
+    Ok((world, scene_file, found))
+}
+
+/// Parse a scene's text. A file that isn't TOML, or isn't a scene, is an
+/// error that names the file (#683): the parser's own message has only a
+/// line and a column.
+fn parse_scene(content: &str, path: Option<&Path>) -> Result<SceneFile> {
+    SceneFile::parse(content).map_err(|e: toml::de::Error| match path {
+        Some(path) => FlintError::TomlParseError(format!(
+            "{}: {}",
+            flint_core::project::shown(path),
+            e.to_string().trim_end()
+        )),
+        None => e.into(),
+    })
+}
+
+/// What a load from a string logs: there is no file to name.
+fn log_string_diagnostics(scene_file: &SceneFile, registry: &SchemaRegistry) {
+    let found = diagnose_scene(scene_file, None, registry);
+    diagnostic::log_summary(&format!("scene '{}'", scene_file.scene.name), &found);
+}
+
+/// A `transform.shear` that shears nothing, or folds space flat, says so
+/// (#625): `xzz = 0.2` is a typo that would otherwise draw an unsheared tile,
+/// and `xy = yx = 1` has no inverse for the normals to use.
+fn warn_on_shear(entity: &str, transform: &toml::Value) {
+    let Some(shear) = transform.get("shear") else {
+        return;
+    };
+    let unknown = flint_core::Shear::unknown_keys(shear);
+    if !unknown.is_empty() {
+        tracing::warn!(
+            "[scene] entity '{}' transform.shear: unknown term(s) {} (expected xy, xz, yx, yz, zx, zy)",
+            entity,
+            unknown.join(", ")
+        );
+    }
+    match flint_core::Shear::from_toml(shear) {
+        Some(terms) if flint_core::Shear::determinant(&terms).abs() < 1e-3 => tracing::warn!(
+            "[scene] entity '{}' transform.shear flattens it (determinant {:.4}); lighting will be wrong",
+            entity,
+            flint_core::Shear::determinant(&terms)
+        ),
+        None if !matches!(shear, toml::Value::Table(_)) => tracing::warn!(
+            "[scene] entity '{}' transform.shear should be a table like {{ xz = 0.25 }}",
+            entity
+        ),
+        _ => {}
+    }
 }
 
 /// Load a scene from a TOML string (no prefab expansion — no filesystem access)
@@ -30,28 +131,32 @@ pub fn load_scene_string(
     content: &str,
     registry: &SchemaRegistry,
 ) -> Result<(FlintWorld, SceneFile)> {
-    let mut scene_file: SceneFile = toml::from_str(content)?;
-    note_post_process(&mut scene_file, content, None);
+    let scene_file = parse_scene(content, None)?;
+    note_post_process(content, None, registry);
 
     if !scene_file.prefabs.is_empty() {
         tracing::warn!("prefabs in scene string will be ignored (no filesystem access)");
     }
 
+    log_string_diagnostics(&scene_file, registry);
     let world = build_world(&scene_file, registry)?;
     Ok((world, scene_file))
 }
 
 /// Warn about `[post_process]` keys that are no field (#354): serde drops
 /// them silently, so a typo would leave the default in place. The scene
-/// still loads. Then record the keys the block wrote
-/// ([`PostProcessDef::authored`]), which a look goes under (#356).
-fn note_post_process(scene_file: &mut SceneFile, content: &str, path: Option<&Path>) {
+/// still loads. Only when no loaded schema declares `[table.post_process]`:
+/// with one (the engine's `schemas/scene/`), the same keys are
+/// `unknown-field` diagnostics in the load's one list (#686), and saying it
+/// twice helps nobody. ([`SceneFile::parse`] records the keys the block
+/// wrote, [`PostProcessDef::authored`], which a look goes under, #356.)
+fn note_post_process(content: &str, path: Option<&Path>, registry: &SchemaRegistry) {
+    if registry.get_table("post_process").is_some() {
+        return;
+    }
     let source = path.map(|p| p.display().to_string());
     for warning in PostProcessDef::unknown_field_warnings(content, source.as_deref()) {
         tracing::warn!("{warning}");
-    }
-    if let Some(def) = &mut scene_file.post_process {
-        def.authored = PostProcessDef::authored_table(content);
     }
 }
 
@@ -63,11 +168,13 @@ pub fn reload_scene<P: AsRef<Path>>(
 ) -> Result<SceneFile> {
     let path = path.as_ref();
     let content = vfs::read_to_string(path)?;
-    let mut scene_file: SceneFile = toml::from_str(&content)?;
-    note_post_process(&mut scene_file, &content, Some(path));
+    let mut scene_file = parse_scene(&content, Some(path))?;
+    note_post_process(&content, Some(path), registry);
 
     // Expand prefab instances
     prefab::expand_prefabs(&mut scene_file, path)?;
+    let found = diagnose_scene_in(&scene_file, path, registry, &Project::for_scene(path));
+    diagnostic::log_summary(&flint_core::project::shown(path), &found);
 
     // Clear existing world
     world.clear();
@@ -82,12 +189,13 @@ pub fn reload_scene_string(
     world: &mut FlintWorld,
     registry: &SchemaRegistry,
 ) -> Result<SceneFile> {
-    let mut scene_file: SceneFile = toml::from_str(content)?;
-    note_post_process(&mut scene_file, content, None);
+    let scene_file = parse_scene(content, None)?;
+    note_post_process(content, None, registry);
 
     if !scene_file.prefabs.is_empty() {
         tracing::warn!("prefabs in scene string will be ignored (no filesystem access)");
     }
+    log_string_diagnostics(&scene_file, registry);
 
     // Clear existing world
     world.clear();
@@ -118,7 +226,8 @@ fn populate_world(
     for (name, entity_def) in &scene_file.entities {
         let id = world.get_id(name).unwrap();
 
-        // Set archetype
+        // Set archetype. One the registry doesn't know gives no defaults;
+        // `diagnose_scene` has said so (unknown-archetype)
         if let Some(archetype) = &entity_def.archetype {
             // Apply archetype defaults through set_component to maintain index
             if let Some(arch_schema) = registry.get_archetype(archetype) {
@@ -136,11 +245,10 @@ fn populate_world(
 
         // Set component data
         for (comp_name, comp_data) in &entity_def.components {
-            // Validate against schema (warn, don't fail)
-            if let Some(schema) = registry.get_component(comp_name) {
-                if let Err(e) = validate_component_data(schema, comp_data) {
-                    tracing::warn!("[scene] entity '{}' component '{}': {}", name, comp_name, e);
-                }
+            // Checked against its schema by `diagnose_scene`, which the
+            // loaders run first: a load warns and never fails on it
+            if comp_name == "transform" {
+                warn_on_shear(name, comp_data);
             }
             world.merge_component(id, comp_name, comp_data.clone())?;
         }
@@ -429,6 +537,27 @@ skybox = "sky_sunset.hdr"
             .environment
             .expect("environment should be present");
         assert_eq!(env.skybox, Some("sky_sunset.hdr".into()));
+        assert!(
+            env.casts_shadows() && env.uses_default_lights(),
+            "absent = true"
+        );
+    }
+
+    #[test]
+    fn test_environment_no_shadows_no_default_lights() {
+        let registry = SchemaRegistry::new();
+        let scene = r#"
+[scene]
+name = "Unlit"
+
+[environment]
+shadows = false
+default_lights = false
+"#;
+        let (_, scene_file) = load_scene_string(scene, &registry).unwrap();
+        let env = scene_file.environment.unwrap();
+        assert!(!env.casts_shadows());
+        assert!(!env.uses_default_lights());
     }
 
     #[test]

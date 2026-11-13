@@ -6,6 +6,13 @@
 //! with its history on (#277) a wobbling camera leaves its glyphs still.
 //!
 //! These need a GPU adapter. Without one each test prints a note and passes.
+//!
+//! They share one device ([`shared_gpu`], #598): making one per test hung
+//! the binary for hours on NVIDIA's Vulkan driver. A test that counts
+//! objects across the device or builds user styles takes it alone
+//! ([`gpu_alone`]); the rest run side by side ([`gpu`]).
+
+mod shared_gpu;
 
 use flint_ecs::FlintWorld;
 use flint_render::{Camera, RendererConfig, SceneRenderer};
@@ -13,23 +20,34 @@ use flint_render::{Camera, RendererConfig, SceneRenderer};
 const SIZE: u32 = 64;
 const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 
+/// The shared device and this test's own frame to draw into. Fields drop
+/// in order, so the targets go before the lease gives the turn back.
 struct Gpu {
-    instance: wgpu::Instance,
-    device: wgpu::Device,
-    queue: wgpu::Queue,
+    instance: &'static wgpu::Instance,
+    device: &'static wgpu::Device,
+    queue: &'static wgpu::Queue,
     color: wgpu::Texture,
     color_view: wgpu::TextureView,
     depth_view: wgpu::TextureView,
+    _lease: shared_gpu::Lease,
 }
 
+/// The device, alongside the other tests.
 fn gpu() -> Option<Gpu> {
-    pollster::block_on(async {
-        let instance = flint_render::gpu_select::instance();
-        let adapter = flint_render::gpu_select::request_adapter(&instance, None).await?;
-        let (device, queue) = adapter
-            .request_device(&wgpu::DeviceDescriptor::default(), None)
-            .await
-            .ok()?;
+    shared_gpu::lease().map(frame_for)
+}
+
+/// The device with no other test on it: for a test that counts the
+/// device's objects ([`held`], `generate_report`) or builds user styles
+/// (their error scopes are the device's, not the thread's, in wgpu 23).
+fn gpu_alone() -> Option<Gpu> {
+    shared_gpu::lease_alone().map(frame_for)
+}
+
+fn frame_for(lease: shared_gpu::Lease) -> Gpu {
+    let shared = lease.gpu;
+    let device = &shared.device;
+    {
         let target = |format, usage| {
             device.create_texture(&wgpu::TextureDescriptor {
                 label: None,
@@ -54,23 +72,24 @@ fn gpu() -> Option<Gpu> {
             wgpu::TextureFormat::Depth32Float,
             wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
         );
-        Some(Gpu {
+        Gpu {
             color_view: color.create_view(&Default::default()),
             depth_view: depth.create_view(&Default::default()),
             color,
-            instance,
+            instance: &shared.instance,
             device,
-            queue,
-        })
-    })
+            queue: &shared.queue,
+            _lease: lease,
+        }
+    }
 }
 
 impl Gpu {
     fn frame(&self, renderer: &mut SceneRenderer, world: &FlintWorld) -> Vec<u8> {
-        renderer.update_from_world(world, &self.device);
+        renderer.update_from_world(world, self.device);
         renderer.render_to(
-            &self.device,
-            &self.queue,
+            self.device,
+            self.queue,
             &self.depth_view,
             &Camera::default(),
             &self.color_view,
@@ -128,8 +147,8 @@ fn a_display_style_inverts_the_frame_and_lets_it_go() {
         return;
     };
     let mut renderer = SceneRenderer::new_headless(
-        &gpu.device,
-        &gpu.queue,
+        gpu.device,
+        gpu.queue,
         FORMAT,
         SIZE,
         SIZE,
@@ -142,7 +161,7 @@ fn a_display_style_inverts_the_frame_and_lets_it_go() {
         let mut config = renderer.post_process_config().clone();
         f(&mut config);
         renderer.set_post_process_config(config);
-        renderer.ensure_style_resources(&gpu.device);
+        renderer.ensure_style_resources(gpu.device);
     };
 
     // On: the negative of every pixel, alpha kept. The style inverts
@@ -163,14 +182,14 @@ fn a_display_style_inverts_the_frame_and_lets_it_go() {
 
     // A resize rebuilds the chain's targets; the style still draws.
     set(&mut renderer, &|c| c.styles.set_enabled("invert", true));
-    renderer.resize_postprocess(&gpu.device, SIZE, SIZE);
+    renderer.resize_postprocess(gpu.device, SIZE, SIZE);
     assert_eq!(gpu.frame(&mut renderer, &world), inverted);
 
     // A host that only sets the config (no ensure call) still gets the
     // style: the frame builds it.
     let mut fresh = SceneRenderer::new_headless(
-        &gpu.device,
-        &gpu.queue,
+        gpu.device,
+        gpu.queue,
         FORMAT,
         SIZE,
         SIZE,
@@ -193,6 +212,224 @@ fn a_display_style_inverts_the_frame_and_lets_it_go() {
     }
 }
 
+/// A style from outside the engine (#419): this test crate is another
+/// crate, so everything below is public API. Two passes: the first fills a
+/// target of the style's own with one colour, the second draws that target.
+mod game_style {
+    use bytemuck::{Pod, Zeroable};
+    use flint_render::stylize::{
+        kit, StyleDescriptor, StyleDevice, StyleFrame, StyleInput, StyleParam, StylePass,
+        StyleStage,
+    };
+
+    pub static TWO_PASS: StyleDescriptor = StyleDescriptor::new(
+        "utest_game_two_pass",
+        "Two pass",
+        StyleStage::Display,
+        create,
+    )
+    .params(&[StyleParam::new("level", 0.5, 0.0..=1.0)]);
+
+    const WGSL: &str = r#"
+struct U { level: f32, _p0: f32, _p1: f32, _p2: f32 };
+@group(0) @binding(0) var<uniform> u: U;
+@group(1) @binding(0) var t: texture_2d<f32>;
+@group(1) @binding(1) var s: sampler;
+struct V { @builtin(position) p: vec4<f32>, @location(0) uv: vec2<f32> };
+@vertex fn vs_main(@builtin(vertex_index) i: u32) -> V {
+    let uv = vec2<f32>(f32((i << 1u) & 2u), f32(i & 2u));
+    return V(vec4<f32>(uv * 2.0 - 1.0, 0.0, 1.0), vec2<f32>(uv.x, 1.0 - uv.y));
+}
+@fragment fn fs_fill(v: V) -> @location(0) vec4<f32> {
+    return vec4<f32>(u.level, 0.25, 0.75, 1.0);
+}
+@fragment fn fs_draw(v: V) -> @location(0) vec4<f32> {
+    return textureSample(t, s, v.uv);
+}
+"#;
+
+    #[repr(C)]
+    #[derive(Copy, Clone, Pod, Zeroable)]
+    struct U {
+        level: f32,
+        _p: [f32; 3],
+    }
+
+    struct TwoPass {
+        fill: wgpu::RenderPipeline,
+        draw: wgpu::RenderPipeline,
+        uniforms: wgpu::Buffer,
+        uniform_bgl: wgpu::BindGroupLayout,
+        sampled_bgl: wgpu::BindGroupLayout,
+    }
+
+    const FILL_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+
+    fn create(d: &StyleDevice) -> Box<dyn StylePass> {
+        let uniform_bgl = kit::uniform_layout(d.device, "TwoPass U");
+        let sampled_bgl = kit::sampled_layout(d.device, "TwoPass S");
+        let module = kit::shader(d.device, "TwoPass", WGSL);
+        Box::new(TwoPass {
+            fill: kit::fullscreen_pipeline_entry(
+                d.device,
+                "TwoPass Fill",
+                &module,
+                "fs_fill",
+                &[&uniform_bgl],
+                FILL_FORMAT,
+            ),
+            draw: kit::fullscreen_pipeline_entry(
+                d.device,
+                "TwoPass Draw",
+                &module,
+                "fs_draw",
+                &[&uniform_bgl, &sampled_bgl],
+                d.format,
+            ),
+            uniforms: kit::uniform_buffer::<U>(d.device, "TwoPass Uniforms"),
+            uniform_bgl,
+            sampled_bgl,
+        })
+    }
+
+    impl StylePass for TwoPass {
+        fn encode(
+            &self,
+            frame: &StyleFrame<'_>,
+            encoder: &mut wgpu::CommandEncoder,
+            _input: &StyleInput<'_>,
+            output: &wgpu::TextureView,
+        ) {
+            let u = U {
+                level: frame.param("level"),
+                _p: [0.0; 3],
+            };
+            frame
+                .queue
+                .write_buffer(&self.uniforms, 0, bytemuck::cast_slice(&[u]));
+            let target = frame.target("utest_game_two_pass.fill", FILL_FORMAT);
+            let params = frame.uniform("TwoPass U BG", &self.uniform_bgl, &self.uniforms);
+            kit::fullscreen_pass(
+                encoder,
+                "TwoPass Fill",
+                &target.view,
+                &self.fill,
+                &[&params],
+            );
+            let sampled = frame.sampled("TwoPass S BG", &self.sampled_bgl, &target.view);
+            kit::fullscreen_pass(
+                encoder,
+                "TwoPass Draw",
+                output,
+                &self.draw,
+                &[&params, &sampled],
+            );
+        }
+    }
+}
+
+/// #419: a style registered from another crate is switched on by a scene
+/// table's settings and by a `--style` word, and draws both its passes.
+#[test]
+fn a_style_registered_from_another_crate_draws_its_two_passes() {
+    let Some(gpu) = gpu() else {
+        flint_render::gpu_select::skip_without_gpu("no GPU adapter");
+        return;
+    };
+    flint_render::stylize::register(&game_style::TWO_PASS).unwrap();
+    let mut renderer = SceneRenderer::new_headless(
+        gpu.device,
+        gpu.queue,
+        FORMAT,
+        SIZE,
+        SIZE,
+        RendererConfig::default(),
+    );
+    let world = FlintWorld::new();
+    let plain = gpu.frame(&mut renderer, &world);
+
+    // As a scene says it
+    let tables: std::collections::BTreeMap<String, toml::Table> =
+        toml::from_str("[utest_game_two_pass]\nlevel = 1.0\n").unwrap();
+    let (styles, warnings) = flint_render::stylize::StyleSettings::from_tables(&tables);
+    assert!(warnings.is_empty(), "{warnings:?}");
+    let mut config = renderer.post_process_config().clone();
+    config.styles = styles;
+    renderer.set_post_process_config(config);
+    let drawn = gpu.frame(&mut renderer, &world);
+    assert_ne!(drawn, plain);
+    // Linear (1, 0.25, 0.75) on an sRGB target
+    let want = [255u8, 137, 225, 255];
+    for (i, px) in drawn.chunks(4).enumerate() {
+        for c in 0..4 {
+            assert!(
+                px[c].abs_diff(want[c]) <= 1,
+                "pixel {i}: {px:?}, want {want:?}"
+            );
+        }
+    }
+
+    // As a `--style` word says it, over the defaults
+    let mut config = flint_render::PostProcessConfig::default();
+    let errors =
+        flint_render::stylize::apply_style_specs(&mut config, &["utest_game_two_pass".into()]);
+    assert!(errors.is_empty(), "{errors:?}");
+    renderer.set_post_process_config(config);
+    let drawn = gpu.frame(&mut renderer, &world);
+    // level 0.5 linear is 188 in sRGB
+    assert!(drawn[0].abs_diff(188) <= 1, "{:?}", &drawn[..4]);
+}
+
+fn panics_building(
+    _: &flint_render::stylize::StyleDevice,
+) -> Box<dyn flint_render::stylize::StylePass> {
+    panic!("a game's broken create (test)")
+}
+
+static BROKEN_GAME_STYLE: flint_render::stylize::StyleDescriptor =
+    flint_render::stylize::StyleDescriptor::new(
+        "utest_game_broken",
+        "Broken",
+        flint_render::stylize::StyleStage::Display,
+        panics_building,
+    );
+
+/// #419: a game style whose `create` panics is the game's bug. It is
+/// switched off in the config as set (not only in the one drawn, which the
+/// next quality change rebuilds from) and the renderer keeps drawing.
+#[test]
+fn a_game_style_that_panics_building_is_switched_off() {
+    let Some(gpu) = gpu() else {
+        flint_render::gpu_select::skip_without_gpu("no GPU adapter");
+        return;
+    };
+    flint_render::stylize::register(&BROKEN_GAME_STYLE).unwrap();
+    let mut renderer = SceneRenderer::new_headless(
+        gpu.device,
+        gpu.queue,
+        FORMAT,
+        SIZE,
+        SIZE,
+        RendererConfig::default(),
+    );
+    let world = FlintWorld::new();
+    let plain = gpu.frame(&mut renderer, &world);
+    let mut config = renderer.post_process_config().clone();
+    config.styles.set_enabled("utest_game_broken", true);
+    renderer.set_post_process_config(config);
+    renderer.ensure_style_resources(gpu.device);
+    assert!(!renderer
+        .post_process_config()
+        .styles
+        .is_enabled("utest_game_broken"));
+    assert!(!renderer
+        .effective_post_process_config()
+        .styles
+        .is_enabled("utest_game_broken"));
+    // Not a lost device: the frame still draws, as it did without the style
+    assert_eq!(gpu.frame(&mut renderer, &world), plain);
+}
+
 #[test]
 fn hdr_and_display_styles_chain_in_one_frame() {
     let Some(gpu) = gpu() else {
@@ -200,8 +437,8 @@ fn hdr_and_display_styles_chain_in_one_frame() {
         return;
     };
     let mut renderer = SceneRenderer::new_headless(
-        &gpu.device,
-        &gpu.queue,
+        gpu.device,
+        gpu.queue,
         FORMAT,
         SIZE,
         SIZE,
@@ -211,14 +448,14 @@ fn hdr_and_display_styles_chain_in_one_frame() {
     let mut config = renderer.post_process_config().clone();
     config.styles.set_enabled("kuwahara", true);
     renderer.set_post_process_config(config.clone());
-    renderer.ensure_style_resources(&gpu.device);
+    renderer.ensure_style_resources(gpu.device);
     let painted = gpu.frame(&mut renderer, &world);
 
     config.styles.set_enabled("invert", true);
     config.fxaa_enabled = true;
     renderer.set_post_process_config(config);
-    renderer.ensure_style_resources(&gpu.device);
-    renderer.ensure_fxaa_resources(&gpu.device);
+    renderer.ensure_style_resources(gpu.device);
+    renderer.ensure_fxaa_resources(gpu.device);
     // Two frames: the second reuses every bind group the first made
     gpu.frame(&mut renderer, &world);
     let both = gpu.frame(&mut renderer, &world);
@@ -247,8 +484,8 @@ fn display_styles_with_fxaa_hold_two_full_size_textures() {
         &["ascii", "pencil", "invert"],
     ] {
         let mut renderer = SceneRenderer::new_headless(
-            &gpu.device,
-            &gpu.queue,
+            gpu.device,
+            gpu.queue,
             FORMAT,
             SIZE,
             SIZE,
@@ -261,8 +498,8 @@ fn display_styles_with_fxaa_hold_two_full_size_textures() {
         }
         config.fxaa_enabled = true;
         renderer.set_post_process_config(config);
-        renderer.ensure_style_resources(&gpu.device);
-        renderer.ensure_fxaa_resources(&gpu.device);
+        renderer.ensure_style_resources(gpu.device);
+        renderer.ensure_fxaa_resources(gpu.device);
         gpu.frame(&mut renderer, &world);
         let drawn = gpu.frame(&mut renderer, &world);
         let stats = renderer.collect_stats();
@@ -277,6 +514,66 @@ fn display_styles_with_fxaa_hold_two_full_size_textures() {
     }
 }
 
+/// #297: FXAA switched on through the config alone, as the viewer's scene
+/// load, F11 toggle and hot reload do, is drawn on the next frame, the
+/// same as when the host builds it first; and so is FXAA turned on after
+/// frames drew without it. Before, the frame drew no FXAA until a resize.
+#[test]
+fn fxaa_set_by_the_config_alone_is_drawn() {
+    let Some(gpu) = gpu() else {
+        flint_render::gpu_select::skip_without_gpu("no GPU adapter");
+        return;
+    };
+    let world = box_world();
+    // How many bytes two frames differ in
+    let differ = |a: &[u8], b: &[u8]| a.iter().zip(b).filter(|(x, y)| x != y).count();
+    let renderer = || {
+        SceneRenderer::new_headless(
+            gpu.device,
+            gpu.queue,
+            FORMAT,
+            SIZE,
+            SIZE,
+            RendererConfig::default(),
+        )
+    };
+    let with_fxaa = |renderer: &mut SceneRenderer, on: bool| {
+        let mut config = renderer.post_process_config().clone();
+        config.fxaa_enabled = on;
+        renderer.set_post_process_config(config);
+    };
+
+    let mut plain = renderer();
+    with_fxaa(&mut plain, false);
+    let without = gpu.frame(&mut plain, &world);
+    assert_eq!(plain.collect_stats().full_size_targets, 0);
+
+    // The host builds it, as F4 does: the reference
+    let mut built = renderer();
+    with_fxaa(&mut built, true);
+    built.ensure_fxaa_resources(gpu.device);
+    let reference = gpu.frame(&mut built, &world);
+    let smoothed = differ(&without, &reference);
+    assert!(smoothed > 0, "FXAA changed none of the cube's edges");
+
+    // The config alone, from the first frame (a scene load)
+    let mut loaded = renderer();
+    with_fxaa(&mut loaded, true);
+    let on_load = gpu.frame(&mut loaded, &world);
+    assert_eq!(differ(&on_load, &reference), 0, "on load");
+    assert_eq!(loaded.collect_stats().full_size_targets, 1);
+
+    // Off, then on by the config (F11, a hot reload)
+    let mut reloaded = renderer();
+    with_fxaa(&mut reloaded, false);
+    let off = gpu.frame(&mut reloaded, &world);
+    assert_eq!(differ(&off, &without), 0, "off");
+    with_fxaa(&mut reloaded, true);
+    let later = gpu.frame(&mut reloaded, &world);
+    assert_eq!(differ(&later, &reference), 0, "turned on later");
+    println!("FXAA smooths {smoothed} of {} bytes", without.len());
+}
+
 /// #299: two styles of one stage in the two orders draw two pictures, and
 /// a scene that orders nothing draws what registration order always drew.
 #[test]
@@ -288,8 +585,8 @@ fn an_authored_order_rearranges_a_stage() {
     // A fresh renderer per frame, so ASCII's cell history starts clean
     let draw = |orders: Option<(f32, f32)>| {
         let mut renderer = SceneRenderer::new_headless(
-            &gpu.device,
-            &gpu.queue,
+            gpu.device,
+            gpu.queue,
             FORMAT,
             SIZE,
             SIZE,
@@ -303,7 +600,7 @@ fn an_authored_order_rearranges_a_stage() {
             config.styles.set_order("invert", Some(invert));
         }
         renderer.set_post_process_config(config);
-        renderer.ensure_style_resources(&gpu.device);
+        renderer.ensure_style_resources(gpu.device);
         gpu.frame(&mut renderer, &FlintWorld::new())
     };
     let default = draw(None);
@@ -340,8 +637,8 @@ fn ascii_draws_one_glyph_per_cell_on_one_grid() {
         return;
     };
     let mut renderer = SceneRenderer::new_headless(
-        &gpu.device,
-        &gpu.queue,
+        gpu.device,
+        gpu.queue,
         FORMAT,
         SIZE,
         SIZE,
@@ -358,7 +655,7 @@ fn ascii_draws_one_glyph_per_cell_on_one_grid() {
     let mut config = renderer.post_process_config().clone();
     config.styles.set_enabled("ascii", true);
     renderer.set_post_process_config(config.clone());
-    renderer.ensure_style_resources(&gpu.device);
+    renderer.ensure_style_resources(gpu.device);
     let glyphs = gpu.frame(&mut renderer, &world);
     assert_ne!(glyphs, plain, "the style drew nothing");
 
@@ -406,6 +703,97 @@ fn ascii_draws_one_glyph_per_cell_on_one_grid() {
     assert_ne!(block(&gpu.frame(&mut renderer, &world), 8, 0, 0), first);
 }
 
+#[test]
+fn a_calibrated_ramp_draws_the_glyph_its_cpu_pick_names() {
+    // #281: the shader's `ramp_step` over the `ramp_tone` table picks what
+    // `GlyphRamp::pick` does. With contrast 0 the tone is 0.5 + brightness
+    // everywhere, so each frame is one glyph over the whole grid
+    let Some(gpu) = gpu() else {
+        flint_render::gpu_select::skip_without_gpu("no GPU adapter");
+        return;
+    };
+    use flint_core::vfs::{self, MemorySource};
+    let classic = " .:-=+*#%@";
+    let calibrated = flint_render::GlyphSet::builtin()
+        .ramp("classic")
+        .unwrap()
+        .calibrated();
+    let order: String = calibrated.glyphs().iter().collect();
+    let mut src = MemorySource::new();
+    src.insert(
+        "fonts/cal.glyphs.toml",
+        format!("[ramps.r]\nglyphs = \"{classic}\"\nmap = \"coverage\"\n"),
+    );
+    // The same glyphs, written in the calibrated order on equal bands: the
+    // reference that names each glyph by its band's centre
+    src.insert(
+        "fonts/ref.glyphs.toml",
+        format!("[ramps.r]\nglyphs = \"{order}\"\n"),
+    );
+    vfs::scoped(std::sync::Arc::new(src), || {
+        let world = FlintWorld::new();
+        let mut renderer = SceneRenderer::new_headless(
+            gpu.device,
+            gpu.queue,
+            FORMAT,
+            SIZE,
+            SIZE,
+            RendererConfig::default(),
+        );
+        let mut config = renderer.post_process_config().clone();
+        config.styles.set_enabled("ascii", true);
+        for (k, v) in [
+            ("contrast", 0.0),
+            ("hysteresis", 0.0),
+            ("smoothing", 0.0),
+            ("dither", 0.0),
+            ("edges", 0.0),
+            ("glow", 0.0),
+        ] {
+            config.styles.set_param("ascii", k, v);
+        }
+        config.styles.set_option("ascii", "ramp", "r");
+        config.styles.set_option("ascii", "color", "tint");
+        config.styles.set_option("ascii", "ground", "black");
+        renderer.ensure_style_resources(gpu.device);
+        let mut draw = |font: &str, tone: f32| -> Vec<bool> {
+            let mut c = config.clone();
+            c.styles.set_option("ascii", "font", font);
+            c.styles.set_param("ascii", "brightness", tone - 0.5);
+            renderer.set_post_process_config(c);
+            renderer.reset_style_history();
+            let frame = gpu.frame(&mut renderer, &world);
+            block(&frame, 8, 3, 3)
+                .chunks(4)
+                .map(|p| p[..3] != [0, 0, 0])
+                .collect()
+        };
+        let n = calibrated.len();
+        let reference: Vec<Vec<bool>> = (0..n)
+            .map(|i| draw("ref", (i as f32 + 0.5) / n as f32))
+            .collect();
+        let mut seen = std::collections::BTreeSet::new();
+        let bounds = calibrated.bounds();
+        for i in 0..=40 {
+            let tone = i as f32 / 40.0;
+            // A tone on a band's edge is either side of it after the
+            // shader's arithmetic
+            if bounds.iter().any(|b| (b - tone).abs() < 1e-3) {
+                continue;
+            }
+            let want = calibrated.step(tone);
+            seen.insert(want);
+            assert_eq!(
+                draw("cal", tone),
+                reference[want],
+                "tone {tone}: the CPU picks {:?}",
+                calibrated.glyphs()[want]
+            );
+        }
+        assert!(seen.len() >= 8, "the sweep crossed most bands: {seen:?}");
+    });
+}
+
 /// The distinct RGB colours of an RGBA8 frame.
 fn colours(pixels: &[u8]) -> std::collections::BTreeSet<[u8; 3]> {
     pixels.chunks(4).map(|p| [p[0], p[1], p[2]]).collect()
@@ -428,8 +816,8 @@ fn ascii_palette_modes_draw_only_the_palettes_colours() {
         return;
     };
     let mut renderer = SceneRenderer::new_headless(
-        &gpu.device,
-        &gpu.queue,
+        gpu.device,
+        gpu.queue,
         FORMAT,
         SIZE,
         SIZE,
@@ -452,7 +840,7 @@ fn ascii_palette_modes_draw_only_the_palettes_colours() {
         config.styles.set_option("ascii", "palette", palette);
         config.styles.set_option("ascii", "ground", ground);
         renderer.set_post_process_config(config.clone());
-        renderer.ensure_style_resources(&gpu.device);
+        renderer.ensure_style_resources(gpu.device);
         let frame = gpu.frame(&mut renderer, &world);
         let allowed = hex_bytes(&Palette::builtin(palette).unwrap());
         let seen = colours(&frame);
@@ -543,7 +931,7 @@ fn the_palette_matcher_agrees_with_its_cpu_reference() {
         eprintln!("no GPU adapter; skipping");
         return;
     };
-    let device = &gpu.device;
+    let device = gpu.device;
     let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("palette harness"),
         source: wgpu::ShaderSource::Wgsl(format!("{PALETTE_WGSL}\n{PALETTE_HARNESS}").into()),
@@ -706,8 +1094,8 @@ fn ascii_holds_its_glyphs_still_under_a_wobbling_camera() {
 
     let run = |temporal: &str| -> Vec<Vec<u8>> {
         let mut renderer = SceneRenderer::new_headless(
-            &gpu.device,
-            &gpu.queue,
+            gpu.device,
+            gpu.queue,
             FORMAT,
             SIZE,
             SIZE,
@@ -717,7 +1105,7 @@ fn ascii_holds_its_glyphs_still_under_a_wobbling_camera() {
         config.styles.set_enabled("ascii", true);
         config.styles.set_option("ascii", "temporal", temporal);
         renderer.set_post_process_config(config);
-        renderer.ensure_style_resources(&gpu.device);
+        renderer.ensure_style_resources(gpu.device);
         (0..24)
             .map(|i| {
                 // A camera that wobbles back and forth by a fraction of a
@@ -726,10 +1114,10 @@ fn ascii_holds_its_glyphs_still_under_a_wobbling_camera() {
                 let wobble = if i % 2 == 0 { 0.0 } else { WOBBLE };
                 camera.target.x += wobble;
                 camera.target.y += wobble;
-                renderer.update_from_world(&world, &gpu.device);
+                renderer.update_from_world(&world, gpu.device);
                 renderer.render_to(
-                    &gpu.device,
-                    &gpu.queue,
+                    gpu.device,
+                    gpu.queue,
                     &gpu.depth_view,
                     &camera,
                     &gpu.color_view,
@@ -790,7 +1178,7 @@ fn cell_means(frame: &[u8]) -> Vec<[f32; 3]> {
 
 #[test]
 fn reprojected_history_reads_the_past_of_the_surface_now_in_the_cell() {
-    let Some(gpu) = gpu() else {
+    let Some(gpu) = gpu_alone() else {
         flint_render::gpu_select::skip_without_gpu("no GPU adapter");
         return;
     };
@@ -836,8 +1224,8 @@ fn reprojected_history_reads_the_past_of_the_surface_now_in_the_cell() {
     // itself last showed the other colour
     let run = |temporal: &str| -> Vec<Vec<u8>> {
         let mut renderer = SceneRenderer::new_headless(
-            &gpu.device,
-            &gpu.queue,
+            gpu.device,
+            gpu.queue,
             FORMAT,
             SIZE,
             SIZE,
@@ -851,7 +1239,7 @@ fn reprojected_history_reads_the_past_of_the_surface_now_in_the_cell() {
         config.styles.set_param("ascii", "smoothing", 0.95);
         config.styles.set_param("ascii", "hysteresis", 0.0);
         renderer.set_post_process_config(config);
-        renderer.ensure_style_resources(&gpu.device);
+        renderer.ensure_style_resources(gpu.device);
         [0.0f32, 2.0]
             .iter()
             .map(|&x| {
@@ -860,10 +1248,10 @@ fn reprojected_history_reads_the_past_of_the_surface_now_in_the_cell() {
                     target: flint_core::Vec3::new(x, 0.0, 0.0),
                     ..Camera::default()
                 };
-                renderer.update_from_world(&world, &gpu.device);
+                renderer.update_from_world(&world, gpu.device);
                 renderer.render_to(
-                    &gpu.device,
-                    &gpu.queue,
+                    gpu.device,
+                    gpu.queue,
                     &gpu.depth_view,
                     &camera,
                     &gpu.color_view,
@@ -944,8 +1332,8 @@ fn the_callers_depth_with_an_id_makes_no_bind_groups_a_frame() {
     flint_render::entity_style::set_entity_style(&mut world, cube, "ascii").unwrap();
 
     let mut renderer = SceneRenderer::new_headless(
-        &gpu.device,
-        &gpu.queue,
+        gpu.device,
+        gpu.queue,
         FORMAT,
         SIZE,
         SIZE,
@@ -956,10 +1344,10 @@ fn the_callers_depth_with_an_id_makes_no_bind_groups_a_frame() {
     renderer.set_post_process_config(config);
 
     let frame = |renderer: &mut SceneRenderer, depth: flint_render::DepthTarget<'_>| {
-        renderer.update_from_world(&world, &gpu.device);
+        renderer.update_from_world(&world, gpu.device);
         renderer.render_to(
-            &gpu.device,
-            &gpu.queue,
+            gpu.device,
+            gpu.queue,
             depth,
             &Camera::default(),
             &gpu.color_view,
@@ -982,22 +1370,28 @@ fn the_callers_depth_with_an_id_makes_no_bind_groups_a_frame() {
     );
     let (made_bare, bare_pixels) = per_frame(&mut renderer, bare);
 
-    // An id: the first frame makes them, the next ones none
+    // An id: the first two frames make them, the next ones none. Two, not
+    // one: ASCII's cell history (#277) ping-pongs a pair of textures, and
+    // its group over the depth binds the side it reads, so the second side
+    // is first bound on the second frame (#572)
     let id = flint_render::new_depth_id();
     let keyed = flint_render::DepthTarget::new(&gpu.depth_view, id);
     let (made_first, _) = per_frame(&mut renderer, keyed);
+    let (made_second, _) = per_frame(&mut renderer, keyed);
+    let made_warm = made_first + made_second;
     let kept = renderer.kept_post_binds();
     let steady: Vec<u64> = (0..8).map(|_| per_frame(&mut renderer, keyed).0).collect();
     let (_, keyed_pixels) = per_frame(&mut renderer, keyed);
 
     // A new depth texture (a resize, say) comes with a new id: made once
-    // again, and the old id's groups dropped rather than piled up
+    // again over the same two frames, and the old id's groups dropped
+    // rather than piled up
     let next = flint_render::DepthTarget::new(&gpu.depth_view, flint_render::new_depth_id());
-    let (made_next, _) = per_frame(&mut renderer, next);
+    let made_next = per_frame(&mut renderer, next).0 + per_frame(&mut renderer, next).0;
     let (made_after, _) = per_frame(&mut renderer, next);
     eprintln!(
-        "bind groups a frame: bare {made_bare}, keyed first {made_first} then {steady:?}, \
-         new id {made_next} then {made_after}; kept {kept} -> {}",
+        "bind groups a frame: bare {made_bare}, keyed first {made_first} + {made_second} then \
+         {steady:?}, new id {made_next} then {made_after}; kept {kept} -> {}",
         renderer.kept_post_binds()
     );
     assert!(
@@ -1006,14 +1400,18 @@ fn the_callers_depth_with_an_id_makes_no_bind_groups_a_frame() {
     );
     // A bare frame makes a group at each use, and some are used twice
     assert!(
-        (1..=made_bare).contains(&made_first),
-        "the first keyed frame makes each group once"
+        (1..=made_bare).contains(&made_warm),
+        "the first two keyed frames make each group once, made {made_first} + {made_second}"
+    );
+    assert!(
+        made_second <= 1,
+        "only the history's second side waits for the second frame, made {made_second}"
     );
     assert!(
         steady.iter().all(|&n| n == 0),
         "a steady keyed frame made bind groups: {steady:?}"
     );
-    assert_eq!(made_next, made_first, "a new id remakes each group once");
+    assert_eq!(made_next, made_warm, "a new id remakes each group once");
     assert_eq!(made_after, 0);
     assert_eq!(
         renderer.kept_post_binds(),
@@ -1028,7 +1426,7 @@ fn the_callers_depth_with_an_id_makes_no_bind_groups_a_frame() {
 
 #[test]
 fn a_script_set_style_animates_without_allocating_and_clears_exactly() {
-    let Some(gpu) = gpu() else {
+    let Some(gpu) = gpu_alone() else {
         flint_render::gpu_select::skip_without_gpu("no GPU adapter");
         return;
     };
@@ -1046,8 +1444,8 @@ fn a_script_set_style_animates_without_allocating_and_clears_exactly() {
     world.set_component(cube, "bounds", bounds.into()).unwrap();
 
     let mut renderer = SceneRenderer::new_headless(
-        &gpu.device,
-        &gpu.queue,
+        gpu.device,
+        gpu.queue,
         FORMAT,
         SIZE,
         SIZE,
@@ -1107,7 +1505,7 @@ fn a_script_set_style_animates_without_allocating_and_clears_exactly() {
 
 #[test]
 fn a_blend_fades_and_dissolves_an_entity_into_ascii() {
-    let Some(gpu) = gpu() else {
+    let Some(gpu) = gpu_alone() else {
         flint_render::gpu_select::skip_without_gpu("no GPU adapter");
         return;
     };
@@ -1125,8 +1523,8 @@ fn a_blend_fades_and_dissolves_an_entity_into_ascii() {
     bounds.insert("max".into(), vec3([2.5, 2.5, 2.5]));
     world.set_component(cube, "bounds", bounds.into()).unwrap();
     let mut renderer = SceneRenderer::new_headless(
-        &gpu.device,
-        &gpu.queue,
+        gpu.device,
+        gpu.queue,
         FORMAT,
         SIZE,
         SIZE,
@@ -1232,7 +1630,7 @@ fn a_blend_fades_and_dissolves_an_entity_into_ascii() {
 /// cross-fade isn't drawn at all, and a ramp allocates nothing.
 #[test]
 fn a_style_with_no_blend_code_fades_by_the_framework() {
-    let Some(gpu) = gpu() else {
+    let Some(gpu) = gpu_alone() else {
         flint_render::gpu_select::skip_without_gpu("no GPU adapter");
         return;
     };
@@ -1250,8 +1648,8 @@ fn a_style_with_no_blend_code_fades_by_the_framework() {
     bounds.insert("max".into(), vec3([2.5, 2.5, 2.5]));
     world.set_component(cube, "bounds", bounds.into()).unwrap();
     let mut renderer = SceneRenderer::new_headless(
-        &gpu.device,
-        &gpu.queue,
+        gpu.device,
+        gpu.queue,
         FORMAT,
         SIZE,
         SIZE,
@@ -1338,8 +1736,8 @@ fn a_small_props_dissolve_turns_blend_of_its_cells_wherever_it_sits() {
     const CELL: usize = 4;
     let vec3 = |v: [f64; 3]| toml::Value::Array(v.iter().map(|&x| x.into()).collect());
     let mut renderer = SceneRenderer::new_headless(
-        &gpu.device,
-        &gpu.queue,
+        gpu.device,
+        gpu.queue,
         FORMAT,
         SIZE,
         SIZE,
@@ -1468,8 +1866,8 @@ fn two_entities_draw_in_two_glyph_sets_in_one_frame() {
             set_style_param(&mut world, id, "min_coverage", 0.0.into()).unwrap();
         }
         let mut renderer = SceneRenderer::new_headless(
-            &gpu.device,
-            &gpu.queue,
+            gpu.device,
+            gpu.queue,
             FORMAT,
             SIZE,
             SIZE,
@@ -1574,8 +1972,8 @@ fn a_cell_silhouette_draws_every_edge_cell_whole_or_not_at_all() {
     };
     use flint_render::entity_style::{set_entity_style, set_style_param};
     let mut renderer = SceneRenderer::new_headless(
-        &gpu.device,
-        &gpu.queue,
+        gpu.device,
+        gpu.queue,
         FORMAT,
         SIZE,
         SIZE,
@@ -1664,7 +2062,7 @@ fn coloured(pixels: &[u8]) -> Vec<bool> {
 /// once, and a frame where none asks draws it not at all.
 #[test]
 fn two_styles_share_one_edge_pass_a_frame() {
-    let Some(gpu) = gpu() else {
+    let Some(gpu) = gpu_alone() else {
         flint_render::gpu_select::skip_without_gpu("no GPU adapter");
         return;
     };
@@ -1690,8 +2088,8 @@ fn two_styles_share_one_edge_pass_a_frame() {
 
     let world = box_world();
     let mut renderer = SceneRenderer::new_headless(
-        &gpu.device,
-        &gpu.queue,
+        gpu.device,
+        gpu.queue,
         FORMAT,
         SIZE,
         SIZE,
@@ -1701,7 +2099,7 @@ fn two_styles_share_one_edge_pass_a_frame() {
         let mut config = renderer.post_process_config().clone();
         f(&mut config);
         renderer.set_post_process_config(config);
-        renderer.ensure_style_resources(&gpu.device);
+        renderer.ensure_style_resources(gpu.device);
     };
 
     // No style asks: no pass
@@ -1785,7 +2183,7 @@ fn two_styles_share_one_edge_pass_a_frame() {
 /// its own pixels as `params`: three boxes, three `glow`s, one frame.
 #[test]
 fn a_user_style_takes_settings_per_entity() {
-    let Some(gpu) = gpu() else {
+    let Some(gpu) = gpu_alone() else {
         flint_render::gpu_select::skip_without_gpu("no GPU adapter");
         return;
     };
@@ -1830,8 +2228,8 @@ fn a_user_style_takes_settings_per_entity() {
         boxes.push(e);
     }
     let mut renderer = SceneRenderer::new_headless(
-        &gpu.device,
-        &gpu.queue,
+        gpu.device,
+        gpu.queue,
         FORMAT,
         SIZE,
         SIZE,
@@ -1868,8 +2266,8 @@ fn a_user_style_takes_settings_per_entity() {
             .is_enabled("utest_glow"),
         "the scene has no table for it"
     );
-    renderer.update_from_world(&world, &gpu.device);
-    renderer.ensure_style_resources(&gpu.device);
+    renderer.update_from_world(&world, gpu.device);
+    renderer.ensure_style_resources(gpu.device);
     let styled = gpu.frame(&mut renderer, &world);
 
     // Each box in its own glow (display values; 6 levels for the sRGB
@@ -1934,8 +2332,8 @@ fn the_edges_debug_view_shows_sources_and_cells_and_lets_go() {
     };
     let world = box_world();
     let mut renderer = SceneRenderer::new_headless(
-        &gpu.device,
-        &gpu.queue,
+        gpu.device,
+        gpu.queue,
         FORMAT,
         SIZE,
         SIZE,
@@ -2017,8 +2415,8 @@ fn glass_in_front_of_a_styled_entity_unmasks_it_by_its_coverage() {
             .unwrap();
     };
     let mut renderer = SceneRenderer::new_headless(
-        &gpu.device,
-        &gpu.queue,
+        gpu.device,
+        gpu.queue,
         FORMAT,
         SIZE,
         SIZE,
@@ -2137,8 +2535,8 @@ fn per_entity_styles_scissored_to_their_props_draw_the_same_bytes() {
         world.set_component(id, "bounds", bounds.into()).unwrap();
     }
     let mut renderer = SceneRenderer::new_headless(
-        &gpu.device,
-        &gpu.queue,
+        gpu.device,
+        gpu.queue,
         FORMAT,
         SIZE,
         SIZE,
@@ -2220,8 +2618,8 @@ fn a_styled_terrain_is_masked_around_the_props_on_it() {
     let ground = world.spawn("ground").unwrap();
     boxed(&mut world, "cube", 2.5, 2.5, None);
     let mut renderer = SceneRenderer::new_headless(
-        &gpu.device,
-        &gpu.queue,
+        gpu.device,
+        gpu.queue,
         FORMAT,
         SIZE,
         SIZE,
@@ -2229,8 +2627,8 @@ fn a_styled_terrain_is_masked_around_the_props_on_it() {
     );
     let no_textures: [String; 4] = Default::default();
     renderer.load_terrain(
-        &gpu.device,
-        &gpu.queue,
+        gpu.device,
+        gpu.queue,
         &[flat_chunk(40.0)],
         &flint_core::Transform::default(),
         1.0,
@@ -2277,8 +2675,8 @@ fn a_styled_transparent_styles_what_is_seen_through_it() {
     boxed(&mut world, "glass", 2.5, 2.5, Some(0.4));
     let glass = world.get_id("glass").unwrap();
     let mut renderer = SceneRenderer::new_headless(
-        &gpu.device,
-        &gpu.queue,
+        gpu.device,
+        gpu.queue,
         FORMAT,
         SIZE,
         SIZE,
@@ -2320,8 +2718,8 @@ fn the_mask_buffer_fits_the_scene_and_masks_every_styled_draw() {
         toml::Value::Table(t)
     };
     let mut renderer = SceneRenderer::new_headless(
-        &gpu.device,
-        &gpu.queue,
+        gpu.device,
+        gpu.queue,
         FORMAT,
         SIZE,
         SIZE,
@@ -2412,8 +2810,8 @@ fn the_palette_style_quantizes_the_frame_to_its_table() {
         return;
     };
     let mut renderer = SceneRenderer::new_headless(
-        &gpu.device,
-        &gpu.queue,
+        gpu.device,
+        gpu.queue,
         FORMAT,
         SIZE,
         SIZE,
@@ -2437,7 +2835,7 @@ fn the_palette_style_quantizes_the_frame_to_its_table() {
         config.styles.set_param("palette", "dither", dither);
         config.styles.set_param("palette", "chroma", chroma);
         renderer.set_post_process_config(config.clone());
-        renderer.ensure_style_resources(&gpu.device);
+        renderer.ensure_style_resources(gpu.device);
         let styled = gpu.frame(&mut renderer, &world);
         let table: Vec<[u8; 3]> = palette
             .table()
@@ -2517,7 +2915,7 @@ fn the_palette_style_quantizes_the_frame_to_its_table() {
 /// covers is drawn in glyphs; a frame later the table's buffers hold still.
 #[test]
 fn five_hundred_anchored_props_each_draw_on_their_own_grid() {
-    let Some(gpu) = gpu() else {
+    let Some(gpu) = gpu_alone() else {
         eprintln!("no GPU adapter; skipping");
         return;
     };
@@ -2554,8 +2952,8 @@ fn five_hundred_anchored_props_each_draw_on_their_own_grid() {
         props.push(e);
     }
     let mut renderer = SceneRenderer::new_headless(
-        &gpu.device,
-        &gpu.queue,
+        gpu.device,
+        gpu.queue,
         FORMAT,
         SIZE,
         SIZE,
@@ -2644,14 +3042,14 @@ fn ascii_smoothing_settles_in_the_same_time_at_any_frame_rate() {
     };
     let renderer = || {
         let mut r = SceneRenderer::new_headless(
-            &gpu.device,
-            &gpu.queue,
+            gpu.device,
+            gpu.queue,
             FORMAT,
             SIZE,
             SIZE,
             RendererConfig::default(),
         );
-        r.ensure_style_resources(&gpu.device);
+        r.ensure_style_resources(gpu.device);
         r
     };
     // Where each run starts and ends, drawn without history
@@ -2710,7 +3108,7 @@ fn a_script_cross_fades_whole_frame_styles_without_allocating_and_clears_exactly
     // What set_post_style / set_post_style_param do (#369): edit the
     // renderer's [post_process.styles] table, here a lit cube under
     // Kuwahara (HDR) and invert (display), each faded by its `blend`
-    let Some(gpu) = gpu() else {
+    let Some(gpu) = gpu_alone() else {
         flint_render::gpu_select::skip_without_gpu("no GPU adapter");
         return;
     };
@@ -2729,8 +3127,8 @@ fn a_script_cross_fades_whole_frame_styles_without_allocating_and_clears_exactly
     world.set_component(cube, "bounds", bounds.into()).unwrap();
 
     let mut renderer = SceneRenderer::new_headless(
-        &gpu.device,
-        &gpu.queue,
+        gpu.device,
+        gpu.queue,
         FORMAT,
         SIZE,
         SIZE,
@@ -2860,7 +3258,7 @@ fn with_styles(
         config.styles.set_enabled(name, on.contains(name));
     }
     renderer.set_post_process_config(config);
-    renderer.ensure_style_resources(&gpu.device);
+    renderer.ensure_style_resources(gpu.device);
     gpu.frame(renderer, world)
 }
 
@@ -2868,7 +3266,7 @@ fn with_styles(
 /// the guard let it reach) instead of hanging the device.
 #[test]
 fn a_loop_that_never_ends_draws_a_frame() {
-    let Some(gpu) = gpu() else {
+    let Some(gpu) = gpu_alone() else {
         flint_render::gpu_select::skip_without_gpu("no GPU adapter");
         return;
     };
@@ -2885,8 +3283,8 @@ fn a_loop_that_never_ends_draws_a_frame() {
 
     let world = box_world();
     let mut renderer = SceneRenderer::new_headless(
-        &gpu.device,
-        &gpu.queue,
+        gpu.device,
+        gpu.queue,
         FORMAT,
         SIZE,
         SIZE,
@@ -2919,7 +3317,7 @@ fn a_loop_that_never_ends_draws_a_frame() {
 /// composed text.
 #[test]
 fn a_bounded_loop_draws_the_same_guarded() {
-    let Some(gpu) = gpu() else {
+    let Some(gpu) = gpu_alone() else {
         flint_render::gpu_select::skip_without_gpu("no GPU adapter");
         return;
     };
@@ -2943,8 +3341,8 @@ fn a_bounded_loop_draws_the_same_guarded() {
     );
     let world = box_world();
     let mut renderer = SceneRenderer::new_headless(
-        &gpu.device,
-        &gpu.queue,
+        gpu.device,
+        gpu.queue,
         FORMAT,
         SIZE,
         SIZE,
@@ -2965,4 +3363,186 @@ fn a_bounded_loop_draws_the_same_guarded() {
     assert_eq!(differ, 0, "{differ} bytes differ guarded");
     let _ = std::fs::remove_dir_all(&raw_dir);
     let _ = std::fs::remove_dir_all(&guarded_dir);
+}
+
+/// Write a user style's files into a fresh folder and load it.
+fn user_style(tag: &str, files: &[(&str, &str)]) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("flint-{tag}-{}", std::process::id()));
+    let styles = dir.join("styles");
+    std::fs::create_dir_all(&styles).unwrap();
+    for (name, text) in files {
+        std::fs::write(styles.join(name), text).unwrap();
+    }
+    let messages = flint_render::stylize::custom::load_dir(&dir);
+    assert!(messages.is_empty(), "{messages:?}");
+    dir
+}
+
+fn style_on(gpu: &Gpu, name: &str) -> SceneRenderer {
+    let mut renderer = SceneRenderer::new_headless(
+        gpu.device,
+        gpu.queue,
+        FORMAT,
+        SIZE,
+        SIZE,
+        RendererConfig::default(),
+    );
+    let mut config = renderer.post_process_config().clone();
+    config.styles.set_enabled(name, true);
+    renderer.set_post_process_config(config);
+    renderer.ensure_style_resources(gpu.device);
+    renderer
+}
+
+/// #412: a user style of three passes, each into a target of its own at
+/// its own size and format, the last reading both; every target is
+/// listed with its size and bytes.
+#[test]
+fn a_user_style_of_passes_draws_through_targets_of_its_own() {
+    let Some(gpu) = gpu_alone() else {
+        flint_render::gpu_select::skip_without_gpu("no GPU adapter");
+        return;
+    };
+    let dir = user_style(
+        "passes-412",
+        &[
+            (
+                "utest_passes.shader.toml",
+                r#"version = 1
+name = "utest_passes"
+
+[[passes]]
+name = "fill"
+shader = "fill.wgsl"
+target = "small"
+format = "rgba8"
+scale = 0.5
+
+[[passes]]
+name = "mono"
+shader = "mono.wgsl"
+target = "mono"
+format = "r32f"
+scale = 0.25
+reads = ["small"]
+
+[[passes]]
+shader = "out.wgsl"
+reads = ["small", "mono"]
+"#,
+            ),
+            (
+                "fill.wgsl",
+                "fn style(p: StylePixel) -> vec4<f32> {\n    \
+                 return vec4<f32>(0.5, flint.pass_size.x / 64.0, 0.75, 1.0);\n}\n",
+            ),
+            (
+                "mono.wgsl",
+                "fn style(p: StylePixel) -> vec4<f32> {\n    \
+                 return vec4<f32>(flint_target_small(p.uv).g * flint.pass_size.x / 16.0, 0.0, 0.0, 1.0);\n}\n",
+            ),
+            (
+                "out.wgsl",
+                "fn style(p: StylePixel) -> vec4<f32> {\n    \
+                 let s = flint_target_small(p.uv);\n    \
+                 let m = flint_target_mono(p.uv).r;\n    \
+                 return vec4<f32>(s.r, m, flint_target_small_size().x / flint.resolution.x * s.b / 0.75, 1.0);\n}\n",
+            ),
+        ],
+    );
+    assert!(flint_render::stylize::custom::errors()
+        .iter()
+        .all(|(n, _)| n != "utest_passes"));
+    let mut renderer = style_on(&gpu, "utest_passes");
+    let pixels = gpu.frame(&mut renderer, &box_world());
+    // fill: r 0.5, g = its own size (32) / 64 = 0.5; mono: 0.5 * 16 / 16;
+    // out: the small target's size (32) over 64 times b/0.75 = 0.5. Display
+    // 0.5 is 128 (rounding either way), every pixel
+    let off = pixels
+        .chunks(4)
+        .filter(|p| p[..3].iter().any(|&c| (c as i32 - 128).abs() > 2))
+        .count();
+    assert_eq!(off, 0, "first pixel {:?}", &pixels[..4]);
+
+    let targets = renderer.style_target_entries();
+    let find = |name: &str| targets.iter().find(|t| t.name == name).cloned();
+    let small = find("utest_passes.small").expect("listed");
+    assert_eq!((small.width, small.height), (SIZE / 2, SIZE / 2));
+    assert_eq!(small.format, wgpu::TextureFormat::Rgba8Unorm);
+    assert_eq!(small.bytes, 32 * 32 * 4);
+    let mono = find("utest_passes.mono").expect("listed");
+    assert_eq!(
+        (mono.width, mono.format),
+        (SIZE / 4, wgpu::TextureFormat::R32Float)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// #412: a history target reads last frame's while it's this picture's
+/// past (`flint.history` says so) and starts over, cleared, after a reset.
+#[test]
+fn a_history_target_accumulates_and_starts_over_after_a_reset() {
+    let Some(gpu) = gpu_alone() else {
+        flint_render::gpu_select::skip_without_gpu("no GPU adapter");
+        return;
+    };
+    let dir = user_style(
+        "history-412",
+        &[
+            (
+                "utest_history.shader.toml",
+                r#"version = 1
+name = "utest_history"
+
+[[passes]]
+name = "acc"
+shader = "acc.wgsl"
+target = "acc"
+history = true
+reads = ["acc"]
+
+[[passes]]
+name = "show"
+shader = "show.wgsl"
+reads = ["acc"]
+"#,
+            ),
+            (
+                "acc.wgsl",
+                "fn style(p: StylePixel) -> vec4<f32> {\n    \
+                 return vec4<f32>(flint_target_acc(p.uv).r + 0.125, flint.history, 0.0, 1.0);\n}\n",
+            ),
+            (
+                "show.wgsl",
+                "fn style(p: StylePixel) -> vec4<f32> {\n    \
+                 let a = flint_target_acc(p.uv);\n    \
+                 return vec4<f32>(a.r, a.g, 0.0, 1.0);\n}\n",
+            ),
+        ],
+    );
+    let mut renderer = style_on(&gpu, "utest_history");
+    let world = box_world();
+    // A display-stage style returns display values: the byte is value * 255
+    let first = |renderer: &mut SceneRenderer| {
+        let p = gpu.frame(renderer, &world);
+        (p[0] as f32 / 255.0, p[1] as f32 / 255.0)
+    };
+    let close = |a: f32, b: f32| (a - b).abs() < 0.02;
+    let (r, h) = first(&mut renderer);
+    assert!(close(r, 0.125) && close(h, 0.0), "frame 1: {r} {h}");
+    let (r, h) = first(&mut renderer);
+    assert!(close(r, 0.25) && close(h, 1.0), "frame 2: {r} {h}");
+    let (r, _) = first(&mut renderer);
+    assert!(close(r, 0.375), "frame 3: {r}");
+    renderer.reset_style_history();
+    let (r, h) = first(&mut renderer);
+    assert!(close(r, 0.125) && close(h, 0.0), "after a reset: {r} {h}");
+    let names: Vec<&str> = renderer
+        .style_target_entries()
+        .iter()
+        .map(|t| t.name)
+        .filter(|n| n.starts_with("utest_history"))
+        .collect();
+    assert_eq!(names, ["utest_history.acc.a", "utest_history.acc.b"]);
+    let _ = std::fs::remove_dir_all(&dir);
 }

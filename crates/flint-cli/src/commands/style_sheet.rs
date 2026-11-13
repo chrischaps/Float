@@ -90,14 +90,7 @@ pub fn compose(cells: &[RgbaImage], text: &SheetText) -> RgbaImage {
         TITLE,
         &text.title,
     );
-    if !text.time.is_empty() {
-        // Right-aligned on the title's line, clipped at the left margin
-        let advance = GLYPH * title_scale;
-        let fit = fit_text(&text.time, width - 2 * MARGIN, title_scale);
-        let w = fit.chars().count() as u32 * advance;
-        let x = (width - MARGIN).saturating_sub(w).max(MARGIN);
-        draw_text(&mut sheet, &font, x, y, title_scale, LABEL, &fit);
-    }
+    draw_time(&mut sheet, &font, &text.time, title_scale);
     y += GLYPH * title_scale + 6 * scale;
     for (k, part) in subtitle.iter().enumerate() {
         let y = y + k as u32 * (line + 3 * scale);
@@ -140,7 +133,13 @@ pub fn compose(cells: &[RgbaImage], text: &SheetText) -> RgbaImage {
 pub fn cell_origin(cell_w: u32, cell_h: u32, text: &SheetText, i: usize) -> (u32, u32) {
     let scale = text_scale(cell_w);
     let line = GLYPH * scale;
-    let head = GLYPH * (scale + 1) + 6 * scale + line + 10 * scale;
+    // The subtitle wraps at the sheet's width, as `compose` lays it out
+    let columns = text.labels.len().clamp(1, PER_ROW) as u32;
+    let width = MARGIN * 2 + columns * (cell_w + 2) + (columns - 1) * GUTTER;
+    let lines =
+        wrap_at_breaks(&text.subtitle, width.saturating_sub(2 * MARGIN), scale).len() as u32;
+    let head =
+        GLYPH * (scale + 1) + 6 * scale + lines * (line + 3 * scale) - 3 * scale + 10 * scale;
     let noted = text.notes.iter().any(|note| !note.is_empty());
     let note_band = if noted { 3 * scale + line } else { 0 };
     let row_h = cell_h + 2 + 6 * scale + line + note_band + 4 * scale;
@@ -149,6 +148,19 @@ pub fn cell_origin(cell_w: u32, cell_h: u32, text: &SheetText, i: usize) -> (u32
         MARGIN + col * (cell_w + 2 + GUTTER) + 1,
         MARGIN + head + row * (row_h + GUTTER) + 1,
     )
+}
+
+/// The moment a sheet shows, right-aligned on the title's line and clipped at
+/// the left margin; nothing when `time` is empty.
+fn draw_time(sheet: &mut RgbaImage, font: &GlyphAtlas, time: &str, title_scale: u32) {
+    if time.is_empty() {
+        return;
+    }
+    let width = sheet.width();
+    let fit = fit_text(time, width - 2 * MARGIN, title_scale);
+    let w = fit.chars().count() as u32 * GLYPH * title_scale;
+    let x = (width - MARGIN).saturating_sub(w).max(MARGIN);
+    draw_text(sheet, font, x, MARGIN, title_scale, LABEL, &fit);
 }
 
 /// A two-key sheet's words (#358): the first key's values over the columns,
@@ -160,6 +172,9 @@ pub struct GridText {
     pub row_key: String,
     pub column_labels: Vec<String>,
     pub row_labels: Vec<String>,
+    /// Top right, or nothing when empty: the moment the cells show, as
+    /// [`SheetText::time`].
+    pub time: String,
 }
 
 /// Lay `cells` (all one size, a row at a time) out as a grid of
@@ -201,6 +216,7 @@ pub fn compose_grid(cells: &[RgbaImage], text: &GridText) -> RgbaImage {
         TITLE,
         &text.title,
     );
+    draw_time(&mut sheet, &font, &text.time, title_scale);
     let y = MARGIN + GLYPH * title_scale + 6 * scale;
     for (k, part) in subtitle.iter().enumerate() {
         let y = y + k as u32 * (line + 3 * scale);
@@ -544,6 +560,7 @@ mod tests {
             row_key: "b".into(),
             column_labels: columns.iter().map(|l| l.to_string()).collect(),
             row_labels: rows.iter().map(|l| l.to_string()).collect(),
+            time: String::new(),
         }
     }
 

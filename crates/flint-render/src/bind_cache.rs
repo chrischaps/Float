@@ -171,6 +171,24 @@ impl BindCache {
         }
     }
 
+    /// Forget every group and every first write, as a new cache would
+    /// (the count of groups made goes on): for when what they bind was
+    /// made again (a style rebuilt from a changed shader, #418).
+    pub fn clear(&self) {
+        self.groups
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        let mut caller = self.caller.lock().unwrap_or_else(|e| e.into_inner());
+        caller.0 = 0;
+        caller.1.clear();
+        drop(caller);
+        self.written
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+    }
+
     /// How many bind groups it holds.
     pub fn len(&self) -> usize {
         self.groups.lock().map_or(0, |g| g.len()) + self.caller.lock().map_or(0, |c| c.1.len())
@@ -258,11 +276,16 @@ impl TransformArena {
 
     /// Put `bytes` in `slot`, to go up with its page at [`upload`](Self::upload).
     pub fn stage(&mut self, slot: ArenaSlot, bytes: &[u8]) {
-        debug_assert!(bytes.len() as u64 <= SLOT_STRIDE);
+        self.stage_at(slot, 0, bytes);
+    }
+
+    /// Put `bytes` in `slot`, `offset` bytes in.
+    pub fn stage_at(&mut self, slot: ArenaSlot, offset: usize, bytes: &[u8]) {
+        debug_assert!((offset + bytes.len()) as u64 <= SLOT_STRIDE);
         let Some(page) = self.pages.get_mut(slot.page as usize) else {
             return;
         };
-        let at = slot.offset() as usize;
+        let at = slot.offset() as usize + offset;
         page.staging[at..at + bytes.len()].copy_from_slice(bytes);
         page.dirty = Some(match page.dirty {
             Some((a, b)) => (a.min(slot.index), b.max(slot.index + 1)),
