@@ -11,14 +11,32 @@ Flint is a CLI-first, AI-agent-optimized 3D game engine written in Rust. The pri
 ```bash
 cargo build                    # Debug build
 cargo build --release          # Release build
+cargo build -p flint-cli --no-default-features  # Headless CLI: no sound card, gamepads or file dialogs,
+                               #   so no ALSA/libudev headers on Linux (#221; features audio/gamepad/dialogs;
+                               #   `bash scripts/headless-check.sh [--build]` keeps device crates out of its tree)
 cargo run --bin flint -- <cmd> # Run CLI
-cargo run --bin flint -- play demo/phase4_runtime.scene.toml  # Play a scene
-cargo run --bin flint-player -- demo/phase4_runtime.scene.toml --schemas schemas  # Standalone player
+cargo run --bin flint -- play examples/phase4_runtime.scene.toml  # Play a scene
+cargo run --bin flint-player -- examples/phase4_runtime.scene.toml  # Standalone player (schemas: the root flint.toml)
+cargo run --bin flint -- export web examples/  # any game as a folder a static server plays (#106):
+                               #   examples/dist/web = player + games/<id>/ bundles + games.json;
+                               #   --out, --player <trunk dist> (else trunk builds it), --meta k=v, --clean
 cargo test                     # Run all tests
 cargo test -p flint-core       # Test a single crate
 cargo clippy                   # Lint
-cargo fmt --check              # Check formatting
+cargo fmt --all                # Format (rustfmt.toml pins the edition; `rustfmt <file>` for one file)
+bash scripts/ci.sh             # What a PR must pass: formatting and a record for every cited ADR
+                               #   (scripts/adr-check.sh), in seconds. `issue.sh land` runs it.
+bash scripts/ci.sh --full      #   ...plus what CI's clippy and wasm jobs run (two builds)
 ```
+
+## Build output across worktrees
+
+Every agent worktree builds its own `target/`, and parallel worktrees are how this repo is worked, so disk is what runs out (#762):
+
+- **Keep `target/` per worktree; never point several at one `CARGO_TARGET_DIR`.** Cargo names a workspace crate's output by its path inside the workspace, so two worktrees' `flint-render` share one output and a branch can build against the other's (2026-10-30: a branch failed on a method its own source defines). One target dir also has one build lock, so parallel agents queue, and tests that write into it collide (#421). An A/B against another revision gets its own dir.
+- **The dev profile is lean** (`Cargo.toml`): line tables for workspace crates, no debug info for dependencies. A cold `cargo build` plus `cargo test --no-run` measures 6.6 GB and 150 s. Locals in a debugger: `CARGO_PROFILE_DEV_DEBUG=full`. What loads a texture is built at `opt-level = 3` even in debug (#326): the image decoders, glTF, SHA-256 and `flint-pixels`, where the texel loops live so `flint-render` stays unoptimized. A debug render of a scene with a 32 MB model takes about 2.6 s; a new per-texel loop on load goes in `flint-pixels`.
+- **sccache is optional, per machine, not in `.cargo/config.toml`** (a wrapper that isn't installed fails every build). With `RUSTC_WRAPPER=sccache` a cold-cache build measured no slower (96 s); what a warm cache saves the next worktree is unmeasured (the run was stopped for low memory). It can cache only dependencies, since the workspace crates build incrementally.
+- **Disk is guarded** by `scripts/build-space.sh`. A hook refuses `issue.sh claim` under 30 GB free (`FLINT_DISK_FLOOR_GB`), and the SessionStart hook deletes the `target/` of worktrees whose issue is closed (not the worktree, not one built in the last hour). `report` lists every worktree's `target/` by size. A release build adds several GB: before one, check `df -h .`, and delete your own worktree's `target/release` when you're done with it.
 
 ## Development Workflow
 
@@ -26,197 +44,63 @@ Flint uses an **edit -> validate -> play** loop:
 
 1. **`flint render`** -- Headless scene-to-PNG snapshot. Primary validation tool for AI agents.
    ```bash
-   flint render levels/demo.scene.toml --output test.png --schemas schemas --width 1280 --height 720
-   flint render levels/demo.scene.toml --output test.png --schemas schemas \
+   flint render levels/demo.scene.toml --output test.png --width 1280 --height 720
+   flint render levels/demo.scene.toml --output test.png \
      --distance 20 --pitch 30 --yaw 45 --target 0,1,0 --no-grid
-   # Debug/post-processing flags:
-   #   --debug-mode wireframe|normals|depth|uv|unlit|metalrough|style|edges
-   #                          (style = the entity style mask, #263: needs post-processing;
-   #                          prints and draws a legend of each id's hue, #309; runs mask_view
-   #                          alone, the scene's other styles suspended, #334)
-   #                          (edges = ASCII's edge passes, #349: pixels by source, cells by
-   #                          decision + length bar; ascii alone, on at defaults if absent;
-   #                          ascii_edge_view.wgsl; StyleFrame::debug_mode carries the mode)
-   #   --wireframe-overlay    --show-normals    --no-tonemapping
-   #   --no-shadows           --shadow-resolution 2048
-   #   --no-postprocess       --bloom-intensity 0.08  --bloom-threshold 1.0
-   #   --exposure 1.5         --ssao-radius 0.5       --ssao-intensity 1.0
-   #   --ssao-samples 64      (1-64; SSAO is the heaviest per-pixel pass — 16 is ~4x cheaper)
-   #   --fog-density 0.02     --fog-color 0.7,0.75,0.82  --fog-height-falloff 0.1
-   #   --dither-intensity 0.03   --desaturate 0.85
-   #   --dof 0.6  --dof-focus 10  --dof-range 5
-   #   --volumetric-density 1.0  --volumetric-samples 32
-   #   --kuwahara-radius 4       --kuwahara-sharpness 8.0
-   #   --kuwahara-hardness 8.0   --kuwahara-anisotropy 1.0
-   #   --oren-nayar 0.7          --sheen-strength 0.15  --sheen-color 1,0.9,0.8
-   #   --grade-lift 0.03,0.02,0.015  --grade-gamma 1,1,1  --grade-gain 1.04,1,0.94
-   #   --film-grain 0.03         --grain-time 0  --fxaa
-   #   --particle-time 2.0    (step emitters/effects deterministically before
-   #                           capture; default none = no particles. ADR 0068)
-   #   --msaa 4               (1|4; default 1 keeps pixel gates single-sample.
-   #                           Also on flint-player. ADR 0058)
-   #   --render-scale 0.5     (scene at a fraction of the image, as the player's)
-   #   --gpu-time 240         (draw N frames with GPU timing, print ms per pass)
-   #   --frames 181 --frame-dt 0.0166667 --orbit 6.8755 | --camera-path cam.toml
-   #                          (#345: N frames on one renderer as out_0000.png...; temporal
-   #                           styles see consecutive frames; --flip-stats / --flip-json f.json
-   #                           count ASCII glyph flips and A-B-A reversals from its own grid,
-   #                           --no-images skips the PNGs; byte-identical run to run)
-   #   --ascii                (full-screen ASCII style, #265 = [post_process.styles.ascii])
-   #   --ascii-cell 8 --ascii-font builtin --ascii-ramp classic|blocks|minimal|detailed
-   #   --ascii-color source|tint|raw|mono|palette --ascii-tint 0.35,1,0.45 --ascii-background 0.15
-   #   --ascii-palette cga|cga-warm|cga16|phosphor|amber|mono|<palettes/name.palette.toml> (#276)
-   #                          (nearest inks match in OKLab; --style ascii:chroma=2,palette_dither=1
-   #                           pushes saturation and Bayer-mixes the two nearest inks, #320)
-   #   --ascii-ground dim|black|inverse  --ascii-glow 0.6
-   #   --ascii-text frame.txt  --ascii-text-ansi frame.ans
-   #                          (#317: the glyph grid as text, a line per cell row, cell for
-   #                           cell with the PNG; read a render instead of looking at it)
-   #   --ascii-scope screen|entities --ascii-grid screen|object
-   #                          (#266; a scene's ascii_style entities need no flag)
-   #   --ascii-brightness 0 --ascii-contrast 1 --ascii-ink 1 --ascii-dither 0 (#277)
-   #   --ascii-edges 1 --ascii-edge-threshold 0.5 --ascii-edge-max 3
-   #                          (#267 line glyphs on depth/crease/mask edges; the editor grid is a
-   #                           depth-free overlay since #346, never traced, but --no-grid keeps tone clean)
-   #                          (#351 their ink: --style ascii:edge_ink=cell|color|hue,
-   #                           edge_color=#rrggbb,edge_tint=0..1; hue = the near side's own colour)
-   #   --pixels-per-point 2   (high-DPI scale factor; ASCII cells are in points)
-   #   --style ascii:cell=12,ramp=blocks   (#271: any registered style, keys checked
-   #                          against its descriptor; repeatable; `--style help`;
-   #                          also on `flint edit <model|effect> --render`)
-   #   --style pencil:spacing=5,direction=screen   (#273: hatching, contours, paper;
-   #                          direction surface|screen|tensor, seed, boil; demo/pencil_sketch)
-   #   --style-time 1.5       (post time animated styles read; default 0)
-   #                          (#328: --style/--style-time also on flint play, flint-player and
-   #                           flint edit scene.toml, kept through transitions and hot reloads;
-   #                           the web's ?style=ascii:cell=12, repeatable)
-   #   --edge-depth 0.6 --edge-normal 2.5   (#301: the shared geometry edges' thresholds;
-   #                          `--style edges_view` shows them)
-   #   --list-styles [--json] (#303: every registered style, its stage, table, and each
-   #                          param's default/range/help; with a scene, its user styles too)
-   #   --look ascii_noir      (#279: a styles/<name>.look.toml preset merged over the scene's
-   #                          [post_process]; built-ins ascii_noir|matrix|ink_wash|graphite|watercolor|
-   #                          coloured_pencil|blueprint|charcoal (#391);
-   #                          `--look help` lists them with their tune sweeps. #356: a scene's
-   #                          `[post_process] look = "<name>"` goes UNDER its keys (loader records
-   #                          them in PostProcessDef::authored; flint_render::look::resolve, vfs reads);
-   #                          F4 -> Look and Rhai set_look/clear_look re-resolve; demo/looks.scene.toml)
-   #   --sweep ascii.cell=6,8,12   (one labelled contact sheet, a column per value; keys:
-   #                          <style>.<key>, post.<field> (`|` splits vectors), look=a,b,
-   #                          wooze.<knob> (Living Props builds; one Sweep type in
-   #                          commands/sweep.rs, one sheet in style_sheet.rs, #353);
-   #                          cells 640x360 unless --width/--height. Cells are in points:
-   #                          --sweep-crop X,Y,W,H draws each at full size (1920x1080) and
-   #                          keeps a 1:1 region, --sweep-scale full shrinks the whole frame;
-   #                          two --sweep flags make a grid, first across, second down, #358)
-   #   --report m.json --reference ref.png   (#357: per column luma, near-black/white, edge
-   #                          density, ASCII ramp-step shares, #183's distance; `look_measure.rs`)
-   #   --look x --reference ref.png --ai-refine [--ai-provider anthropic|mock --max-cost 0.5
-   #                          --refine-rounds 4 --refine-candidates 4 --refine-out f.look.toml]
-   #                          (agent proposes sweep-key edits, each rendered + measured, best kept
-   #                          while the distance falls; writes <look>_refined.look.toml + .json log
-   #                          + rounds sheet; calls via CostMeter; mock walks the look's tune)
-   #   --ascii-levels 4 --ascii-footprint 2 --ascii-no-edges --ascii-edge-depth 0.6
-   #   --ascii-edge-normal 2.5   (tone bands, tone footprint, edge sensitivity)
-   # Note: --shadow-resolution defaults to 2048 (the renderer's construction
-   # default) and is a real control since the texel-size upload (ADR 0049).
-   #   --render-mode 1 --mode-mix 1.0 --mode-params 3,0,6,0
-   #     (modes: 1=matrix 2=blood 3=drunk 4=tron [reality tears; params =
-   #      mask scale, mask style 0 fbm/1 iris, rate, spare] 5=underwater
-   #      [params = signed eye depth m, sea energy 0-1, daylight 0-1,
-   #      biolum 0-1; masks by per-pixel waterline, not the tear mask])
    ```
+   Every flag: `flint render --help`, `--list-styles --json`, `--look help`, and `crates/flint-cli/CLAUDE.md`.
 
 2. **`flint edit <file>`** -- Unified interactive editor. Auto-detects file type and opens the right tool:
    ```bash
    flint edit levels/demo.scene.toml              # Scene viewer (hot-reload)
-   flint edit levels/demo.scene.toml --spline      # Spline/track editor
    flint edit models/character.glb                 # Model previewer (orbit camera)
-   flint edit models/character.glb --watch         # Model previewer with file watching
    flint edit specs/oak_tree.procgen.toml          # Procgen previewer (mesh/texture)
-   flint edit specs/stone_wall.procgen.toml        # Texture pipeline editor (if pipeline pattern)
-   flint edit terrain.terrain.toml                 # Terrain editor
-   flint edit fx/fire.particles.toml               # Particle effect editor (curves, forces, bursts, scrub timeline;
-                                                   #   --preset fire|smoke|sparks|rain creates a missing file;
-                                                   #   --render out.png --anim-time 1.5 = deterministic snapshot)
    ```
-   Supported extensions: `.scene.toml`, `.chunk.toml`, `.procgen.toml`, `.terrain.toml`, `.particles.toml`, `.glb`, `.gltf`.
-   Common flags: `--width`, `--height`, `--no-grid`, `--watch`, `--seed`, `--no-inspector`, `--auto-orbit`.
-   Scene viewer applies the scene's `[post_process]` block on load. **F4 opens the Rendering & Effects menu** (ADR 0053) — every render/post toggle plus its non-binary parameters (SSAO radius/samples, DoF, bloom, fog, grade/grain/FXAA, kuwahara, render modes, shadows + resolution, lighting levers, FOV, debug shading mode), an authored-vs-viewer-default post toggle, DoF-follow (focus plane tracks the last selected entity; values are plain view distances since the ADR 0055 depth fix), and a Particles section (the viewer simulates `particle_emitter` / `particle_effect` entities live; ADR 0068). WASD orbit, Q/E zoom — while an entity is selected, W/E/R switch gizmo mode instead of orbiting. It also seeds the orbit camera from the scene's authored `[camera]` block (Space returns to that framing; ADR 0051 in game repos using this pattern), and supports `--auto-orbit` turntable with O toggle and [ / ] speed like the model previewer.
-   Model flags: `--clip <name>`, `--layer clip[:weight[:mask[:mode]]]` (repeatable), `--sequence <file.sequence.toml>`, `--sequence-loop`, `--anim-time <s>` (with `--render`; replays a sequence deterministically), `--anim-speed <f32>`, `--render <path.png>`, `--no-animate`, `--distance`, `--yaw`, `--pitch`, `--target`, `--fov`.
-   A `*.sequence.toml` lists timestamped animator events (`blend`/`layer`/`speed`/`cue`); the previewer gets a Sequence panel (seek slider + event markers, R = restart), the player auto-loads them from `animations/` and scripts use `play_sequence` / `on_sequence_cue`. Layer weights can ramp via `fade_target`/`fade_duration` (`fade_anim_layer`).
-   The model previewer has a Layers stack (clip/weight/Add-Over/mask/solo-mute per row) and a "Skeleton colour" combo that paints the armature by last writer / layer weight / mask / keyed joints.
-   Scene flags: `--spline` (opens spline/track editor).
-   Old commands (`serve`, `preview`, `gen-preview`, `tex-edit`, `terrain-edit`) still work as hidden aliases.
+   More: `crates/flint-cli/CLAUDE.md`.
 
 3. **`flint gen`** -- Run a procedural generation spec to produce meshes (GLB) or textures (PNG).
    ```bash
    flint gen specs/oak_tree.procgen.toml -o tree.glb
    flint gen specs/stone_wall.procgen.toml -o wall.png
    flint gen specs/oak_tree.procgen.toml --dry-run
-   flint gen specs/oak_tree.procgen.toml --seed 42 -o tree.glb
-   flint gen --ai-create "twisted dead tree" -o tree.glb     # agent writes the spec (ANTHROPIC_API_KEY;
-                                                             #   --ai-provider mock is offline and free)
-   flint gen specs/oak_tree.procgen.toml --ai-assist --max-cost 0.50 -o tree.glb
-   flint gen specs/oak_tree.procgen.toml --ai-refine --reference ref.png -o tree.glb
-   #   Claude sees a headless render of what the spec builds each round and the refine
-   #   loops while the measured distance falls (--refine-rounds N; #183)
-   flint gen --cost-report --since 2026-10-01                # sums .flint/procgen_costs.json
-   # --ai-model, --ai-iterations, --ai-generator,
-   # --print-spec (spec alone on stdout), --save-spec. Every API call goes through
-   # flint_procgen_ai::CostMeter: priced, appended to the JSON Lines ledger, and
-   # refused before sending if its worst case could pass --max-cost.
    ```
-
-   **Goldens (#271):** `flint render-suite crates/flint-cli/tests/golden/stylize.goldens.toml`
-   renders every stylize case and fails past its tolerance (`--bless` rewrites, `--case`,
-   `--out-dir` gets renders + `<case>.diff.png` + `report.json` + an `index.html` contact
-   sheet of golden | render | diff, failures first, #329; `--case` with an exact name picks that case
-   alone, otherwise every name containing it, #388); a pass that isn't byte-identical with its golden
-   prints `DRIFT`, is `"drift": true` in the report, and the run ends naming every drifted case
-   or saying none; `--bless-drifted` re-blesses only those, for a catch-up commit (#387); `cargo test -p flint-cli
-   --test render_goldens` runs it. Cases run in one process on one GPU device with glTF
-   decodes and mip chains memoized (`render::RenderHost`, `flint_import::memoize_imports`,
-   `flint_render::memoize_mip_chains`; ~2.5x in debug); a panicking case reruns in its own
-   process, `--isolate` spawns every case. A new style adds a case. A case's `matches = [flags]` (#417) compares with a second render
-   made with those flags instead of a golden, exact by default, and `error = "<text>"` needs a user
-   style's error to hold it (`user-style-broken`: `tests/golden/fixtures/styles/broken.*` must draw a
-   passthrough, which runs the prelude's sRGB round trip). A case's `text = "<x>.txt"`
-   (#317) also pins its ASCII grid exactly (`text_cells` allows some; `<case>.text.diff`).
-   CI runs the goldens and `flint-render --test stylize` on WARP (#314, job `GPU tests (WARP)`)
-   with `FLINT_REQUIRE_GPU=1`, which turns a GPU test's skip into a failure
-   (`gpu_select::skip_without_gpu`; a new GPU test calls it). A golden (image or text) may have
-   a per-adapter variant `<stem>.<warp|lavapipe|vulkan|dx12>.<ext>` (`--bless-variant`); wgpu
-   hides WARP on a machine with a GPU, so WARP variants come from the job's `stylize-goldens-warp`
-   artifact. Two traps it caught (DX12/FXC only): a `switch` miscompiled, and
-   `fract(theta - base)` on a ±ε knife edge. A `.suite.toml` there is still music to WAV.
+   More, and the goldens: `crates/flint-cli/CLAUDE.md`.
 
 4. **`flint play`** -- Full game runtime with physics, scripting, audio, and input.
+   ```bash
+   flint play examples/phase4_runtime.scene.toml
+   flint play examples/phase4_runtime.scene.toml --width 1920 --height 1080
+   ```
+   More: `crates/flint-player/CLAUDE.md`.
 
-**For AI agents:** After visual changes, always run `flint render` to verify before moving on. The render command loads models (searches `scene_dir/models/` then `../models/`), generates geometry, and computes the full transform hierarchy.
+**For AI agents:** Before playing, rendering or bundling, `flint check <dir|scene> [--json]` is the pre-flight (#687): every problem of a project in one run, each with its file, entity, field, a hint and the paths tried, exit 1 on an error, scripts included (`flint script check` alone gives each script's mistakes as `file:line:col`, #694; `crates/flint-cli/CLAUDE.md`). After visual changes, always run `flint render` to verify before moving on. The render command loads models (found by the project's one asset search: `models/` beside the scene, beside each directory up to the project root, then `engine/`; `flint asset where models <name> --scene <scene>` shows it), generates geometry, and computes the full transform hierarchy.
 
 ## Architecture
 
-26-crate Cargo workspace (plus `tools/arch-analyzer`, a syn-based dependency/metrics extractor feeding the `tools/arch-viewer` web graph; neither is a default member):
+31-crate Cargo workspace (plus `tools/arch-analyzer`, a syn-based dependency/metrics extractor feeding the `tools/arch-viewer` web graph and the book's crate table, checked in CI; neither is a default member):
 
 ```
-flint-cli           CLI binary (clap). Commands: init, entity, scene, query, schema, edit, play, validate, asset, render, gen, prefab,
-  │                 validate-suite, play-suite, calibrate, play-chart, replay-chart, render-suite, spike-rumble, bundle
+flint-cli           CLI binary (clap). Commands: init, entity, scene, query, schema, script, edit, serve, preview, play, check,
+  │                 validate, examples, asset, render, style, gen, gen-preview, prefab, bundle, export, spline-edit,
+  │                 terrain-edit, tex-edit, validate-suite, play-suite, calibrate, play-chart, replay-chart, render-suite,
+  │                 goldens, spike-rumble
   ├── flint-asset-gen AI asset generation: pluggable providers (Flux, Meshy, ElevenLabs, Mock)
   ├── flint-procgen   Procedural generation: Generator trait, registry, specs, GLB export
   └── flint-procgen-ai AI-assisted procgen: ProcGenAgent trait, spec creation/refinement
 flint-android       Android entry point (NativeActivity, APK asset extraction)
 flint-player        Standalone player (game loop, physics, audio, animation, scripting, egui HUD)
-  ├── flint-music    Rhythm sessions: suite manifests, charts, tempo maps, ladder/seam/reintegration, replay, offline render
+  ├── flint-rhythm   The rhythm layer: charts, judgment, coherence, ladder/seam/reintegration, replay, haptics
+  ├── flint-music    Music: suite manifests with manifest-named buses, tempo maps, conductor, scheduler, offline render
   ├── flint-input-capture 1 kHz gamepad capture thread (gilrs XInput) stamped against the audio clock; verb maps
-  ├── flint-debug-ui DebugPanel trait + F3/F4 panel roster (Rendering & Effects, ocean, sky, camera, grass, particles...); shared `widgets` (drag helpers, CurveEditor, GradientEditor); optional via debug-hud
+  ├── flint-debug-ui DebugPanel trait + F3/F4 panel roster (Rendering & Effects, ocean, sky, camera, grass, particles, Living Props...); shared `widgets` (drag helpers, CurveEditor, GradientEditor); optional via debug-hud
   ├── flint-script   Rhai scripting with hot-reload
   ├── flint-particles Particle sim: effect assets, curves, forces, bursts, sub-emitters, deterministic stepping
   ├── flint-animation Property tween + skeletal animation
   ├── flint-audio    Kira spatial audio
+  ├── flint-audio-worklet Kira mixer for the browser's AudioWorklet (its own wasm, `--profile worklet`)
   ├── flint-terrain  Heightmap terrain with splat-map blending
   ├── flint-physics  Rapier 3D (character controller, static/kinematic/dynamic bodies, impulse joints)
-  ├── flint-runtime  GameClock, InputState, InputConfig, EventBus, GameStateMachine, PersistentStore
+  ├── flint-runtime  GameClock, InputState, InputConfig, EventBus, GameStateMachine, PersistentStore, pad (gilrs), PadRumble
   ├── flint-viewer   egui inspector with transform gizmos, undo/redo, TOML write-back
   ├── flint-import   glTF model importer
   ├── flint-asset    Content-addressed asset catalog
@@ -224,106 +108,86 @@ flint-player        Standalone player (game loop, physics, audio, animation, scr
   ├── flint-query    PEG query language (pest parser)
   ├── flint-scene    TOML scene serialization/deserialization
   ├── flint-render   wgpu PBR renderer (winit 0.30, wgpu 23, HDR post-processing, bloom, SSAO, fog)
+  ├── flint-pixels   Texel loops on load (RGBA widening, mip chains); no deps, optimized in debug builds
   ├── flint-ecs      hecs wrapper with stable EntityId mapping (BiMap)
   ├── flint-schema   Component/archetype schema system
+  ├── flint-wooze    The wooze field (how woozy a place is, as a function of position and time) and the boil clock
+  ├── flint-geometry Gerstner ocean spectrum, spline sampling, rays against drawn meshes; their component names
   └── flint-core     EntityId, ContentHash, Transform, Vec3, Color, FlintError, vfs (read-only file layer)
 ```
+
+## Where the detail lives
+
+Feature notes go in the nearest scoped CLAUDE.md, not in this file. When a ticket says 'update CLAUDE.md', it means the scoped file for the code you changed; add to this root file only what every session needs.
+
+| Scoped file | Covers |
+|---|---|
+| `crates/flint-cli/CLAUDE.md` | `flint render` flags, `edit`, `gen`, goldens, export, Linux |
+| `crates/flint-render/CLAUDE.md` | post-processing, quality, boil, shallow wooze, glyph atlas, caches, lights |
+| `crates/flint-render/src/stylize/CLAUDE.md` | styles, style mask, per-entity and user styles |
+| `crates/flint-procgen/CLAUDE.md` | living props, wooze field, Woozy Grove |
+| `crates/flint-player/CLAUDE.md` | extensions, UI, input, touch, capture, perf, web |
+| `crates/flint-script/CLAUDE.md` | Rhai detail |
+| `crates/flint-core/CLAUDE.md` | vfs, hot reload, shear |
+| `crates/flint-audio/CLAUDE.md` | audio clock, decoding, device features |
+| `crates/flint-{physics,animation,particles,terrain}/CLAUDE.md` | joints, IK, particles, terrain |
+| `tools/showcase/CLAUDE.md` | film rig |
+| `docs/CLAUDE.md` | book build and publish |
+
+A bullet below that names a feature in a line or two has its full text in one of these.
 
 ## Key Design Principles
 
 - **Dynamic components** stored as `toml::Value` -- archetypes defined at runtime in schema TOML files, not Rust types
 - **Stable EntityIds** via atomic counter (never recycled), persisted across save/load
 - **Scene format is TOML** -- `[scene]` metadata + `[entities.<name>]` sections; reload is full re-parse
-- **Schemas in `schemas/`** -- `components/*.toml` for field types, `archetypes/*.toml` for bundles. Multiple `--schemas` paths; later overrides earlier (game overrides engine)
-- **Scripting via Rhai** -- `script` component with `.rhai` files in `scripts/`; callbacks: `on_init`, `on_update`, `on_collision`, `on_trigger_enter/exit`, `on_action`, `on_interact`, `on_draw_ui`, `on_scene_exit/enter`, `on_animation_end`, `on_sequence_cue`, `on_event` (custom events from `fire_event_data`, the engine or `ExtensionCtx::fire_event`); `ScriptCommand` for deferred effects; `DrawCommand` for immediate-mode 2D UI
-- **Particles** -- inline `particle_emitter` or reusable `particles/*.particles.toml` effects via `particle_effect` (multi-emitter, curves, forces, bursts, sub-emitters; ADR 0068). Deterministic: per-emitter seeds from entity *names*, fixed-step `simulate_to`, `flint render --particle-time`. One shared `ParticleInstance` type; every consumer uploads through `SceneRenderer::update_particles_from` after `ParticleSystem::pack`. Scripts: `play_effect`/`stop_effect`/`set_effect_param`. F3 Particles panel in the player; F4 Particles section in the viewer
+- **Schemas in `schemas/`** -- `components/*.toml` for field types, `archetypes/*.toml` for bundles, `scene/*.toml` for scene-level tables (`[table.<name>]`: `[post_process]`, a game's own `[weather]`; #686, `crates/flint-core/CLAUDE.md`). Several directories load in order, later overriding earlier (game overrides engine). One resolver names them for every command, the viewer and the player (ADR 0114; `crates/flint-core/CLAUDE.md`): repeatable `--schemas` flags if given (the whole list), else `[project] schemas` in the project's `flint.toml`, else `schemas/` in the working directory, beside the scene and one level up
+- **Scripting via Rhai** -- `script` component with `.rhai` files in `scripts/`; callbacks: `on_init`, `on_update`, `on_collision`, `on_trigger_enter/exit`, `on_action`, `on_interact`, `on_draw_ui`, `on_scene_exit/enter`, `on_animation_end`, `on_sequence_cue`, `on_event`, `on_expression(state)`, `on_persist_migrate(from)`; `ScriptCommand` for deferred effects; `DrawCommand` for immediate-mode 2D UI
 - **All game UI is script-driven** -- no hardcoded HUD; `hud_controller` entity + `hud.rhai` pattern; engine provides draw primitives (`draw_text/rect/circle/line/sprite`), scripts compose UI
-- **Game project pattern** -- games in own repos with engine as git subtree at `engine/`; `--schemas engine/schemas --schemas schemas` for layered overrides
-- **Player extensions** (ADRs 0071-0075) -- a game binary embeds `PlayerApp` and installs `PlayerExtension`s (`add_extension`): `register_script_api` (native Rhai fns; same signature replaces Flint's), `pre_update(ExtensionCtx)` before scripts' `on_update` (world, clock, input, last frame's camera, `gpu` for `upload_mesh`/`remove_mesh`, `attach_mesh`, `fire_event` -> scripts' `on_event` same frame), `on_window_event` (only input events consumable) and `ui(egui)` drawn between script UI and the Foreground debug panels. `fonts(&mut FontDefinitions)` edits egui's fonts before each install (ADR 0081); `fonts/fonts.toml` `[egui] proportional/monospace` names egui's default faces, and every named family falls back to egui's fonts. With any extension installed, egui sees input first; a release follows its press. Runtime meshes are frustum-culled per draw by their AABBs (every game). Picking: `Camera::screen_to_ground` / Rhai `screen_to_ground`. Book: guides/player-extensions.md
-- **Every runtime read goes through `flint_core::vfs`** (#97) -- `vfs::read` / `read_to_string` / `read_dir` / `exists` / `is_file` / `is_dir`, never `std::fs` or `Path::exists` in a runtime crate. The default source is the disk; the web player installs a `MemorySource` filled from a game bundle (`vfs::install`; `flint bundle <game>` packs one, `flint_core::bundle` is the format, `flint-player --bundle` plays one natively, audio arrives in a late bundle and `vfs::generation()` tells the player to load it; docs/design/web.md), and tests use `vfs::scoped` (this thread only). Decode images with `flint_render::open_image` (not `image::open`) and glTF through `flint_import::import_gltf` (not `gltf::import`), both of which read via the vfs. Writes (scene save, saves, replays) and hot-reload mtime polling stay on `std::fs`, natively; input overrides go through `flint_player::user_files` (OS config dir, or `localStorage` on the web, #100), and on the web so does the `persist_*` store (`save_<game_id>.toml`, #104). Tests and the CLI keep `std::fs`
+- **Game project pattern** -- games in own repos with engine as git subtree at `engine/`; `schemas = ["engine/schemas", "schemas"]` under `[project]` in the game's `flint.toml` layers the game's schemas over the engine's with no flags, and `--schemas engine/schemas --schemas schemas` overrides it for a run
+- **Player extensions** (ADRs 0071-0075) -- a game binary embeds `PlayerApp` and installs `PlayerExtension`s (`add_extension`): native Rhai fns, `pre_update` before scripts' `on_update`, window events, egui UI. Book: guides/player-extensions.md
+- **Every runtime read goes through `flint_core::vfs`** (#97) -- `vfs::read` / `read_to_string` / `read_dir` / `exists` / `is_file` / `is_dir`, never `std::fs` or `Path::exists` in a runtime crate. Decode images with `flint_render::open_image` and glTF through `flint_import::import_gltf`. Tests and the CLI keep `std::fs`
 - **Fixed-timestep physics** (1/60s) via accumulator; animation/particles run at variable rate
-- **Physics joints** (ADR 0069) -- `joint` component (hinge/prismatic/spherical/fixed) on a dynamic entity, attached to `joint.parent` or the transform parent. Bodies are placed from `get_world_matrix` and dynamic poses write back as local `position` + `rotation_quat`; unit scale is assumed on the physics chain. TOML units are degrees/metres, converted to Rapier radians at sync. Scripts drive `motor_target` via `set_joint_target` and pose rest-quaternion nodes with `rotate_local` / `set_rotation_quat` (`set_rotation` still deletes the quaternion). Bench: `demo/joint_test.scene.toml`
-- **Two-bone IK** (ADR 0070) -- `ik_two_bone` component on the second bone of a transform chain names `target`, `pole` and `tip` entities; `IkPass` (flint-animation) solves after scripts/physics/animation each frame and before the renderer reads world matrices, writing only the two bones' `rotation_quat` from their captured rest. Lengths come from the model's rest offsets. `flint render` runs it once
-- **Glyph atlas** (#264) -- `flint_render::glyph_atlas`: `GlyphSet` = a coverage atlas (`R8Unorm` via `GpuGlyphAtlas`) + named luminance ramps + edge glyphs, from `fonts/<name>.glyphs.toml` (TTF via ab_glyph, PNG grid, hand-drawn `.txt` cells with `cell = [w, h]`, or the hand-drawn built-in 8x8 set in `builtin_8x8.txt`); `GpuGlyphStack` stacks several atlases in one texture (#335); `GlyphSetCache::get("builtin"|"<name>")`; it and `PaletteCache` hot-reload natively (#323: `poll()` stats the files an entry read or searched, `crate::file_watch::FileStamps`; the ASCII style polls every 15 frames). Top-level keys like `default_ramp` go before the first `[table]`. Look at one with `cargo run -p flint-render --example glyph_atlas -- out/ [set]`. Book: concepts/glyph-atlas.md
-- **Stylize passes** (#262, ADR 0111) -- `flint_render::stylize`: a style is a module exporting `STYLE: StyleDescriptor` (name, `StyleStage::Hdr` before fog/bloom/tonemap at scene resolution or `Display` after the composite at output resolution, params with ranges, `create`) plus its name in `register_styles!`; its `StylePass::encode` reads a `StyleFrame` (params, depth, camera, `target()` scratch textures, kept bind groups). Styles of a stage chain in registration order (or a table's `order = <n>`, lower first, ties by registration; `stylize::chain_order` / `stage_chain`, F4's chain line with swap buttons, #299) through framework ping-pong targets that live in `PostProcessResources` (rebuilt on resize). Scenes: `[post_process.styles.<name>]` (Kuwahara too since #298: a scene's old `kuwahara_*` keys fold into its table on load via `flint_scene::fold_legacy_style_keys`; numbers are `params`, strings are `options`, e.g. a font or ramp); F4 → Styles (and the player's F3 Styles panel, made when a scene uses a style) is one `flint_debug_ui::StylesEditor` drawn from descriptors (#268): optional `hints: &[StyleHint]` give labels/help/`.integer()`, `<base>_r/_g/_b` params fold into one colour picker (display values) and are one colour setting (`StyleColor`, #315: `tint = [r, g, b]` or `"#rrggbb"` in a table, `tint=#rrggbb` or `r/g/b` on `--style`, `frame.color("tint")` / `variant_color`, Copy TOML writes the array), and each style gets Defaults / Authored / Copy TOML (`stylize::style_toml`); an option can find its choices at run time (`StyleOption::discovered` + `ChoiceScope::files`, #322: ASCII lists the scene's `palettes/`, `fonts/` and the chosen font's ramps through the vfs; hosts pass the scene folder with `RenderDebugPanel::set_scene_dir` / `StylesDebugPanel::with_scene_dir`, and a discovered option is open to `--style`); `ascii` (#265) is the display-stage glyph style, cells in points times `SceneRenderer::pixels_per_point` (hosts set it from the window), fonts found via `scene_dir`; its edges (#267) are two more passes (`ascii_edges.wgsl`: edge pixels at `StyleFrame::depth_size`; `ascii_edge_cells.wgsl`: one texel a glyph cell summing structure tensors) that the glyph pass draws as line glyphs, and a mask boundary where either side is one of the style's ids (plain or per-entity variant) is always an outline; `encode_to` builds newly enabled styles itself. `invert` is the template. Bloom reads the unstylized HDR unless an HDR style that ran feeds it (#300): `StyleDescriptor::feeds_bloom` (user styles: `feeds_bloom = true` in the `.shader.toml`), overridden per scene by `feeds_bloom` in `[post_process.styles.<name>]`, `--style <name>:feeds_bloom=1`, F4's Feeds bloom checkbox; then the threshold reads the HDR stage's result (`run_bloom`'s `source`, keyed by input id). SSAO/volumetrics read depth only. Demo: `demo/neon_bloom.scene.toml`. Shared edges (#301): a descriptor's `needs: &[StyleNeed::Edges]` gets `StyleFrame::edges` (`stylize/edges.rs`: `Rgba16Float` at the depth's size, r = silhouette / g = crease strength over the shared `[post_process] edge_depth`/`edge_normal` (`--edge-depth`/`--edge-normal`), ba = unit direction, y down; `edges_bind` + `kit::texture_layout`), drawn once a frame before the Hdr stage however many styles read it (`SceneRenderer::style_edge_runs`); `edges_view` shows it, user styles take `inputs = ["edges"]` (`flint_edges`/`flint_edge`). ASCII and pencil still run their own edge passes. A style with frame-to-frame state (ASCII's per-cell history, #277: a cell pass into a ping-ponged `Rgba16Uint` texture via `target_sized`, then the glyph pass) trusts it only when `StyleFrame::frame` follows its last frame and `history_epoch` is unchanged; hosts call `SceneRenderer::reset_style_history()` on a scene change or camera cut (#343: Rhai `reset_style_history()`, and the player's `camera_cut` detector resets on a jump > 2 m or turn > 30° in a frame at > 4x the last frame's rate; `set_camera_cut_detection(false)`; `demo/ascii_cuts.scene.toml`). `temporal = "reproject"` (#344) reads a cell's past where its surface was last frame (scene depth + last frame's `view_proj`, kept by the style; an `R32Float` cell-depth target rejects disocclusions); measured no better than screen-space history on the meadow, so opt-in (`tools/ascii_flips.py --track 8` counts flips along the motion). Book: concepts/stylize-passes.md (reference) and guides/stylized-rendering.md (choosing whole-frame vs per-entity, with the decision's captures). The decision: per-entity *selection* on one screen grid, with full screen its "everything" case and `grid = "object"` opt-in only; glyph-like styles at the Display stage (`docs/adr/0111-stylized-rendering.md`)
-- **Entity style mask** (#263) -- `flint_render::style_mask`: a `style_mask { style, enabled }` component (descendants inherit; nearest wins) gives each styled entity an id (`StyleIds`, 1.. in name order). After the scene pass (and MSAA depth resolve) its opaque static/box/skinned draws, its terrain chunks (the host names the terrain entity with `set_terrain_entity`, #310) and then its styled transparents (a styled transparent is a lens: its id replaces what is behind it, #310) are redrawn with their cached transform (+ bone) bind groups into an `Rg16Uint` target in `StyleTargets` (id in `.r`, blend in `.g`, #278), depth-tested in the shader against the single-sample depth with a slope tolerance; ids ride one dynamic-offset uniform buffer. Drawn only while a style whose `uses_mask` asks for it is on (`MaskUse::Always`, or `MaskUse::When(fn(&config, &ids))` per frame, #350: ASCII only with `edges > 0` and an id to outline); styles read `StyleFrame::mask` / `mask_bind` / `style_id`. `--debug-mode style` (`DebugMode::StyleMask`) turns on the `mask_view` display style. Demo: `demo/style_mask.scene.toml`. Veil (#290): just before the mask, unstyled transparents and all particles draw their coverage into an `R8Unorm` "style veil" (read-only scene depth attachment, `fs_veil` entry points in `shader.wgsl`/`skinned_shader.wgsl`/`particle_shader.wgsl`), and the mask writes blend x (1 - coverage): what's in front unmasks by its coverage. A new transparent or particle draw path needs a veil draw too. Demo: `demo/style_veil.scene.toml`
-- **Per-entity styles** (#266) -- a descriptor's `component: Some("ascii_style")` makes a style per-entity: an entity with that component (or a `style_mask` naming the style) switches it on for its own pixels with no `[post_process.styles]` table (`is_on(config, &StyleIds)`; `ensure`/`active`/`any_uses_mask` take the ids). Its fields are the descriptor's params/options (ASCII's `font` too, #335: every set in use is stacked into one atlas, each variant row carrying its glyph cell and edge-glyph start; up to `MAX_FONTS` = 8), falling back on the scene's table then defaults (`StyleVariant::param`; a colour `tint = [r, g, b]` or `"#rrggbb"` fills `tint_r/g/b`, #315); each distinct set is a `StyleVariant` with its own id, named for its settings (`ascii{ramp=blocks}`, `ascii@barrel` for `grid = "object"`, `ascii{off}` for `enabled = false`). Styles read `frame.variants()` / `variant_param` / `whole_frame()` / `project`. Scissor (#385): `frame.styled_rect(pad)` is the style's entities' projected draw bounds (skinned ones as posed, from CPU copies of the bone matrices) grown by `pad`, `None` when it covers the frame; `kit::scissored_pass` draws inside it and blits the input around it (byte-identical only while the passthrough is exact outside), `kit::fullscreen_pass_in` for prep passes; pencil and ASCII (glyph + both edge passes) use it; `FLINT_STYLE_SCISSOR=0` / `set_style_scissor(false)` draws full passes. The schema gives `ascii_style` fields no defaults on purpose (the loader fills defaults in). ASCII: `scope = "screen"|"entities"`, `grid = "screen"|"object"`, `--ascii-scope`/`--ascii-grid`. Demo: `demo/ascii_entities.scene.toml`. Thin features (#288): `outline` (points) and `min_coverage` are ink floors `variant_pixel` passes to `shade`, from the mask edge and the variant's share of the cell's samples; per-entity rows only, slot 0 untouched (`demo/ascii_silhouette.scene.toml`). Whole-cell silhouettes (#338): `silhouette = "cell"` (flag `SNAP`) draws a cell of the variant's grid whole when it covers `cell_share` of the cell's 16 samples, scene pixels included, and drops its own minority cells; the glyph pass's `resolve(p)` asks the pixel's own grid, then each of `snap_grids` (up to `MAX_SNAP_GRIDS` = 8), per pixel; pixel-silhouette variants keep their pixels; outline off on a snapped variant. Scripts (#269): `set_entity_style` / `set_style_param` / `clear_entity_style` queue `ScriptCommand`s that `flint_player::apply_style_command` turns into `flint_render::entity_style` component edits (set/clear fire `style_changed`); `tween_style_param(id, param, target, secs[, easing])` lets the engine ease a number/blend/colour (#370: `flint_player::StyleTweens`, stepped on game time before the frame's commands, start from `entity_style::tween_endpoints`, `style_tween_done` at the end; a `set_style_param` of the param or a clear stops it); `get_entity_style` / `get_entity_style_variant` / `get_style_param` read back (own, inherited or whole-frame; `entity_style::drawn_style` / `style_setting`) through the `flint_script::StyleReader` the player installs (`SceneStyles`, re-copied when `SceneRenderer::post_config_generation` changes, #372); a per-frame param is a variant-table row in the existing uniform, no GPU allocation (`SceneRenderer::kept_post_binds` + hub report test in `tests/stylize.rs`). Demo: `demo/ascii_story.scene.toml`. Whole-frame from scripts (#369): `set_post_style` / `set_post_style_param` / `reset_post_style` edit the renderer's config through `flint_render::post_style` (`flint_player::apply_post_style_command`, fires `post_style_changed`); every style's table takes `blend` 0..1, which `run_stage` draws as the style's input back over its output with blend constant 1 - blend (`stylize/blend.rs`, no per-frame allocation; at 0 `StyleSet::active` leaves the style out of the chain, still built and `is_on`, so the frame is byte-identical to the one without it, #399); demo `demo/dream_story.scene.toml`. Blend (#278): `blend` 0..1 on the style component (or `style_mask`) is the root's, inherited, and rides in the mask's `.g` (`resolve_blended`), never in the variant name, so a ramp keeps one id; an id whose every root is at blend 0 is `StyleIds::is_faded` and asks for nothing, so a style with only faded entities is off, pass and mask skipped (#400; a `scope = "entities"` table is a preset that doesn't hold it on: `StyleDescriptor::covers_frame`); ASCII mixes per pixel (`transition = "fade"`) or turns whole cells by a fixed patch-noise order (`"dissolve"`), each cell ranked in it among its own variant's cells within 8 (#398: `ascii_dissolve{,_order,_rank}.wgsl`, a band a dissolving variant up to `MAX_DISSOLVE` = 8, so a 6x5-cell prop turns exactly round(blend x cells) wherever it sits). Every other mask-reading style gets the blend (and the veil) from the framework's cross-fade (#396, `stylize/fade.rs`: after its pass, its input is mixed back by 1 - `.g` on its own ids, drawn only while `SceneRenderer::style_mask_fades()`); one that draws it itself sets `.blends_itself()` (ASCII; a user style that calls `flint_style_blend`). Demo: `demo/ascii_reveal.scene.toml`; book: stylize-passes.md "Blending in and out" (and how it differs from `--render-mode` tears)
-- **Pencil sketch** (#273) -- `stylize/pencil.rs`, a display style in two passes: a prep pass writes tone, contour (depth steps on the near side, creases from depth-rebuilt normals, mask edges, luma edges by `detail`) and a double-angle stroke direction into `pencil.prep`; the draw pass blurs the direction, hatches up to 4 layers in 15° bins (surface = across grad(1/z), so planes hatch straight), wobbles/doubles contours and lays paper grain. All randomness is integer hashes of row/dash/layer/`seed` (byte-identical runs); `boil` steps the seed by post time. Per-entity via `pencil_style` (same variant table as ASCII, `grid = "object"` anchors the hatching); `grid = "world"` (#389) lays it on the surfaces: triplanar stripes on the depth-rebuilt world position (prep zw then hold the octahedral normal), spacing in octaves of 2^k metres picked per plane and stroke direction from the quad derivatives of the world position and cross-faded like mips, rows hashed by odd part + octave so a stroke survives the climb; a mask id another running style owns (`StyleFrame::foreign_ids`) gets the `FOREIGN` slot and passes through. The `graphite` look uses it. Images from files (#390): `paper_image` / `stroke_image` (+ `paper_scale`, `stroke_rows`; watercolor takes `paper_image` too) load through `stylize::images::ImageSlot` (scene dir, parent, `.`; a bare name tries `papers/` / `strokes/<name>.png`; vfs; CPU mips; a paper's cast neutralized and its luma measured), read with `textureLoad` by `style_image.wgsl`, no sampler; one image of each a frame
-- **Style ownership** (#384) -- each pixel is one style's: after every style that `yields` (all but `mask_view`, `edges_view`, `display_bloom`: `.draws_over_entities()`), `run_stage` draws `stylize/ownership.rs`, which puts the style's input back where the mask id's variant names another registered style that is on (`stylize::owner_table`, registry index per id; the drawing style rides in `instance_index`), mixed by the mask's blend. So whole-frame ASCII leaves a pencil cask sketched, in either chain order, and a new style gets it free. An opt-out variant is nobody's; the cut is per mask pixel, not cell-snapped; `any_uses_mask` draws the mask for it; skipped under `--debug-mode style|edges`. Golden `ascii-full-yields-to-pencil`
-- **Palette style** (#324) -- `stylize/palette.rs`: the frame quantized to a `flint_render::palette` (`palette`, `dither`, `pixel` in points, `chroma`; `--style palette:palette=phosphor,dither=1,pixel=4`). Every `nearest` palette reader picks through one WGSL matcher, `pal_pick` in `src/palette.wgsl` (#320's OKLab; `palette::PALETTE_WGSL`, concatenated with the includer, which defines `palette_ink(i)` and `palette_ink_lab(i)`); `Palette::pick` / `palette::pick_in` is its CPU twin and GPU tests hold them equal. Ladders are climbed by each style. A new palette-reading style includes the file, never a copy. Unlike ASCII the style counts the ground as a colour (`Palette::table`, `Palette::quantize`), and it runs before `display_bloom`. Built-in `paper` (dark inks, cream ground) needs `ground = "inverse"` in ASCII
-- **Display bloom** (#321) -- `stylize/display_bloom.rs`, a whole-frame display style registered after ASCII/pencil: threshold on display value into a half-size `Rgba16Float` mip, 13-tap downs, additive tent ups, composite over the input; glow that crosses glyph cells (ASCII's `glow` stays inside each cell). The first display style with a mip chain: each mip a `target_sized`, each step a 256-byte slot in one uniform buffer (`kit::fullscreen_pipeline_with` takes the entry point and blend). `levels` is in points (one more per doubling of `pixels_per_point`); intensity is divided by the levels drawn. 0.066 ms at 1080p
-- **User-authored styles** (#274, #275, ADR 0112; experimental, format v1) -- `styles/<name>.shader.toml` (`version = 1`, `name` = stem, `stage`, `shader`, `inputs = ["depth","mask"]`, `[params.<k>] default/min/max/label/help/integer`, #413: `[images.<k>] file/srgb`
-and `[options.<k>] kind = "choice"|"image"`, `default`, `choices` (an image option without them lists its default's
-folder at load; every option is closed, so #318 warns); options are `u32` indices in `params` after the floats with
-`FLINT_<OPT>_<CHOICE>` consts; images bind in group 3 read with group 1's sampler (no new sampler):
-`flint_image_<k>(uv)` / `_tiled_<k>` / `_size_<k>()` / `flint_lut_<k>(rgb)`, polled and re-decoded natively) + a WGSL `fn style(p: StylePixel) -> vec4<f32>`; `stylize::custom` composes a generated prelude (`flint.*`, `params.*`, `flint_sample/flint_view_depth/flint_world_pos/flint_style_blend`...) and entry points, checks it with naga (native) into `file:line:col` errors, draws a passthrough on failure, polls the WGSL's mtime to rebuild (last good kept). Every user loop is guarded natively (#411): `guard_loops` rewrites the naga IR (a counter per loop, `break if` at `custom::LOOP_LIMIT` = 4096) and wgpu builds naga's `wgsl-out` of it (`Report::guarded`); the web doesn't guard yet. Hosts call `stylize::custom::load_dir(scene_dir)` BEFORE reading `[post_process]` (`flint render`, the player's `scene_loading::load_user_styles` on load and transitions, and the viewer do); the registry is an append-only snapshot of leaked descriptors, so `registry()` is no longer a compile-time slice. `.shader.toml` hot reload (#275): hosts call `custom::reload_changed(scene_dir)` every ~15 frames; a changed description replaces its descriptor at the same index (`replace_runtime`; `StyleSet` rebuilds a slot whose descriptor address changed) and the host re-reads the scene's tables for it (`refresh_settings`). A user style's bind-cache names carry a per-install generation: keep them unique, or a rebuilt pass binds the old pass's buffers. Errors: `custom::errors()`, drawn by `flint_debug_ui::paint_style_errors` (player + viewer) and tagged in F4; `flint bundle` loads each scene's user styles from the packed files and refuses broken ones. A style with `inputs = ["mask"]` is per-entity (#414): it gets the component `<name>_style` (no schema file; fields = its params and options + `enabled`/`blend`; an image option binds the scene's file, a per-entity value moves only its index), a `style_mask` alone switches it on, and `params` in its WGSL is a `var<private>` the entry point fills from the pixel's variant row (`flint_params` table: 16 rows + 256 id slots; `flint_params_at(uv)` reads a neighbour's). Template: `flint style new <name> [--stage hdr] [--inputs depth,mask,edges] [--dir styles]` (#416; `custom::template`), `flint style check <file|dir>` (GPU-free naga check, exit 1 on an error; `custom::check_file`), `flint style prelude <file> [--composed]`, `flint style list [scene]`; worked example `demo/styles/template.*`. Not `*.style.toml`: that suffix is AI style guides and UI class files. `--style`/`--sweep` let unknown names through clap and `StyleArgs::check` validates after loading. Demos: `demo/styles/`, `demo/user_styles.scene.toml`
-- **Post-processing** -- HDR pipeline (`Rgba16Float`) with bloom, SSAO, fog, volumetric (god rays), Kuwahara (anisotropic painterly filter), vignette; `[post_process]` TOML block; F4 opens the Rendering & Effects debug menu in the player and viewer (all toggles + parameters, ADR 0053); when active, PBR shaders output linear HDR
-- **Quality settings** (FlintKart#55) -- `flint_core::quality::QualitySettings` (render_scale, render_scale_auto, msaa, shadows, shadow_resolution, shadow_cascades, shadow_distance, and post caps post_process/bloom/ssao/ssao_samples/fog/volumetric) reaches `SceneRenderer::set_quality` from `--quality k=v,...` (flint-player and `flint render`), the page's `?quality=`, Android's `dev_profile.toml` `[quality]`, and scripts' `set_quality(map)` / `get_quality()` / `gpu_info()`, applied between frames (`PlayerApp::apply_quality`). Post keys are caps over the authored config: the renderer keeps `post_process_config()` (authored) apart from `effective_post_process_config()` (drawn), so a scene load keeps the tier. An MSAA change rebuilds every scene pipeline against equal bind group layouts (wgpu dedupes them), so cached bind groups stay valid; a new scene pipeline must be added to `set_msaa`. Shadow cascades map split depths through the camera's own near/far (they assumed 0.1/200 before, stretching the last cascade to the 1000 m far plane). Book: concepts/quality-settings.md
-- **Scene transitions** -- `TransitionPhase` lifecycle with script-driven visuals; `PersistentStore` survives transitions; `GameStateMachine` pushdown automaton with per-system `SystemPolicy`
-- **Input system** -- TOML-based `InputConfig` with layered loading (built-in -> game -> user overrides -> CLI); keyboard/mouse/gamepad/touch unified via `Binding` enum
-- **On-screen touch controls** (#133) -- an input config's `[touch_controls]` block (sticks, buttons, look region, menu; a later layer's block replaces the whole) is evaluated by `flint_runtime::TouchControls` inside `InputState` and painted by the player (`touch_overlay.rs`) on its own Foreground egui layer. The one engine-drawn UI, since a stick is a device: a finger on a stick/button skips egui and extensions (`taken_before_the_game`), is held by touch id and never reaches scripts' touch list; look drags feed `raw_mouse_delta` and are shared. Shown after a real touch, hidden by a key or pad (`--touch-controls auto|always|never`, web `?touch=`); geometry in points inside the web page's safe-area insets. `--input-script` has `touch`/`drag`/`lift`. A button's `value` (default 1; -1 drives an axis's other end) and scripts' `set_touch_controls(false)` (put away under a menu so taps reach it, #134); a finger counts for `any_input_just_pressed`. The shipped games' layouts live in their repos (Float, FlintKart `config/input.toml`). Book: concepts/touch-controls.md, guides/playing-on-mobile.md
-- egui 0.30's `Color32::from_white_alpha` / `from_rgba_unmultiplied` premultiply in linear light, but the HUD blends in display space: a translucent white drawn with them reads several times too bright. Build translucent light colours with `from_rgba_premultiplied(a, a, a, a)`
 
 ## Critical Gotchas
 
 - `toml::toml!` macro produces `Map<String, Value>` not `Value` -- needs `.into()` in tests
 - wgpu v23: `Instance::new()` takes owned `InstanceDescriptor`; max 4 bind groups (0-3); `wgpu::Queue` is not `Clone` -- pass `&Queue` through, do not stash one in a struct
-- wgpu v23 on DX12: the shader-visible sampler heap has 2048 slots and every bind group's samplers are copied into it, with no sharing, so samplers in a per-entity or per-material bind group cap how many can live ("Not enough memory left" in `create_bind_group`, DX12 only; test with `WGPU_BACKEND=dx12`). Keep samplers in groups bound once a frame: PBR materials sample with the light group's `material_sampler` (group 2, binding 4), and a material bind group holds none
 - winit v0.30: `ApplicationHandler` trait with `run_app()`; `DeviceEvent::MouseMotion` for raw mouse delta
 - Rapier v0.22: character controller types in `rapier3d::control`, NOT `rapier3d::prelude`
 - Kira v0.11: `Decibels(f32)` and `PlaybackRate(f64)` are tuple structs; uses `glam` via `mint`
 - `AudioManager::new()` / `Gilrs::new()` may fail in headless/CI -- wrap in `Option`
-- Rhai v1.24 `sync`: `call_fn()` Scope visible only to direct callee, NOT sub-functions; entity IDs as `i64`; no implicit numeric coercion (`0.0` is NOT `0`); draw `_ex` functions take `layer` as int (`0`), not float (`0.0`)
-- `ScriptCallContext` uses raw `*mut FlintWorld` -- only valid during `call_update()`/`process_events()` scope
-- `on_update()` is parameterless -- use `delta_time()` API; `on_interact` checks `interactable.range` + `.enabled`
-- `on_draw_ui()` ALWAYS runs even when scripts paused (pause menus need it)
-- HDR format `Rgba16Float` -- all pipelines must use this when post-processing active; `resize_postprocess()` on window resize
-- `render_draw_commands()` is a free function to avoid borrow conflicts; `load_pending_sprites()` before egui borrow
-- Screen size for draw commands must be egui logical points, NOT physical pixels
-- Skeletal animation: separate `SkinnedVertex`/`skinned_pipeline`; bone matrices in storage buffer (bind group 3)
-- Particles: no depth write; one shared storage buffer indexed by `first_instance`; skip draw for 0 alive; `bytemuck::cast_slice` for zero-copy
-- `flint-terrain` does NOT depend on `flint-render`; uses standard `Vertex` format so reuses shadow pipeline
+- Rhai v1.24 `sync`: `call_fn()` Scope visible only to direct callee, NOT sub-functions; entity IDs as `i64`
 - `flint-android` excluded from `default-members` -- use `cargo ndk -p flint-android`; min API 26. `cargo test --workspace` fails on `ndk-sys` on Windows; use plain `cargo test`
 - Windows links a 1 MB main-thread stack; debug builds of flint-cli's clap parser overflow it -- `.cargo/config.toml` links with `/STACK:8388608`. Don't remove it, and don't grow `Commands` assuming stack is free.
 - Scene entity `merge_component()` does field-level merge INTO archetype defaults, not full replacement
-- `flint_core::toml_util` -- use `toml_f64`/`toml_f32`/`toml_vec3`/etc. instead of inline coercion patterns
-- Never use `archetype = "furniture"` on non-visual entities -- furniture includes `bounds`, renders teal boxes
-- Per-frame GPU allocations are the renderer's CPU cliff: `update_from_world` rebuilds the draw lists every frame, so anything it needs per entity must come from a cache (`draw_bind_cache` for transform/material binds keyed by entity + sub-mesh with a material hash, `box_mesh_cache` for procedural boxes, `GpuMesh` buffers shared via `Arc`, one dynamic-offset uniform buffer for all shadow draws). Never `create_buffer`/`create_bind_group` inside a per-entity loop; a 270-entity scene went from ~17 ms to ~4 ms when those were removed. Skinned draws use the same cache (`SKINNED_DRAW_KEY`, bone binds in `skinned_bone_binds`, #121). On the web every `create_*` is also a JS object: Float's skinned path made 386 buffers and 327 bind groups a frame, and Firefox stalled ~250 ms at each GC. Count WebGPU calls per frame in the browser before trusting a desktop timing (`?perf=1` shows them: the page wraps `submit`/`writeBuffer`/`createBindGroup`/`createBuffer`/`beginRenderPass`, #139)
-- One submission a frame (#139): `SceneRenderer::encode_to` records the whole frame (grass, shadows, scene, post-process, depth upscale, world lines) into the caller's encoder, the player adds its HUD and the GPU timer's resolve (`encode_gpu_timings`), submits once, then calls `frame_submitted` (grass and timer read-backs). `render_to` is that with its own submit. Every `queue.write_buffer` lands before the submission, so a uniform buffer may hold one value per frame: steps that differ get slots of their own (bloom's per-step slots), and encoding two cameras into one submission would show the second camera's uniforms to both. Cached draws' transforms live in `TransformArena` pages (`bind_cache.rs`, a 256-byte slot each, one write per page); post-process bind groups live in `PostProcessResources::binds` (dropped on resize); ones over the caller's depth view are kept under the id the caller passes with it (#379: `encode_to`/`render_to` take `impl Into<DepthTarget>`, `RenderContext::depth_target()` / `HeadlessContext::depth_target()`, a `new_depth_id()` each time the texture is made; `BindCache::get_over` drops the old id's groups) and made per frame for a bare `&TextureView`, since wgpu 23 gives a view no identity to key on. A host that makes its own depth texture takes a new id with it, or kept groups bind the old texture
-- Offline capture: `flint-player --frame-step S` advances the clock exactly S seconds per frame (wall time ignored), and with `--screenshot-every S` every frame is written; `--input-script FILE` plays timed `down`/`up`/`tap` keys, `axis` values and gamepad `press`/`release` (on pad slot 9) at game times (format in `player_app/input_script.rs`); a scripted key also goes through the debug keys (`handle_debug_key`), so `tap F2` opens the stats overlay, and `--stats` opens it from the first frame. Together they make deterministic, smooth gameplay footage and scripted regression runs
-- Perf switches: `flint-player --exit-after N` prints `[perf] avg ms/frame`, the spread of dt and of present-to-present times (p50/p90/p99/max and frames over 1.5x p50), and the average draw calls, entity draws, culled draws and triangles on exit; `FLINT_VSYNC=0|mailbox` picks the present mode (Fifo can pace at a virtual display's rate, e.g. 7 Hz with Virtual Desktop attached); `FLINT_FRAME_LATENCY=1..3` sets the swapchain's frame latency (default 2); `FLINT_PACING=0` turns off vsync pacing; `FLINT_SHADOWS=0` disables the shadow pass at start; `FLINT_LOD_SCALE` / `FLINT_DRAW_DISTANCE_SCALE` start the distance levers (#56: glTF `extras.flint_lod` bands per primitive, `lod.draw_distance` per entity, Rhai `set_lod_scale` / `set_draw_distance_scale`; `FLINT_LOD_SCALE=1000` holds every model at full detail; book: Rendering); `--render-scale 0.25..1|auto` draws the 3D scene at that fraction of the window on each side (HDR chain + its own depth, upscaled by the composite, depth copied back so world text/lines still test against it) under a full-resolution HUD, `auto` stepping down to hold 60 fps; the web caps the scene at DPR 1.5 by default and takes `?scale=` (#122, `SceneRenderer::set_render_scale`); `--perf` prints a line every 10 s with each frame phase's CPU time, the worst scripts and each pass's GPU time, and the web page's `?perf=1` (`?perf=cpu` without GPU timing) shows the same in a corner with a Copy line button (#120, docs/design/web.md)
-- Vsync pacing: under Fifo the player gives `GameClock` the monitor's refresh period (`set_vsync_period`, re-read when the window moves), and `delta_time` comes in whole refresh periods that keep game time on the wall clock. On a hybrid-GPU laptop Fifo lets frames through in bursts (6, 6, 6, then 45 ms at a 60 Hz mean); paced, every frame steps 16.7 ms. Stalls over 250 ms pass through, and frames faster than the refresh on average fall back to raw time. `raw_delta_time` is the unpaced wall time. See the book's Profiling guide
+- Read a component through `world.view(id, comp::COLLIDER)` (`.f32("friction", 0.5)`, `.choice("shape", &[..], "box")`, `.opt_f32(..)`; ADR 0115, `crates/flint-core/CLAUDE.md`): it takes an integer as a number and reports a wrong type or unknown choice once per entity and field. Any other TOML goes through `flint_core::toml_util` (`toml_f64`/`toml_f32`/`toml_vec3`/...). Never `toml::Value::as_float` in a runtime crate: it reads `8` as nothing, and `scripts/wasm-check.sh` denies it
+- `furniture`, `wall`, `floor`, `ceiling`, `pillar`, `room`, `door` (and the `door` component) are not the engine's: they are the examples' layer, `schemas/examples/` (#681). The root `flint.toml` lists it after `schemas/`, so every scene in this checkout resolves them with no flag; a `--schemas` flag is the whole list, so `--schemas schemas` alone leaves them out (add `--schemas schemas/examples`), and a game has none of them unless its own `flint.toml` lists `engine/schemas/examples`. In an example, never put `furniture` on a non-visual entity: it includes `bounds` and draws a teal box. The renderer still colours a `bounds` box by these names (`default_archetype_visuals`)
+- Every `flint_core::components` constant has a schema in `schemas/components/`, and every schema a reader: `cargo test -p flint-schema --test engine_schemas` holds it (ADR 0115; what it checks: `crates/flint-core/CLAUDE.md`). A schema field's `default` is written into the component at load, so give one only where the reader falls back to that same value
+- Per-frame GPU allocations are the renderer's CPU cliff: never `create_buffer`/`create_bind_group` inside a per-entity loop; what a draw needs per entity comes from a cache (`crates/flint-render/CLAUDE.md`)
+- One submission a frame (#139): `SceneRenderer::encode_to` records the whole frame (grass, shadows, scene, post-process, depth upscale, world lines) into the caller's encoder, the player adds its HUD and the GPU timer's resolve (`encode_gpu_timings`), submits once, then calls `frame_submitted` (grass and timer read-backs). `render_to` is that with its own submit.
+- CI (`.github/workflows/ci.yml`, #757) runs `rustfmt` (the tree is formatted; an unformatted file fails the PR and `issue.sh land`), `clippy (native)` (`cargo clippy --all-targets`: warnings pass, a deny-level lint or code that doesn't compile fails), the wasm and headless checks, and the GPU tests on WARP, which don't block while they fail on main (`continue-on-error`). No unit tests run in CI yet
 - CI's `wasm32 check` (`.github/workflows/ci.yml`) builds `flint-player` and every crate it links for `wasm32-unknown-unknown` on each PR. Run it locally with `bash scripts/wasm-check.sh` before pushing runtime-crate changes. It also denies `Instant::now`/`SystemTime::now` and their `elapsed()`, which compile on wasm but panic there: runtime code uses the `web-time` crate (a workspace dep: `web-time = { workspace = true }`), which #100 moved every older site to. Desktop-only deps in a runtime crate go under `[target.'cfg(not(target_arch = "wasm32"))'.dependencies]`, as in flint-player's Cargo.toml (docs/design/web.md)
-- Web frame loop (#121): `flint_web.rs` runs winit with `ControlFlow::Wait` and `about_to_wait` requests a redraw, so the player draws once per `requestAnimationFrame` and the main thread sleeps between frames. Never `ControlFlow::Poll` on the web: it chains `scheduler.postTask` tasks back to back, Chrome shrugs but Firefox starved its refresh driver (83 ms frames, multi-second stalls, half the audio buffers late). `?loop=poll` brings the old loop back for comparisons
-- Web player (#102): draw the swapchain through `RenderContext::frame_view` (sRGB view of a plain WebGPU canvas), never a default view. Sound and pointer lock need a gesture: the page's Begin calls `flint_player::web_begin()`, and on wasm `set_cursor_captured(true)` is a wish that `sync_pointer_lock` turns into a lock while the page has activation; mouse look flows only while the lock is held. Headless Chrome never grants pointer lock, and headed Chrome only with the window focused (`Page.bringToFront`). Touch (#132): winit's web backend sends `pointerType == "touch"` as `WindowEvent::Touch` scaled by `devicePixelRatio`, and `touch_to_surface` rescales to canvas pixels (they differ under Chrome's device emulation on a scaled desktop). A `(pointer: coarse)` page asks for no pointer lock. Test with CDP `Emulation.setTouchEmulationEnabled` + `Input.dispatchTouchEvent`
-- Web audio (#136): the browser mixes in an `AudioWorklet`, on the audio thread, running a second wasm (`crates/flint-audio-worklet`: kira only, no imports, `[profile.worklet]` opt-level 3, built by Trunk.toml's `pre_build` hook and copied beside the page). The pages share no memory with it (no COOP/COEP on Pages), so `AudioEngine` calls become `flint_audio::remote` commands posted once a frame and each sound crosses once as samples; handles are `engine::SoundHandle` / `SpatialTrack`. A new engine call that plays or changes sound needs a `protocol::Command` too. `?mixer=main` (or a scene with a `music_session`, which needs `manager_mut`) keeps the old main-thread cpal stream, which is also the fallback when the worklet fails
-- play.chaps.dev (#103): `.github/workflows/play.yml` builds the player with trunk, packs every game in `tools/play-site/games.toml` (each pinned to a commit) with `flint bundle`, and deploys this repo's Pages from Actions. `?game=<id>` plays `games/<id>/<id>.flintpack`; `?embed=1` is the iframe view. `index.html`'s doorway shows the chooser, or the game's film when WebGPU is missing, before any wasm loads: `Trunk.toml`'s loader awaits `window.flintDoorway` and preloads only the JS glue. Keep the two together, or a browser that can't play downloads 7 MB of wasm (docs/design/web.md)
-- Web size (#123): the site builds with `trunk build --release --cargo-profile web-release` (workspace `[profile.web-release]`: opt-level z, fat LTO, 1 codegen unit, panic = abort, with `opt-level = 3` package overrides for the hot crates and `+simd128` in `.cargo/config.toml` (#137); 3.6 MB gzipped, down from 5.1). Speed-build a crate only when the phone shows it hot: each override costs bytes, and the 4 MB gzip line holds. The workspace `image` dep is PNG/JPEG/HDR only and `flint-render` restores image's defaults natively, so add a format for desktop there, not in the workspace. rhai's `no_optimize`/`no_custom_syntax`/`only_i64` are on for wasm only (flint-script's Cargo.toml): web scripts see `i64` integers and nothing else. Measure a size change with trunk and record it in web.md's Size table
 - `FlintWorld::spawn` ids come from a process-wide counter and scenes load from a `HashMap`, so entity ids differ run to run -- derive anything reproducible (seeds) from entity **names**, never ids
+- Lights are `[entities.x.light]` with a `type`, and a directional `direction` points *toward* the light. `flint schema light` lists the fields. A `directional_light` table is not a light: no system reads it, `flint validate` and `flint check` warn about it as an unknown component (with a hint naming `[light] type`), and a scene with only that gets `default_scene_lights`. The frozen fixtures under `tests/fixtures/scenes/` keep one on purpose (#681).
 
 ## Documentation Pipeline
 
-The book is `docs/book` (mdBook), published to docs.chaps.dev by hand from this machine. There is no drift checker and no CI for the docs: when a change alters a command, flag, key or component the book describes, update the book in the same PR, checking against the code rather than memory.
+The changelog is for games that carry the engine as a subtree (#765): a change a game can notice (a scene or schema key, a script function, a CLI flag, a format, a Cargo feature, a change in look or behaviour) gets an entry saying what changed and what to do. Each PR adds its own file, `bash scripts/changelog.sh new <issue> <slug>` (`changelog.d/<issue>-<slug>.md`, about 150 words), never an edit to `CHANGELOG.md` or `changelog/` (#788): after the merge the `Changelog` workflow moves it into `changelog/YYYY-MM.md` and `CHANGELOG.md` stays a short page linking the months. `changelog.sh since <date>` prints what is new. CI's `changelog` job (`scripts/changelog-check.sh`) fails a PR that touches `schemas/`, the script API or the scene format with no fragment; a commit-message line `Changelog: none (reason)` waives it for a change no game can notice.
 
-```bash
-mdbook build docs/book                                   # must be clean before any docs commit; output in docs/book/book/ (gitignored)
-powershell -ExecutionPolicy Bypass -File docs/build.ps1 -SkipRustdoc -Serve  # preview at http://localhost:3000 (drop -SkipRustdoc for the API docs)
-powershell -ExecutionPolicy Bypass -File docs/build.ps1 -Publish            # mdBook + rustdoc into ~/dev/docs.chaps.dev/flint, committed and pushed
-bash docs/publish.sh --publish                           # the same in bash (--skip-rustdoc, --serve, --docs-repo <dir>)
-```
+The book is `docs/book` (mdBook), published to docs.chaps.dev by hand from this machine. CI checks its generated parts, the script API (`flint script api --check-book`) and the crate table (`flint-arch-analyzer --check-book`), and `python scripts/docs-check.py` (#375) checks what the prose names against a built `flint`: every `--flag` on a `flint` command line (book and CLAUDE.md files), every `[post_process.styles.<name>]`, every image a page links. Nothing checks what the prose says a flag or key does. When a change alters a command, flag, key or component the book describes, update the book in the same PR, checking against the code rather than memory. There is no `tools/docs-check`, `DOCS_SYNC.md` or `.synced-to` (#175, #375): a ticket that names them is wrong.
 
-Without `-Publish` / `--publish` the scripts build and copy into the docs repo but don't commit. `docs/publish.bat` is `build.ps1 -Publish`. Windows PowerShell 5.1 (`powershell`) runs `build.ps1`; `pwsh` may not be installed.
-
-- Publishing pushes to the separate `docs.chaps.dev` repo (default `~/dev/docs.chaps.dev`; `-DocsRepo` / `--docs-repo` to change it). It is outward-facing: only on request.
-- Renders for the book are made locally with `flint render` (no GPU in CI) and land in `docs/book/src/images/` in kebab-case.
+Build, preview and publish commands: `docs/CLAUDE.md`.
 
 ## Project Structure
 
 - `crates/` -- All workspace crates
-- `schemas/` -- Engine component and archetype TOML definitions
-- `styles/` -- Style guide TOML definitions for AI generation
-- `demo/` -- Showcase scenes, scripts, audio, animations, `particles/` effect assets
-- `testGame/` -- Test project (levels/, schemas/)
+- `schemas/` -- Engine component, archetype and scene-table TOML definitions; `schemas/examples/` -- the room-builder layer the examples are written in, not part of the engine's set
+- `flint.toml` -- the checkout as a project: `schemas = ["schemas", "schemas/examples"]`, read by everything run from this tree (a game with the engine as a subtree never reads it)
+- `styles/` -- AI style guides (`*.styleguide.toml`, #420; `*.style.toml` is a UI class file) and looks (`*.look.toml`)
+- `examples/` -- Curated example scenes and their assets (was `demo/`, #763); `examples/index.toml` gives each a topic and purpose, `flint examples` lists them, `flint examples --check` (CI) holds the index to the folder and validates each. Improve them freely: nothing pins their pixels
+- `tests/fixtures/scenes/` -- Frozen copies of the scenes the goldens and CLI tests load, with their assets. No golden may load from `examples/` (`no_golden_case_loads_an_example`); a change here is a change to a test
+- `crates/flint-cli/templates/` -- What `flint init` writes (#707): the game-project scaffold, compiled into the binary; `tests/init_cli.rs` builds and runs each
 - `docs/book/` -- mdBook source; `docs/build.ps1` / `docs/publish.sh` -- build, preview and publish it
 - `docs/design/flint-design-doc.md` -- Full design document for remaining phases
 - `docs/adr/` -- Architecture decision records from ADR 0111 on (earlier numbers live only in commit messages); `README.md` says how to take a number

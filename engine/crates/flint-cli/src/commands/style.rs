@@ -64,6 +64,10 @@ pub struct PreludeArgs {
     /// the entry points
     #[arg(long)]
     pub composed: bool,
+    /// For a style of several `[[passes]]` (#412), the pass to print, by
+    /// name (`pass1`, `pass2`... for unnamed ones); the last by default
+    #[arg(long)]
+    pub pass: Option<String>,
 }
 
 #[derive(Args)]
@@ -189,12 +193,28 @@ fn check(args: CheckArgs) -> Result<()> {
 
 fn prelude(args: PreludeArgs) -> Result<()> {
     let source = custom::read_source(&args.file).map_err(anyhow::Error::msg)?;
+    let pass = match &args.pass {
+        None => source.last_pass(),
+        Some(name) => source
+            .passes
+            .iter()
+            .position(|p| &p.name == name)
+            .ok_or_else(|| {
+                let names: Vec<&str> = source.passes.iter().map(|p| p.name.as_str()).collect();
+                anyhow::anyhow!(
+                    "{}: no pass \"{name}\" (its passes: {})",
+                    args.file.display(),
+                    names.join(", ")
+                )
+            })?,
+    };
     if args.composed {
-        let user = std::fs::read_to_string(&source.wgsl_path)
-            .with_context(|| format!("reading {}", source.wgsl_path.display()))?;
-        print!("{}", custom::compose(&source, &user).text);
+        let path = &source.passes[pass].wgsl_path;
+        let user =
+            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        print!("{}", custom::compose_pass(&source, pass, &user).text);
     } else {
-        print!("{}", custom::prelude(&source));
+        print!("{}", custom::prelude_pass(&source, pass));
     }
     Ok(())
 }
@@ -209,18 +229,21 @@ fn list(args: ListArgs) -> Result<()> {
                 .unwrap_or(Path::new("."))
         }
     });
-    if let Some(dir) = scene_dir {
-        for message in custom::load_dir(dir) {
+    // The styles and choices a scene there sees, by its project's one
+    // asset search (ADR 0114); with no scene, the working directory's
+    let assets = flint_core::project::AssetScope::for_dir(scene_dir.unwrap_or(Path::new(".")));
+    if scene_dir.is_some() {
+        for message in custom::load_for(&assets) {
             eprintln!("warning: {message}");
         }
     }
     if args.json {
         println!(
             "{}",
-            serde_json::to_string_pretty(&catalog::catalog_for(scene_dir))?
+            serde_json::to_string_pretty(&catalog::catalog_in(&assets))?
         );
     } else {
-        print!("{}", catalog::catalog_text_for(scene_dir));
+        print!("{}", catalog::catalog_text_in(&assets));
     }
     Ok(())
 }

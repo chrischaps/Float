@@ -178,6 +178,12 @@ impl RenderDebugPanel {
         self.styles_editor.set_scene_dir(scene_dir);
     }
 
+    /// [`set_scene_dir`](Self::set_scene_dir) for a host that holds the
+    /// scene's project (ADR 0114): the choices are searched from `assets`.
+    pub fn set_asset_scope(&mut self, assets: Option<flint_core::project::AssetScope>) {
+        self.styles_editor.set_asset_scope(assets);
+    }
+
     /// The looks to offer (#356; `flint_render::look::list` of the
     /// scene) and the one in use, set by the host on scene load and after
     /// a script or the picker changes it.
@@ -467,8 +473,35 @@ impl RenderDebugPanel {
             f.pp_changed |= slider(ui, "Crease", &mut self.pp.edge_normal, 0.2..=8.0);
         });
 
+        section(ui, "Shading boil", false, |ui| {
+            // How long each drawing is held (#214). The amounts are the
+            // Kuwahara and contour styles' own `boil` (#599), in Styles above
+            ui.label("Amounts: Styles > Kuwahara / Contour > Boil");
+            let names = ["Ones", "Twos", "Threes"];
+            let cur = (self.pp.boil_on.clamp(1, 3) - 1) as usize;
+            egui::ComboBox::from_label("Hold each drawing")
+                .selected_text(names[cur])
+                .show_ui(ui, |ui| {
+                    for (i, name) in names.iter().enumerate() {
+                        if ui.selectable_label(cur == i, *name).clicked() && cur != i {
+                            self.pp.boil_on = i as u32 + 1;
+                            f.pp_changed = true;
+                        }
+                    }
+                });
+            ui.label(boil_status(&self.pp.boil));
+        });
+
         section(ui, "Render mode", false, |ui| {
-            let labels = ["None", "Matrix", "Blood", "Drunk", "Tron", "Underwater"];
+            let labels = [
+                "None",
+                "Matrix",
+                "Blood",
+                "Drunk",
+                "Tron",
+                "Underwater",
+                "Tear (props)",
+            ];
             let cur = (self.pp.render_mode as usize).min(labels.len() - 1);
             egui::ComboBox::from_label("Mode")
                 .selected_text(labels[cur])
@@ -481,8 +514,8 @@ impl RenderDebugPanel {
                     }
                 });
             f.pp_changed |= slider(ui, "Mix", &mut self.pp.mode_mix, 0.0..=1.0);
-            let hover = "Tears (1-4): x = mask scale, y = mask style (0 fbm / 1 iris), \
-                         z = rate, w = spare. Underwater (5): x = signed eye depth m, \
+            let hover = "Tears (1-4, 6): x = mask scale (0 = 3), y = mask style (0 fbm / 1 iris), \
+                         z = rate (0 = 6), w = spare. Underwater (5): x = signed eye depth m, \
                          y = sea energy, z = daylight, w = biolum.";
             let r = ui.horizontal(|ui| {
                 ui.label("Params");
@@ -682,6 +715,19 @@ fn fov_label(fov_deg: f32) -> &'static str {
         f if f < 72.0 => "natural",
         f if f < 90.0 => "wide",
         _ => "fisheye",
+    }
+}
+
+/// What the wooze field is telling the boil here and now. Its sliders are shares
+/// of this, so a scene with no field needs to say why they do nothing.
+fn boil_status(boil: &flint_wooze::BoilFrame) -> String {
+    if boil.step <= 0.0 {
+        "No [wooze] table here, so nothing boils.".to_string()
+    } else {
+        format!(
+            "Field: step {:.3} s, jitter {:.2}, drawing {}",
+            boil.step, boil.amount, boil.seed
+        )
     }
 }
 
