@@ -16,12 +16,11 @@ version = "0.1"
 description = "Baked noon lighting under the weather system's full storm"
 
 [post_process]
-enabled = true
 bloom_enabled = true
 bloom_intensity = 0.06
 bloom_threshold = 1.0
 vignette_enabled = true
-vignette = 0.18
+vignette_intensity = 0.18
 fog_enabled = true
 fog_color = [0.386, 0.432, 0.472]
 fog_density = 0.00455

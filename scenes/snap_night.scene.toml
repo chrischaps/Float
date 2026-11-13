@@ -22,12 +22,11 @@ description = "First-person raft on an endless stylized ocean"
 input_config = "config/input.toml"
 
 [post_process]
-enabled = true
 bloom_enabled = true
 bloom_intensity = 0.06
 bloom_threshold = 1.0
 vignette_enabled = true
-vignette = 0.18
+vignette_intensity = 0.18
 fog_enabled = true
 fog_color = [0.012, 0.018, 0.038]
 fog_density = 0.0012

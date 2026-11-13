@@ -8,12 +8,11 @@ version = "0.1"
 description = "Baked dusk lighting for headless renders"
 
 [post_process]
-enabled = true
 bloom_enabled = true
 bloom_intensity = 0.06
 bloom_threshold = 1.0
 vignette_enabled = true
-vignette = 0.18
+vignette_intensity = 0.18
 fog_enabled = true
 fog_color = [0.18, 0.12, 0.25]
 fog_density = 0.0015

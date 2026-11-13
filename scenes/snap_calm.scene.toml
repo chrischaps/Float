@@ -27,12 +27,11 @@ description = "Pre-dawn stillness: the sea goes to glass and the stars come back
 input_config = "config/input.toml"
 
 [post_process]
-enabled = true
 bloom_enabled = true
 bloom_intensity = 0.08
 bloom_threshold = 0.9
 vignette_enabled = true
-vignette = 0.20
+vignette_intensity = 0.20
 fog_enabled = true
 fog_color = [0.014, 0.020, 0.042]
 fog_density = 0.0010

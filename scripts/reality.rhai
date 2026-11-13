@@ -82,6 +82,10 @@ fn on_update() {
 
     let enabled = get_field(me, "reality", "enabled");
     if enabled == () { return; }   // component not landed yet (set_field lag)
+    // Mirror of the scene's [post_process] vignette_intensity (scripts
+    // can't read post_process); unit when a scene doesn't list it
+    let base_vignette = get_field(me, "reality", "base_vignette");
+    if base_vignette == () { base_vignette = 0.18; }
 
     // Game hour for affinities (F3 TOD scrubbing works on scheduling too).
     let hours = 12.0;
@@ -204,7 +208,9 @@ fn on_update() {
             set_radial_blur(0.0);
             set_chromatic_aberration(0.0);
         } else if mode == 1 {
-            set_vignette(0.0);
+            // Sticky override: heal back to the scene's own vignette, or
+            // the Matrix tear would leave the frame vignette-free forever
+            set_vignette(base_vignette);
         }
         phase = 0; mode = 0; t = 0.0;
         next_timer = -1.0;         // roll a fresh interval next frame
@@ -240,7 +246,9 @@ fn on_update() {
             set_chromatic_aberration(0.6 * mix);
             lp_scale = 1.0 - 0.6 * mix;
         } else if mode == 1 {
-            set_vignette(0.3 * mix);
+            // From the scene's vignette up to the tear's 0.3, so the edge
+            // never dips as the code bleeds in
+            set_vignette(base_vignette + (0.3 - base_vignette) * mix);
         }
     }
 
