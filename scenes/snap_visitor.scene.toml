@@ -22,12 +22,11 @@ version = "0.1"
 description = "A weathered twin raft holding station out of the haze"
 
 [post_process]
-enabled = true
 bloom_enabled = true
 bloom_intensity = 0.05
 bloom_threshold = 1.0
 vignette_enabled = true
-vignette = 0.16
+vignette_intensity = 0.16
 fog_enabled = true
 # Heavier than the game default: the haze is what he comes out of.
 fog_color = [0.55, 0.70, 0.84]

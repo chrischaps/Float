@@ -17,6 +17,33 @@ const BLOOM_SLOT_STRIDE: u64 = crate::bind_cache::SLOT_STRIDE;
 /// HDR texture format used for the intermediate scene buffer and bloom chain.
 pub const HDR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 
+/// The reality tear's mask and the noise under it (#397), shared by the
+/// composite and the style mask so a `blend_source = "tear"` prop turns
+/// exactly where the composite tears. Prepended to each: WGSL has no include.
+pub const TEAR_MASK_WGSL: &str = include_str!("tear_mask.wgsl");
+
+/// The composite's source: [`TEAR_MASK_WGSL`], then `composite_shader.wgsl`.
+pub const COMPOSITE_WGSL: &str = concat!(
+    include_str!("tear_mask.wgsl"),
+    include_str!("composite_shader.wgsl")
+);
+
+/// The render modes with a reality tear (#397): Matrix (1), blood (2),
+/// drunk (3, which tears nothing it draws), Tron (4) and the tear alone (6),
+/// whose only look is the styled props that follow it. Underwater (5) masks
+/// by its waterline instead.
+pub fn tears(render_mode: u32) -> bool {
+    matches!(render_mode, 1..=4 | 6)
+}
+
+/// Whether `config` draws a reality tear this frame, as the composite sees
+/// it: post-processing on, a tearing mode, and a mix above the composite's
+/// own cut-off. While it doesn't, a `blend_source = "tear"` entity is at
+/// blend 0 everywhere.
+pub fn tear_active(config: &PostProcessConfig) -> bool {
+    config.enabled && tears(config.render_mode) && config.mode_mix > 0.001
+}
+
 /// Post-processing configuration (runtime-adjustable parameters).
 #[derive(Debug, Clone)]
 pub struct PostProcessConfig {
@@ -96,10 +123,24 @@ pub struct PostProcessConfig {
     /// the strengths it reads.
     pub edge_depth: f32,
     pub edge_normal: f32,
+    /// Film frames each drawing of the shading boil (#214) is held: 1, 2
+    /// or 3. Shared by the boils of the `kuwahara` and `contour` styles,
+    /// whose amounts are their own `boil` parameters (#599).
+    pub boil_on: u32,
+    /// Motion on twos for the whole frame (#405): entities that name no
+    /// `motion_hold` rate of their own are drawn on ticks, this many a
+    /// second, and the post time styles, grain and the tear read holds to
+    /// the start of each tick. 0 = off. See [`crate::motion_hold`].
+    pub motion_hold: f32,
+    /// This frame's drawing, from the wooze field. Whoever owns the clock stamps
+    /// it each frame with `SceneRenderer::set_boil`; a scene with no field never
+    /// does, and its amount of 0 turns both boils off.
+    pub boil: flint_wooze::BoilFrame,
     /// Stylized render mode: 0 = none, 1 = Matrix code, 2 = blood ocean
     /// grade, 3 = drunk, 4 = Tron wireframe (reality tears), 5 = underwater
     /// (submerged-eye moments; masks by a per-pixel waterline, not the
-    /// tear mask).
+    /// tear mask), 6 = the tear alone (#397: no look of its own, so only
+    /// styled props with `blend_source = "tear"` show where it tears).
     pub render_mode: u32,
     /// Blend strength for the active render mode (0 = normal view).
     pub mode_mix: f32,
@@ -178,6 +219,9 @@ impl Default for PostProcessConfig {
             volumetric_decay: 0.98,
             edge_depth: 0.6,
             edge_normal: 2.5,
+            boil_on: 2,
+            motion_hold: 0.0,
+            boil: Default::default(),
             render_mode: 0,
             mode_mix: 0.0,
             mode_params: [0.0; 4],
@@ -198,6 +242,26 @@ impl PostProcessConfig {
     /// trusted to be bit-exact across drivers.
     pub fn grade_active(&self) -> bool {
         self.grade_lift != [0.0; 3] || self.grade_gamma != [1.0; 3] || self.grade_gain != [1.0; 3]
+    }
+
+    /// The shading boil's two amounts (#214): Kuwahara's paint and the
+    /// contour's ink, each its style's `boil` parameter (#599).
+    pub fn boil_amounts(&self) -> (f32, f32) {
+        let boil = |style: &str| crate::stylize::find(style).map_or(0.0, |d| d.param(self, "boil"));
+        (boil("kuwahara"), boil("contour"))
+    }
+
+    /// Set the shading boil's two amounts ([`boil_amounts`](Self::boil_amounts)).
+    /// Neither style is switched on or off, and an amount already held
+    /// writes nothing, so a style with no table doesn't get one.
+    pub fn set_boil_amounts(&mut self, paint: f32, ink: f32) {
+        let (was_paint, was_ink) = self.boil_amounts();
+        if paint != was_paint {
+            self.styles.set_param("kuwahara", "boil", paint);
+        }
+        if ink != was_ink {
+            self.styles.set_param("contour", "boil", ink);
+        }
     }
 }
 
@@ -248,12 +312,15 @@ pub fn post_process_config_from_def(pp_def: &flint_scene::PostProcessDef) -> Pos
     config.volumetric_decay = pp_def.volumetric_decay;
     config.edge_depth = pp_def.edge_depth;
     config.edge_normal = pp_def.edge_normal;
+    config.boil_on = pp_def.boil_on;
+    config.motion_hold = pp_def.motion_hold;
     config.film_grain = pp_def.film_grain;
     config.grade_lift = pp_def.grade_lift;
     config.grade_gamma = pp_def.grade_gamma;
     config.grade_gain = pp_def.grade_gain;
     config.fxaa_enabled = pp_def.fxaa;
-    // The old `kuwahara_*` keys arrive folded into the kuwahara table (#298)
+    // The old `kuwahara_*` (#298) and `contour_*` (#599) keys arrive folded
+    // into their styles' tables
     let (styles, warnings) = crate::stylize::StyleSettings::from_tables(&pp_def.style_tables());
     for warning in warnings {
         tracing::warn!("{warning}");
@@ -668,7 +735,7 @@ impl PostProcessPipeline {
         // --- Composite pipeline ---
         let composite_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Composite Shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("composite_shader.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(COMPOSITE_WGSL.into()),
         });
 
         // Group 0: PostProcessUniforms
@@ -1861,8 +1928,8 @@ impl PostProcessPipeline {
 
     /// Run the SSAO generation and blur passes.
     /// Reads the depth buffer and writes blurred AO to `resources.ssao_blur_view`.
-    /// `depth_owned`: `depth_view` lives as long as `resources` (the scaled
-    /// scene's depth), so the bind group over it can be kept.
+    /// `depth_key`: who vouches for `depth_view`, so the bind group over it
+    /// can be kept ([`DepthKey`](crate::bind_cache::DepthKey), #379).
     #[allow(clippy::too_many_arguments)]
     pub fn run_ssao(
         &self,
@@ -1872,7 +1939,7 @@ impl PostProcessPipeline {
         resources: &PostProcessResources,
         config: &PostProcessConfig,
         depth_view: &wgpu::TextureView,
-        depth_owned: bool,
+        depth_key: crate::bind_cache::DepthKey,
         camera: &Camera,
     ) {
         // Write SSAO uniforms
@@ -1904,7 +1971,7 @@ impl PostProcessPipeline {
                 }],
             })
         });
-        let depth_bg = resources.binds.get_if(depth_owned, "ssao depth", 0, || {
+        let depth_bg = resources.binds.get_over(depth_key, "ssao depth", 0, || {
             device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("SSAO Depth BG"),
                 layout: &self.ssao_depth_bgl,
@@ -1998,7 +2065,7 @@ impl PostProcessPipeline {
     /// Run the volumetric ray-march and bilateral blur passes.
     /// Reads the depth buffer and shadow maps, writes blurred god rays to
     /// `resources.volumetric_blur_view`. `shadow_id` is the shadow pass's
-    /// [`gpu_id`](crate::bind_cache::gpu_id), `depth_owned` as in
+    /// [`gpu_id`](crate::bind_cache::gpu_id), `depth_key` as in
     /// [`run_ssao`](Self::run_ssao).
     #[allow(clippy::too_many_arguments)]
     pub fn run_volumetric(
@@ -2009,7 +2076,7 @@ impl PostProcessPipeline {
         resources: &PostProcessResources,
         config: &PostProcessConfig,
         depth_view: &wgpu::TextureView,
-        depth_owned: bool,
+        depth_key: crate::bind_cache::DepthKey,
         camera: &Camera,
         shadow: VolumetricShadow<'_>,
     ) {
@@ -2046,7 +2113,7 @@ impl PostProcessPipeline {
         });
         let depth_bg = resources
             .binds
-            .get_if(depth_owned, "volumetric depth", 0, || {
+            .get_over(depth_key, "volumetric depth", 0, || {
                 device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: Some("Volumetric Depth BG"),
                     layout: &self.volumetric_depth_bgl,
@@ -2123,7 +2190,7 @@ impl PostProcessPipeline {
         let blur_texture_bg =
             resources
                 .binds
-                .get_if(depth_owned, "volumetric blur texture", 0, || {
+                .get_over(depth_key, "volumetric blur texture", 0, || {
                     device.create_bind_group(&wgpu::BindGroupDescriptor {
                         label: Some("Volumetric Blur Texture BG"),
                         layout: &self.volumetric_blur_texture_bgl,
@@ -2170,7 +2237,7 @@ impl PostProcessPipeline {
         config: &PostProcessConfig,
         target_view: &wgpu::TextureView,
         depth_view: &wgpu::TextureView,
-        depth_owned: bool,
+        depth_key: crate::bind_cache::DepthKey,
         camera: &Camera,
         time: f32,
         ground_fog: Option<&crate::ground_fog::GroundFogGpu>,
@@ -2200,7 +2267,7 @@ impl PostProcessPipeline {
         let ssao_depth_bg =
             resources
                 .binds
-                .get_if(depth_owned, "composite ssao+depth", variant, || {
+                .get_over(depth_key, "composite ssao+depth", variant, || {
                     device.create_bind_group(&wgpu::BindGroupDescriptor {
                         label: Some("Composite SSAO+Depth+Volumetric BG"),
                         layout: &self.composite_ssao_bgl,
@@ -2683,8 +2750,6 @@ mod tests {
         assert_eq!(old.styles, post_process_config_from_def(&table).styles);
     }
 
-    use super::*;
-
     /// The Rust uniform struct must byte-match the WGSL PostProcessUniforms
     /// in composite_shader.wgsl. Layout: 12 scalars + texel_size vec2 +
     /// fog block (through dither_intensity) = 112 bytes, inv_view_proj mat4
@@ -2696,6 +2761,16 @@ mod tests {
     /// at 272..304 (ADR 0101), ground fog rows (color+density / origin+size
     /// / floor base, ceiling, falloff, steps / texel, max lod, enabled, pad)
     /// at 304..368 (ADR 0106).
+    /// Boil is opt-in twice over: a scene asks for it, and has a field.
+    #[test]
+    fn boil_and_contour_default_off() {
+        let config = PostProcessConfig::default();
+        assert!(!config.styles.is_enabled("contour"));
+        assert_eq!(config.styles.param("kuwahara", "boil"), None);
+        assert_eq!(config.styles.param("contour", "boil"), None);
+        assert_eq!(config.boil, Default::default());
+    }
+
     #[test]
     fn composite_uniforms_match_wgsl_layout() {
         assert_eq!(std::mem::size_of::<PostProcessUniforms>(), 368);

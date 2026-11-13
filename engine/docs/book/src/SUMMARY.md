@@ -58,10 +58,12 @@
 - [Importing Assets](guides/importing-assets.md)
 - [Headless Rendering](guides/headless-rendering.md)
 - [Stylized Rendering](guides/stylized-rendering.md)
+- [Filming a Showcase](guides/filming-a-showcase.md)
 - [AI Agent Workflow](guides/ai-agent-workflow.md)
 - [Building a Game Project](guides/building-a-game-project.md)
 - [Deploying to Android](guides/android.md)
 - [Playing on Mobile](guides/playing-on-mobile.md)
+- [Publishing to the Web](guides/publishing-to-the-web.md)
 - [Player Extensions](guides/player-extensions.md)
 - [Debug Panels](guides/debug-panels.md)
 - [Profiling](guides/profiling.md)
@@ -69,6 +71,7 @@
 
 # Reference
 
+- [Script API Reference](reference/script-api.md)
 - [CLI Reference](cli-reference/overview.md)
   - [Music and Rhythm Commands](cli-reference/music.md)
 - [File Formats](formats/overview.md)

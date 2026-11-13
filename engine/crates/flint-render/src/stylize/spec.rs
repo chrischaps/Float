@@ -7,11 +7,14 @@
 //! --style ascii:cell=12,ramp=blocks      a parameter (number) and an option (text)
 //! --style invert:strength=0.5
 //! --style kuwahara:radius=6
-//! --style ascii:off                      turn off a style the scene has on
+//! --style ascii:off                      off everywhere: the scene's table and
+//!                                        every entity's ascii_style (#376)
 //! --style invert:order=0                 run first in its stage (#299)
 //! --style kuwahara:feeds_bloom=1         bloom reads the painted image (#300)
 //! --style ascii:color=tint,tint=#4dff73  a colour (#315): #rrggbb, or r/g/b
 //! --style ascii:tint=0.3/1/0.4
+//! --style pencil:reveal=0.5              shown inside half a ragged tear (#406)
+//! --style pencil:reveal=0.4,reveal_shape=wipe,reveal_angle=30
 //! ```
 //!
 //! Keys are checked against the style's descriptor: a number for each of
@@ -20,8 +23,10 @@
 //! when it lists them), a colour for each of its
 //! [`colors`](super::StyleDescriptor::colors) (`#rrggbb` or `r/g/b`, since
 //! commas split keys; its channels `tint_r`... still take numbers), and
-//! `enabled` / `off`. Values outside a
-//! parameter's F4 range are taken as written, as a scene's are.
+//! `enabled` / `off`. A number outside its parameter's F4 range (a
+//! colour's channels included) is refused, naming the range (#355): a
+//! style clamps it or draws it badly, and either way not as asked. A scene's table keeps
+//! such a value and warns.
 
 use super::{color_from_text, find, names, registry, StyleDescriptor};
 use crate::postprocess::PostProcessConfig;
@@ -103,8 +108,13 @@ impl StyleSpec {
                 });
                 continue;
             }
-            if key == "order" {
+            if key == "order" || key == "blend" {
                 number(name, key, value)?;
+            } else if super::reveal::is_key(key) {
+                // Where it shows (#406): checked, ranges and all
+                super::StyleReveal::default()
+                    .set_text(key, value)
+                    .map_err(|e| format!("{name}: {e}"))?;
             } else {
                 check(descriptor, key, value)?;
             }
@@ -122,14 +132,33 @@ impl StyleSpec {
             if key == "order" {
                 config.styles.set_order(&self.name, value.parse().ok());
             }
+            // How much of it shows (#369)
+            if key == "blend" {
+                config.styles.set_blend(&self.name, value.parse().ok());
+            }
+            // Where it shows (#406)
+            if super::reveal::is_key(key) {
+                let mut reveal = super::StyleReveal::default();
+                if reveal.set_text(key, value).is_ok() {
+                    let value = reveal_value(&reveal, key);
+                    let _ = config.styles.set_reveal(&self.name, key, &value, false);
+                }
+            }
         }
         if let Some(feeds) = self.feeds_bloom {
             config.styles.set_feeds_bloom(&self.name, Some(feeds));
         }
         let descriptor = find(&self.name).expect("checked by parse");
-        config.styles.set_enabled(&self.name, self.enabled);
+        if self.enabled {
+            config.styles.set_enabled(&self.name, true);
+        } else {
+            // Off everywhere (#376): the table and every entity that
+            // would switch the style on for its own pixels, so a styled
+            // scene renders unstyled with the rest of its post kept
+            config.styles.set_off_everywhere(&self.name);
+        }
         for (key, value) in &self.settings {
-            if key == "order" {
+            if key == "order" || key == "blend" || super::reveal::is_key(key) {
                 continue;
             }
             if descriptor.options.iter().any(|o| o.name == key) {
@@ -144,6 +173,25 @@ impl StyleSpec {
                 config.styles.set_param(&self.name, key, n);
             }
         }
+    }
+}
+
+/// Reveal key `key` of `reveal` as the TOML value that sets it.
+fn reveal_value(reveal: &super::StyleReveal, key: &str) -> toml::Value {
+    match key {
+        "reveal" => toml::Value::Float(f64::from(reveal.amount.unwrap_or(0.0))),
+        "reveal_shape" => toml::Value::String(reveal.shape().name().to_string()),
+        "reveal_ink" | "reveal_rim_color" => toml::Value::Array(
+            if key == "reveal_ink" {
+                reveal.ink()
+            } else {
+                reveal.rim_color(super::reveal::DEFAULT_PAPER)
+            }
+            .iter()
+            .map(|c| toml::Value::Float(f64::from(*c)))
+            .collect(),
+        ),
+        _ => toml::Value::Float(f64::from(reveal.number(key))),
     }
 }
 
@@ -183,17 +231,36 @@ pub fn check_style_specs(specs: &[String]) -> Result<(), String> {
 /// One line per registered style with the keys `--style` takes, for help
 /// text and error messages.
 pub fn style_spec_help() -> String {
-    registry()
+    let mut lines: Vec<String> = registry()
         .iter()
         .map(|d| format!("{}: {}", d.name, known_keys(d)))
-        .collect::<Vec<_>>()
-        .join("\n")
+        .collect();
+    lines.push(reveal_help());
+    lines.join("\n")
+}
+
+/// The reveal's keys (#406), which every style takes.
+fn reveal_help() -> String {
+    let mut keys = vec![format!(
+        "reveal_shape={}",
+        super::RevealShape::NAMES.join("|")
+    )];
+    keys.push("reveal_ink=#rrggbb".to_string());
+    keys.push("reveal_rim_color=#rrggbb".to_string());
+    keys.extend(
+        super::reveal::NUMBERS
+            .iter()
+            .map(|n| format!("{}=<{}-{}>", n.key, n.min, n.max)),
+    );
+    format!("every style, with reveal=<0-1>: {}", keys.join(", "))
 }
 
 fn check(descriptor: &StyleDescriptor, key: &str, value: &str) -> Result<(), String> {
     let name = descriptor.name;
     if let Some(option) = descriptor.options.iter().find(|o| o.name == key) {
-        if !option.choices.is_empty() && !option.choices.contains(&value) {
+        // An option whose choices are found at run time (a palette file,
+        // a font's ramps) is open: the style resolves the name, and warns
+        if option.refuses(value) {
             return Err(format!(
                 "{name}: {key} must be one of {}",
                 option.choices.join(", ")
@@ -201,16 +268,26 @@ fn check(descriptor: &StyleDescriptor, key: &str, value: &str) -> Result<(), Str
         }
         return Ok(());
     }
-    if descriptor.color_setting(key).is_some() {
-        return match color_from_text(value) {
-            Some(_) => Ok(()),
-            None => Err(format!(
+    if let Some(color) = descriptor.color_setting(key) {
+        let Some(rgb) = color_from_text(value) else {
+            return Err(format!(
                 "{name}: {key} must be a colour, #rrggbb or r/g/b (0.3/1/0.4), not '{value}'"
-            )),
+            ));
         };
+        for (p, v) in color.channels.iter().zip(rgb) {
+            if let Some(e) = p.range_error(v) {
+                return Err(format!("{name}: {key}={value}: {e}"));
+            }
+        }
+        return Ok(());
     }
-    if descriptor.params.iter().any(|p| p.name == key) {
-        return number(name, key, value);
+    if let Some(param) = descriptor.params.iter().find(|p| p.name == key) {
+        number(name, key, value)?;
+        let n: f32 = value.parse().expect("checked by number");
+        return match param.range_error(n) {
+            Some(e) => Err(format!("{name}: {e}")),
+            None => Ok(()),
+        };
     }
     Err(format!(
         "{name} has no key '{key}'; it takes: {}",
@@ -241,7 +318,10 @@ fn known_keys(descriptor: &StyleDescriptor) -> String {
         params
             .into_iter()
             .chain(descriptor.options.iter().map(|o| {
-                if o.choices.is_empty() {
+                if o.discover.is_some() {
+                    let found = o.choices_in(&super::ChoiceScope::defaults(None));
+                    format!("{}={}|<name>", o.name, found.join("|"))
+                } else if o.choices.is_empty() {
                     format!("{}=<text>", o.name)
                 } else {
                     format!("{}={}", o.name, o.choices.join("|"))
@@ -250,6 +330,10 @@ fn known_keys(descriptor: &StyleDescriptor) -> String {
             .collect()
     };
     keys.push("order=<n>".to_string());
+    keys.push("blend=1".to_string());
+    // Where it shows (#406); the reveal_* keys are listed once, by
+    // style_spec_help
+    keys.push("reveal=<0-1>, reveal_*".to_string());
     if descriptor.stage == super::StyleStage::Hdr {
         keys.push(format!("feeds_bloom={}", descriptor.feeds_bloom));
     }
@@ -267,6 +351,25 @@ mod tests {
         apply_style_spec(&mut config, "ascii").unwrap();
         assert!(config.styles.is_enabled("ascii"));
         assert_eq!(config.styles.param("ascii", "cell"), None);
+    }
+
+    /// #376: `off` (and `enabled=false`) is off everywhere, not only the
+    /// table; `on` or a bare name lifts it, so a later word wins.
+    #[test]
+    fn off_is_off_everywhere_and_a_later_word_lifts_it() {
+        let mut config = PostProcessConfig::default();
+        apply_style_spec(&mut config, "ascii:cell=10").unwrap();
+        apply_style_spec(&mut config, "ascii:off").unwrap();
+        assert!(!config.styles.is_enabled("ascii"));
+        assert!(config.styles.is_off_everywhere("ascii"));
+        assert_eq!(config.styles.param("ascii", "cell"), Some(10.0));
+        apply_style_spec(&mut config, "ascii").unwrap();
+        assert!(config.styles.is_enabled("ascii"));
+        assert!(!config.styles.is_off_everywhere("ascii"));
+        apply_style_spec(&mut config, "ascii:enabled=false").unwrap();
+        assert!(config.styles.is_off_everywhere("ascii"));
+        apply_style_spec(&mut config, "ascii:on").unwrap();
+        assert!(!config.styles.is_off_everywhere("ascii"));
     }
 
     #[test]
@@ -356,10 +459,38 @@ mod tests {
         assert!(key.contains("cell=8"), "{key}");
         let choice = StyleSpec::parse("ascii:color=purple").unwrap_err();
         assert!(choice.contains("source"), "{choice}");
+        // Open lists only suggest (#318): a glyph set's own ramp, a palette file
+        assert!(StyleSpec::parse("ascii:ramp=runes").is_ok());
+        assert!(StyleSpec::parse("ascii:palette=palettes/dusk.palette.toml").is_ok());
         let nan = StyleSpec::parse("invert:strength=lots").unwrap_err();
         assert!(nan.contains("number"), "{nan}");
         assert!(StyleSpec::parse("ascii:cell").is_err());
         assert!(StyleSpec::parse("kuwahara:cell=3").is_err());
+    }
+
+    #[test]
+    fn a_number_outside_its_range_is_refused_naming_the_range() {
+        let cell = StyleSpec::parse("ascii:cell=400").unwrap_err();
+        assert_eq!(cell, "ascii: cell=400 is outside its range 4..32");
+        assert!(StyleSpec::parse("ascii:cell=3.5").is_err());
+        // The ends are inside
+        assert!(StyleSpec::parse("ascii:cell=4").is_ok());
+        assert!(StyleSpec::parse("ascii:cell=32").is_ok());
+        // A colour's channels have ranges too
+        let tint = StyleSpec::parse("ascii:tint=2/1/0.4").unwrap_err();
+        assert!(
+            tint.contains("tint_r=2 is outside its range 0..1"),
+            "{tint}"
+        );
+        assert!(StyleSpec::parse("ascii:tint=#ffffff").is_ok());
+        // `order` is a place in the chain, not a parameter: any number
+        assert!(StyleSpec::parse("ascii:order=1000").is_ok());
+        // Every default sits inside its own range
+        for d in registry() {
+            for p in d.params {
+                assert!(p.range_error(p.default).is_none(), "{}.{}", d.name, p.name);
+            }
+        }
     }
 
     #[test]
@@ -391,6 +522,39 @@ mod tests {
         for d in registry() {
             StyleSpec::parse(d.name).unwrap();
         }
-        assert!(style_spec_help().lines().count() == registry().len());
+        // A line a style, then the reveal's keys every style takes (#406)
+        let help = style_spec_help();
+        assert_eq!(help.lines().count(), registry().len() + 1);
+        assert!(help
+            .lines()
+            .last()
+            .unwrap()
+            .contains("reveal_shape=tear|wipe|iris|panel"));
+    }
+
+    #[test]
+    fn reveal_keys_parse_check_and_apply() {
+        let mut config = PostProcessConfig::default();
+        apply_style_spec(
+            &mut config,
+            "pencil:reveal=0.4,reveal_shape=wipe,reveal_angle=30,reveal_ink=#102030",
+        )
+        .unwrap();
+        assert!(config.styles.is_enabled("pencil"));
+        let r = config.styles.reveal("pencil").unwrap();
+        assert_eq!(r.amount, Some(0.4));
+        assert_eq!(r.shape(), super::super::RevealShape::Wipe);
+        assert_eq!(r.number("reveal_angle"), 30.0);
+        assert!((r.ink()[2] - 0x30 as f32 / 255.0).abs() < 1e-4);
+        // Out of range, a wrong shape or a non-number is refused by name
+        for bad in [
+            "pencil:reveal=2",
+            "pencil:reveal_shape=star",
+            "pencil:reveal_edge=big",
+            "pencil:reveal_ink=red",
+        ] {
+            let e = StyleSpec::parse(bad).unwrap_err();
+            assert!(e.contains("reveal"), "{bad}: {e}");
+        }
     }
 }

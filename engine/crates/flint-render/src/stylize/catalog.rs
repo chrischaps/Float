@@ -5,8 +5,10 @@
 //! once [`custom::load_dir`](super::custom::load_dir) has run) appears with
 //! no change here.
 
-use super::{is_builtin, registry, StyleDescriptor, StyleStage};
+use super::{is_builtin, is_game_style, registry, ChoiceScope, StyleDescriptor, StyleStage};
+use flint_core::project::AssetScope;
 use serde::Serialize;
+use std::path::Path;
 
 /// One registered style, as listed.
 #[derive(Debug, Clone, Serialize)]
@@ -16,12 +18,17 @@ pub struct StyleListing {
     /// `"hdr"` (linear, before fog/bloom/tonemap) or `"display"` (after
     /// the composite, at output resolution).
     pub stage: &'static str,
-    /// `"builtin"`, or `"user"` for a `styles/<name>.shader.toml`.
+    /// `"builtin"`, `"game"` for a Rust style a game binary registered
+    /// ([`register`](super::register), #419), or `"user"` for a
+    /// `styles/<name>.shader.toml`.
     pub source: &'static str,
     /// Where a scene sets it: `[post_process.styles.<name>]`.
     pub table: String,
     /// The component an entity takes the style with (per-entity styles).
     pub component: Option<String>,
+    /// Whether it leaves other styles' entities (#384); false for the
+    /// debug views and display bloom, which draw over everything.
+    pub yields: bool,
     /// Whether it reads the entity style mask.
     pub uses_mask: bool,
     pub params: Vec<ParamListing>,
@@ -69,17 +76,44 @@ pub struct OptionListing {
     pub default: String,
     /// The values offered; empty means any text (a file or set name).
     pub choices: Vec<String>,
+    /// The choices were found beside the scene (its palettes, its fonts, a
+    /// font's ramps; #322), and a name outside them is still the style's
+    /// to resolve (a file path).
+    pub open: bool,
     pub label: String,
     pub help: String,
 }
 
 /// Every registered style, in registration order.
 pub fn catalog() -> Vec<StyleListing> {
-    registry().iter().map(|d| listing(d)).collect()
+    catalog_for(None)
+}
+
+/// [`catalog`] with the choices a scene in `scene_dir` can see (its
+/// palettes and glyph sets, #322), by its project's search; with no scene,
+/// the working directory's, as a renderer with no scene searches.
+pub fn catalog_for(scene_dir: Option<&Path>) -> Vec<StyleListing> {
+    let assets = AssetScope::for_dir(scene_dir.unwrap_or(Path::new(".")));
+    catalog_in(&assets)
+}
+
+/// [`catalog`] with the choices found from `assets`, for a host that holds
+/// the scene's project.
+pub fn catalog_in(assets: &AssetScope) -> Vec<StyleListing> {
+    registry()
+        .iter()
+        .map(|d| listing_in(d, Some(assets)))
+        .collect()
 }
 
 /// One style's listing.
 pub fn listing(d: &StyleDescriptor) -> StyleListing {
+    listing_in(d, None)
+}
+
+/// One style's listing, its found choices searched for from `assets`.
+pub fn listing_in(d: &StyleDescriptor, assets: Option<&AssetScope>) -> StyleListing {
+    let scope = ChoiceScope::defaults(assets);
     let help = |name: &str| d.hint(name).map(|h| h.help.to_string()).unwrap_or_default();
     StyleListing {
         name: d.name.to_string(),
@@ -90,12 +124,15 @@ pub fn listing(d: &StyleDescriptor) -> StyleListing {
         },
         source: if is_builtin(d.name) {
             "builtin"
+        } else if is_game_style(d.name) {
+            "game"
         } else {
             "user"
         },
         table: format!("[post_process.styles.{}]", d.name),
         component: d.component.map(str::to_string),
-        uses_mask: d.uses_mask,
+        yields: d.yields,
+        uses_mask: d.uses_mask.ever(),
         params: d
             .params
             .iter()
@@ -117,7 +154,8 @@ pub fn listing(d: &StyleDescriptor) -> StyleListing {
             .map(|o| OptionListing {
                 name: o.name.to_string(),
                 default: o.default.to_string(),
-                choices: o.choices.iter().map(|c| c.to_string()).collect(),
+                choices: o.choices_in(&scope),
+                open: o.discover.is_some(),
                 label: d.label_for(o.name),
                 help: help(o.name),
             })
@@ -138,11 +176,28 @@ pub fn listing(d: &StyleDescriptor) -> StyleListing {
 
 /// [`catalog`] for a terminal: one block per style.
 pub fn catalog_text() -> String {
+    catalog_text_for(None)
+}
+
+/// [`catalog_for`] for a terminal.
+pub fn catalog_text_for(scene_dir: Option<&Path>) -> String {
+    catalog_text_of(catalog_for(scene_dir))
+}
+
+/// [`catalog_in`] for a terminal.
+pub fn catalog_text_in(assets: &AssetScope) -> String {
+    catalog_text_of(catalog_in(assets))
+}
+
+fn catalog_text_of(listings: Vec<StyleListing>) -> String {
     let mut out = String::new();
-    for s in catalog() {
+    for s in listings {
         let mut tags = vec![s.stage.to_string(), s.source.to_string()];
         if let Some(c) = &s.component {
             tags.push(format!("per-entity: {c}"));
+        }
+        if !s.yields {
+            tags.push("draws over entities".into());
         }
         if s.uses_mask {
             tags.push("reads mask".into());
@@ -162,6 +217,8 @@ pub fn catalog_text() -> String {
         for o in &s.options {
             let choices = if o.choices.is_empty() {
                 "<text>".to_string()
+            } else if o.open {
+                format!("{}|<name>", o.choices.join("|"))
             } else {
                 o.choices.join("|")
             };
@@ -247,9 +304,17 @@ mod tests {
 
     #[test]
     fn json_parses_and_lists_every_style() {
+        // Tests beside this one register styles (user styles, #419's game
+        // styles), so the registry may grow while the catalog is made
+        let before = registry().len();
         let json = serde_json::to_string(&catalog()).unwrap();
+        let after = registry().len();
         let back: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.as_array().unwrap().len(), registry().len());
+        let listed = back.as_array().unwrap().len();
+        assert!(
+            (before..=after).contains(&listed),
+            "{listed} of {before}..{after}"
+        );
     }
 
     #[test]
@@ -268,7 +333,9 @@ mod tests {
     #[test]
     fn a_colour_is_listed_once_by_its_key() {
         let ascii = listing(super::super::find("ascii").unwrap());
-        assert_eq!(ascii.colors.len(), 1);
+        // The tint, and the edge ink's colour (#351)
+        assert_eq!(ascii.colors.len(), 2);
+        assert_eq!(ascii.colors[1].key, "edge_color");
         let tint = &ascii.colors[0];
         assert_eq!(tint.key, "tint");
         assert_eq!(tint.default, [0.35, 1.0, 0.45]);
@@ -285,8 +352,10 @@ mod tests {
 
     #[test]
     fn text_names_every_style() {
+        // The registry as it was first: tests beside this one add to it
+        let registered = registry();
         let text = catalog_text();
-        for d in registry() {
+        for d in registered {
             assert!(text.contains(&format!("{} (", d.name)), "{}", d.name);
         }
     }

@@ -18,12 +18,16 @@
 //! tube). Colours are
 //! display (sRGB) values, `#rrggbb` or `#rgb`, at most [`MAX_COLORS`].
 //!
-//! A style names a palette as `builtin` names ([`BUILTIN_PALETTES`]), a
-//! bare name looked up as `<dir>/palettes/<name>.palette.toml` in the
-//! scene's folder then its parent, or a `.palette.toml` path. Every read
-//! goes through the vfs.
+//! A style names a palette by a bare name or a `.palette.toml` path, found
+//! by the project's one asset search ([`AssetKind::Palettes`]:
+//! `palettes/<name>.palette.toml` in the scene's directory, each directory
+//! above it up to the project root, then the mounted engine), or failing
+//! that as one of the built-ins ([`BUILTIN_PALETTES`]): a file the search
+//! finds wins over a built-in of the same name. Every read goes through the
+//! vfs.
 
 use crate::file_watch::FileStamps;
+use flint_core::project::{shown, AssetKind, AssetScope};
 use flint_core::vfs;
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -38,7 +42,9 @@ pub const MAX_COLORS: usize = 32;
 pub const PALETTE_SUFFIX: &str = ".palette.toml";
 
 /// The palettes built into the engine, by name.
-pub const BUILTIN_PALETTES: &[&str] = &["cga", "cga-warm", "cga16", "phosphor", "amber", "mono"];
+pub const BUILTIN_PALETTES: &[&str] = &[
+    "cga", "cga-warm", "cga16", "phosphor", "amber", "mono", "paper",
+];
 
 /// How a palette's ink is chosen for a colour.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Deserialize)]
@@ -207,24 +213,7 @@ impl Palette {
     /// the indices of the nearest and the next, and their squared OKLab
     /// distances. The first of equals wins, as in the shader.
     pub fn nearest_two(&self, color: [f32; 3], chroma: f32) -> ([usize; 2], [f32; 2]) {
-        let mut lab = oklab(color);
-        lab[1] *= chroma;
-        lab[2] *= chroma;
-        let (mut best, mut second) = (0, 0);
-        let (mut best_d, mut second_d) = (1e9_f32, 1e9_f32);
-        for (i, ink) in self.colors.iter().enumerate() {
-            let e = oklab(*ink);
-            let d = (0..3)
-                .map(|k| (e[k] - lab[k]) * (e[k] - lab[k]))
-                .sum::<f32>();
-            if d < best_d {
-                (second, second_d) = (best, best_d);
-                (best, best_d) = (i, d);
-            } else if d < second_d {
-                (second, second_d) = (i, d);
-            }
-        }
-        ([best, second], [best_d, second_d])
+        nearest_two_in(&self.colors, color, chroma)
     }
 
     /// The ink for `color` with its chroma scaled by `chroma`, and
@@ -232,15 +221,46 @@ impl Palette {
     /// Bayer pattern on the cell grid: `cell` is the cell's index. The CPU
     /// reference for `pal_pick` in `palette.wgsl`.
     pub fn pick(&self, color: [f32; 3], chroma: f32, dither: f32, cell: [i32; 2]) -> [f32; 3] {
-        let ([best, second], [best_d, second_d]) = self.nearest_two(color, chroma);
-        if dither > 0.0 && self.colors.len() > 1 {
-            let d1 = best_d.sqrt();
-            let share = d1 / (d1 + second_d.sqrt()).max(1e-6);
-            if bayer4(cell) < share * dither {
-                return self.colors[second];
+        pick_in(&self.colors, color, chroma, dither, cell)
+    }
+
+    /// The table the palette style (#324) quantizes to: the ground is a
+    /// colour like any other there, so a dark pixel can fall to CGA's black
+    /// or a light one to paper. Nearest puts the ground first; a ladder
+    /// takes it in at its own lightness, so paper's ground is the top rung
+    /// and phosphor's the bottom one. At most [`MAX_COLORS`] + 1 colours.
+    pub fn table(&self) -> Vec<[f32; 3]> {
+        let mut table = self.colors.clone();
+        match self.matching {
+            PaletteMatch::Nearest => table.insert(0, self.background),
+            PaletteMatch::Luminance => {
+                let at = table
+                    .iter()
+                    .position(|c| luma(*c) > luma(self.background))
+                    .unwrap_or(table.len());
+                table.insert(at, self.background);
             }
         }
-        self.colors[best]
+        table
+    }
+
+    /// The colour the palette style draws for a block of colour `color`
+    /// (display values) in block `cell`. Nearest: `pal_pick` over
+    /// [`table`](Self::table) with `chroma` and `dither`. A ladder: the
+    /// rung for the colour's luminance, moved up to half a rung either way
+    /// by `dither` and the cell's Bayer threshold (as `palette.wgsl` in
+    /// `stylize/` draws it).
+    pub fn quantize(&self, color: [f32; 3], chroma: f32, dither: f32, cell: [i32; 2]) -> [f32; 3] {
+        let table = self.table();
+        match self.matching {
+            PaletteMatch::Nearest => pick_in(&table, color, chroma, dither, cell),
+            PaletteMatch::Luminance => {
+                let n = table.len();
+                let t = luma(color).clamp(0.0, 1.0);
+                let td = (t + (bayer4(cell) - 0.5) * dither / n as f32).clamp(0.0, 1.0);
+                table[((td * n as f32) as usize).min(n - 1)]
+            }
+        }
     }
 
     /// The rung of a luminance ladder for tone `t` (0-1).
@@ -310,6 +330,52 @@ pub fn oklab(display: [f32; 3]) -> [f32; 3] {
     ]
 }
 
+/// Rec. 709 luminance of a display colour, as the shaders weigh it.
+pub fn luma(c: [f32; 3]) -> f32 {
+    0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2]
+}
+
+/// [`Palette::nearest_two`] over any list of inks.
+pub fn nearest_two_in(inks: &[[f32; 3]], color: [f32; 3], chroma: f32) -> ([usize; 2], [f32; 2]) {
+    let mut lab = oklab(color);
+    lab[1] *= chroma;
+    lab[2] *= chroma;
+    let (mut best, mut second) = (0, 0);
+    let (mut best_d, mut second_d) = (1e9_f32, 1e9_f32);
+    for (i, ink) in inks.iter().enumerate() {
+        let e = oklab(*ink);
+        let d = (0..3)
+            .map(|k| (e[k] - lab[k]) * (e[k] - lab[k]))
+            .sum::<f32>();
+        if d < best_d {
+            (second, second_d) = (best, best_d);
+            (best, best_d) = (i, d);
+        } else if d < second_d {
+            (second, second_d) = (i, d);
+        }
+    }
+    ([best, second], [best_d, second_d])
+}
+
+/// [`Palette::pick`] over any list of inks: `pal_pick` on the CPU.
+pub fn pick_in(
+    inks: &[[f32; 3]],
+    color: [f32; 3],
+    chroma: f32,
+    dither: f32,
+    cell: [i32; 2],
+) -> [f32; 3] {
+    let ([best, second], [best_d, second_d]) = nearest_two_in(inks, color, chroma);
+    if dither > 0.0 && inks.len() > 1 {
+        let d1 = best_d.sqrt();
+        let share = d1 / (d1 + second_d.sqrt()).max(1e-6);
+        if bayer4(cell) < share * dither {
+            return inks[second];
+        }
+    }
+    inks[best]
+}
+
 /// A 4x4 Bayer threshold in (0, 1) for the cell at `cell`, as `pal_bayer`.
 pub fn bayer4(cell: [i32; 2]) -> f32 {
     const M: [u32; 16] = [0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5];
@@ -373,6 +439,14 @@ background = "#120800""##
 colors = ["#5a5a5a", "#999999", "#d0d0d0", "#ffffff"]
 background = "#000000""##
         }
+        // Dark inks on a light ground (#324): ink, wash and pencil on
+        // cream paper. The palette style takes the paper in as the top
+        // rung; ASCII draws it with `ground = "inverse"` (see the book)
+        "paper" => {
+            r##"match = "luminance"
+colors = ["#1b1a22", "#4b4654", "#8c8479", "#c9bfae"]
+background = "#f3ecdc""##
+        }
         _ => return None,
     })
 }
@@ -382,24 +456,25 @@ background = "#000000""##
 /// forgets them all when a file one depended on changes on disk (#323).
 #[derive(Default)]
 pub struct PaletteCache {
-    search: Vec<PathBuf>,
+    /// Where names are searched from; `None` knows the built-ins alone.
+    scope: Option<AssetScope>,
     palettes: HashMap<String, Result<Arc<Palette>, PaletteError>>,
     stamps: FileStamps,
 }
 
 impl PaletteCache {
-    /// A cache that resolves names against `search`, in order.
-    pub fn new(search: Vec<PathBuf>) -> Self {
+    /// A cache that finds names by the project's search, from `scope`.
+    pub fn new(scope: AssetScope) -> Self {
         Self {
-            search,
+            scope: Some(scope),
             palettes: HashMap::new(),
             stamps: FileStamps::default(),
         }
     }
 
-    /// The directories names resolve against.
-    pub fn search(&self) -> &[PathBuf] {
-        &self.search
+    /// The project and scene directory names are searched from.
+    pub fn scope(&self) -> Option<&AssetScope> {
+        self.scope.as_ref()
     }
 
     /// The palette `name` names, loading it the first time.
@@ -407,14 +482,24 @@ impl PaletteCache {
         if let Some(found) = self.palettes.get(name) {
             return found.clone();
         }
-        let candidates = self.candidates(name);
-        // Watch the candidates up to the one that loads: an edit to it, or a
-        // file appearing ahead of it (or at all, after a failure), reloads
-        let found = candidates.iter().position(vfs::is_file);
-        for path in &candidates[..found.map_or(candidates.len(), |i| i + 1)] {
-            self.stamps.watch(path);
+        let answer = self
+            .scope
+            .as_ref()
+            .map(|scope| scope.explain(AssetKind::Palettes, name));
+        let mut tried: &[PathBuf] = &[];
+        let mut found = None;
+        if let Some(answer) = &answer {
+            if let Some(change) = &answer.order_change {
+                change.log();
+            }
+            // Watch the places up to the one that loads: an edit to it, or
+            // a file appearing ahead of it (or at all, after a failure),
+            // reloads
+            self.stamps.watch_all(answer.watched());
+            tried = &answer.tried;
+            found = answer.found.as_deref();
         }
-        let loaded = self.resolve(name, &candidates, found);
+        let loaded = Self::load(name, tried, found);
         if let Err(e) = &loaded {
             tracing::warn!("palette `{name}`: {e}");
         }
@@ -441,41 +526,30 @@ impl PaletteCache {
         changed
     }
 
-    fn candidates(&self, name: &str) -> Vec<PathBuf> {
-        if name.ends_with(PALETTE_SUFFIX) {
-            let mut c: Vec<PathBuf> = self.search.iter().map(|d| d.join(name)).collect();
-            c.push(PathBuf::from(name));
-            c
-        } else {
-            self.search
-                .iter()
-                .map(|d| d.join("palettes").join(format!("{name}{PALETTE_SUFFIX}")))
-                .collect()
-        }
-    }
-
-    fn resolve(
-        &self,
+    fn load(
         name: &str,
-        candidates: &[PathBuf],
-        found: Option<usize>,
+        tried: &[PathBuf],
+        found: Option<&Path>,
     ) -> Result<Arc<Palette>, PaletteError> {
-        // A file beside the scene wins over a built-in of the same name
-        if let Some(i) = found {
-            return Palette::load(&candidates[i]).map(Arc::new);
+        // A file the search finds wins over a built-in of the same name
+        if let Some(path) = found {
+            return Palette::load(path).map(Arc::new);
         }
         if let Some(p) = Palette::builtin(name) {
             return Ok(p);
         }
-        Err(PaletteError::Read(format!(
-            "no palette `{name}` (built-in: {}; looked for {})",
+        let mut text = format!(
+            "no palette `{name}`: not one of the built-ins ({}), and no file. Tried:",
             BUILTIN_PALETTES.join(", "),
-            candidates
-                .iter()
-                .map(|p| p.display().to_string())
-                .collect::<Vec<_>>()
-                .join(", ")
-        )))
+        );
+        if tried.is_empty() {
+            text.push_str(" nowhere (no scene to search from)");
+        }
+        for path in tried {
+            text.push_str("\n  ");
+            text.push_str(&shown(path));
+        }
+        Err(PaletteError::Read(text))
     }
 }
 
@@ -614,13 +688,26 @@ mod tests {
             r##"colors = ["#123456"]"##,
         )
         .unwrap();
-        let mut cache = PaletteCache::new(vec![dir.clone()]);
+        std::fs::write(dir.join("flint.toml"), "").unwrap();
+        let mut cache = PaletteCache::new(AssetScope::for_dir(&dir));
         assert_eq!(cache.get("cga").unwrap().colors().len(), 1);
         assert_eq!(
             cache.get("amber").unwrap().matching(),
             PaletteMatch::Luminance
         );
-        assert!(cache.get("nope").is_err());
+        // A miss says the built-ins and every place it looked
+        let err = cache.get("nope").unwrap_err().to_string();
+        assert!(err.contains("built-ins (cga,"), "{err}");
+        let listed: Vec<&str> = err.lines().skip(1).map(str::trim).collect();
+        let at = |rel: &str| shown(&dir.join(rel));
+        assert_eq!(
+            listed,
+            [at("palettes/nope.palette.toml"), at("nope.palette.toml")]
+        );
+        // With nothing to search from, the built-ins are all there is
+        let mut bare = PaletteCache::default();
+        assert!(bare.get("amber").is_ok());
+        assert!(bare.get("nope").is_err());
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -632,7 +719,8 @@ mod tests {
         std::fs::create_dir_all(dir.join("palettes")).unwrap();
         let file = dir.join("palettes/tide.palette.toml");
         std::fs::write(&file, r##"colors = ["#ff0000"]"##).unwrap();
-        let mut cache = PaletteCache::new(vec![dir.clone()]);
+        std::fs::write(dir.join("flint.toml"), "").unwrap();
+        let mut cache = PaletteCache::new(AssetScope::for_dir(&dir));
         let before = cache.get("tide").unwrap();
         assert!(!cache.poll(), "nothing changed yet");
         assert!(Arc::ptr_eq(&before, &cache.get("tide").unwrap()));
@@ -673,5 +761,52 @@ colors = ["#ffaa00"]"##,
             PaletteMatch::Nearest
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// ADR 0114: a scene two folders down finds the project's palette, and
+    /// one that appears nearer later (beside the scene, or a folder between)
+    /// takes over at the next poll, since every nearer place is watched.
+    #[test]
+    fn a_nested_scene_finds_the_projects_palette_and_a_nearer_one_takes_over() {
+        let root = std::env::temp_dir().join(format!("flint-palette-near-{}", std::process::id()));
+        let scene_dir = root.join("scenes/act1/cave");
+        std::fs::create_dir_all(&scene_dir).unwrap();
+        std::fs::create_dir_all(root.join("palettes")).unwrap();
+        std::fs::write(root.join("flint.toml"), "").unwrap();
+        std::fs::write(
+            root.join("palettes/tide.palette.toml"),
+            r##"colors = ["#ff0000"]"##,
+        )
+        .unwrap();
+        let mut cache = PaletteCache::new(AssetScope::for_dir(&scene_dir));
+        assert_eq!(cache.get("tide").unwrap().colors().len(), 1);
+        assert!(!cache.poll());
+
+        // A folder between the scene and the root gets its own
+        std::fs::create_dir_all(root.join("scenes/palettes")).unwrap();
+        std::fs::write(
+            root.join("scenes/palettes/tide.palette.toml"),
+            r##"colors = ["#00ff00", "#0000ff"]"##,
+        )
+        .unwrap();
+        assert!(cache.poll(), "a nearer file appeared");
+        assert_eq!(cache.get("tide").unwrap().colors().len(), 2);
+        assert!(!cache.poll());
+
+        // Then the scene's own folder does
+        std::fs::create_dir_all(scene_dir.join("palettes")).unwrap();
+        std::fs::write(
+            scene_dir.join("palettes/tide.palette.toml"),
+            r##"colors = ["#111111", "#222222", "#333333"]"##,
+        )
+        .unwrap();
+        assert!(cache.poll());
+        assert_eq!(cache.get("tide").unwrap().colors().len(), 3);
+
+        // Taken away again, the next one out is back
+        std::fs::remove_file(scene_dir.join("palettes/tide.palette.toml")).unwrap();
+        assert!(cache.poll());
+        assert_eq!(cache.get("tide").unwrap().colors().len(), 2);
+        std::fs::remove_dir_all(&root).ok();
     }
 }

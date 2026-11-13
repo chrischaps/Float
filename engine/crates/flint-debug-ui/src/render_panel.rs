@@ -40,8 +40,15 @@ pub struct RenderPanelFlags {
     /// A stylize pass (Kuwahara or a registered style) was just enabled —
     /// host must call `ensure_style_resources`.
     pub style_needs_resources: bool,
+    /// The style editor wrote a style into the scene file (#364); the
+    /// panel's authored settings already match it. A host with another
+    /// editor (the player's F3 Styles) passes [`RenderDebugPanel::authored_styles`] on.
+    pub styles_committed: bool,
     /// FXAA was just enabled — host must call ensure_fxaa_resources.
     pub fxaa_needs_resources: bool,
+    /// A look was picked (#356): the host lays [`RenderDebugPanel::look`]
+    /// under the scene's keys and uploads the result.
+    pub look_changed: bool,
 }
 
 impl RenderPanelFlags {
@@ -53,6 +60,7 @@ impl RenderPanelFlags {
             || self.lighting_changed
             || self.lighting_reset
             || self.fov_changed
+            || self.look_changed
     }
 }
 
@@ -75,6 +83,11 @@ pub struct RenderDebugPanel {
     /// The style mask view's legend (#309), shown under the debug mode
     /// while it is Style Mask; set by the host from the renderer's ids.
     style_legend: Vec<LegendEntry>,
+    /// The looks the scene can reach (#356), set by the host.
+    looks: Vec<LookEntry>,
+    /// The look the scene draws with (`None`: its own keys alone); the
+    /// picker writes the choice here and raises `look_changed`.
+    pub look: Option<String>,
     flags: RenderPanelFlags,
     open: bool,
     dirty: bool,
@@ -103,6 +116,8 @@ impl RenderDebugPanel {
             authored_styles: None,
             styles_editor: StylesEditor::default(),
             style_legend: Vec::new(),
+            looks: Vec::new(),
+            look: None,
             flags: RenderPanelFlags::default(),
             open: false,
             dirty: false,
@@ -139,6 +154,75 @@ impl RenderDebugPanel {
         self.authored_styles = authored;
     }
 
+    /// The scene's authored style settings, as last set or committed.
+    pub fn authored_styles(&self) -> Option<&StyleSettings> {
+        self.authored_styles.as_ref()
+    }
+
+    /// The scene file the style editor's Commit to scene writes (#364);
+    /// `None` hides the button (a scene from a bundle has no file).
+    pub fn set_scene_file(&mut self, scene_file: Option<std::path::PathBuf>) {
+        self.styles_editor.set_scene_file(scene_file);
+    }
+
+    /// Grey out Commit to scene, with the reason on hover (#364); `None`
+    /// allows it.
+    pub fn set_commit_blocked(&mut self, reason: Option<String>) {
+        self.styles_editor.set_commit_blocked(reason);
+    }
+
+    /// The scene's folder, where the style editor finds the scene's own
+    /// palettes and glyph sets to offer (#322); set by the host on scene
+    /// load (and reload, to find new files).
+    pub fn set_scene_dir(&mut self, scene_dir: Option<std::path::PathBuf>) {
+        self.styles_editor.set_scene_dir(scene_dir);
+    }
+
+    /// [`set_scene_dir`](Self::set_scene_dir) for a host that holds the
+    /// scene's project (ADR 0114): the choices are searched from `assets`.
+    pub fn set_asset_scope(&mut self, assets: Option<flint_core::project::AssetScope>) {
+        self.styles_editor.set_asset_scope(assets);
+    }
+
+    /// The looks to offer (#356; `flint_render::look::list` of the
+    /// scene) and the one in use, set by the host on scene load and after
+    /// a script or the picker changes it.
+    pub fn set_looks(&mut self, looks: &[flint_render::look::Look], current: Option<&str>) {
+        self.looks = looks
+            .iter()
+            .map(|l| LookEntry {
+                name: l.name.clone(),
+                hover: match l.description.is_empty() {
+                    true => l.source.clone(),
+                    false => format!("{}\n\n{}", l.description, l.source),
+                },
+            })
+            .collect();
+        self.look = current.map(str::to_string);
+    }
+
+    /// The look in use, as the host last said (a script's `set_look`,
+    /// #356), without touching the list on offer.
+    pub fn set_current_look(&mut self, current: Option<&str>) {
+        self.look = current.map(str::to_string);
+    }
+
+    /// The names of the looks on offer.
+    pub fn look_names(&self) -> impl Iterator<Item = &str> {
+        self.looks.iter().map(|l| l.name.as_str())
+    }
+
+    /// Pick a look as the menu does, raising `look_changed` for the host.
+    /// For hosts and tests that drive the panel without a click.
+    pub fn pick_look(&mut self, look: Option<&str>) {
+        if self.look.as_deref() == look {
+            return;
+        }
+        self.look = look.map(str::to_string);
+        self.flags.look_changed = true;
+        self.dirty = true;
+    }
+
     /// Mirror the renderer's style ids into the Style Mask legend. Cheap
     /// every frame: it rebuilds only when the ids changed.
     pub fn set_style_ids(&mut self, ids: &StyleIds) {
@@ -172,6 +256,49 @@ impl RenderDebugPanel {
     /// DebugPanel loop (the viewer draws it inside its own egui Window).
     pub fn ui_contents(&mut self, ui: &mut egui::Ui) {
         let mut f = self.flags;
+
+        // A look (#356): a whole preset, laid under the scene's own keys.
+        // Picking one replaces the post config; the sections below then
+        // tune what it set
+        if !self.looks.is_empty() {
+            section(ui, "Look", true, |ui| {
+                let none = "None (the scene's keys)";
+                let current = self.look.clone();
+                let mut picked: Option<Option<String>> = None;
+                egui::ComboBox::from_label("Look")
+                    .selected_text(current.as_deref().unwrap_or(none))
+                    .show_ui(ui, |ui| {
+                        if ui.selectable_label(current.is_none(), none).clicked() {
+                            picked = Some(None);
+                        }
+                        for entry in &self.looks {
+                            let on = current.as_deref() == Some(entry.name.as_str());
+                            if ui
+                                .selectable_label(on, &entry.name)
+                                .on_hover_text(&entry.hover)
+                                .clicked()
+                            {
+                                picked = Some(Some(entry.name.clone()));
+                            }
+                        }
+                    })
+                    .response
+                    .on_hover_text(
+                        "A styles/<name>.look.toml beside the scene, or a built-in. It goes \
+                         under the scene's own [post_process] keys and replaces what this \
+                         menu changed since.",
+                    );
+                if let Some(look) = current.as_deref() {
+                    ui.weak(format!("[post_process] look = \"{look}\""));
+                }
+                if let Some(choice) = picked {
+                    if choice != current {
+                        self.look = choice;
+                        f.look_changed = true;
+                    }
+                }
+            });
+        }
 
         section(ui, "Post chain", true, |ui| {
             if self.show_freeze {
@@ -331,6 +458,13 @@ impl RenderDebugPanel {
                 .ui(ui, &mut self.pp, self.authored_styles.as_ref());
             f.pp_changed |= edit.changed;
             f.style_needs_resources |= edit.needs_resources;
+            if let Some(name) = edit.committed {
+                // The scene now says what the config says of the style
+                self.authored_styles
+                    .get_or_insert_with(StyleSettings::default)
+                    .restore(name, &self.pp.styles);
+                f.styles_committed = true;
+            }
             // The shared geometry edges' thresholds (#301): one pair for
             // every style that reads them (edges_view shows what they find)
             ui.separator();
@@ -339,8 +473,35 @@ impl RenderDebugPanel {
             f.pp_changed |= slider(ui, "Crease", &mut self.pp.edge_normal, 0.2..=8.0);
         });
 
+        section(ui, "Shading boil", false, |ui| {
+            // How long each drawing is held (#214). The amounts are the
+            // Kuwahara and contour styles' own `boil` (#599), in Styles above
+            ui.label("Amounts: Styles > Kuwahara / Contour > Boil");
+            let names = ["Ones", "Twos", "Threes"];
+            let cur = (self.pp.boil_on.clamp(1, 3) - 1) as usize;
+            egui::ComboBox::from_label("Hold each drawing")
+                .selected_text(names[cur])
+                .show_ui(ui, |ui| {
+                    for (i, name) in names.iter().enumerate() {
+                        if ui.selectable_label(cur == i, *name).clicked() && cur != i {
+                            self.pp.boil_on = i as u32 + 1;
+                            f.pp_changed = true;
+                        }
+                    }
+                });
+            ui.label(boil_status(&self.pp.boil));
+        });
+
         section(ui, "Render mode", false, |ui| {
-            let labels = ["None", "Matrix", "Blood", "Drunk", "Tron", "Underwater"];
+            let labels = [
+                "None",
+                "Matrix",
+                "Blood",
+                "Drunk",
+                "Tron",
+                "Underwater",
+                "Tear (props)",
+            ];
             let cur = (self.pp.render_mode as usize).min(labels.len() - 1);
             egui::ComboBox::from_label("Mode")
                 .selected_text(labels[cur])
@@ -353,8 +514,8 @@ impl RenderDebugPanel {
                     }
                 });
             f.pp_changed |= slider(ui, "Mix", &mut self.pp.mode_mix, 0.0..=1.0);
-            let hover = "Tears (1-4): x = mask scale, y = mask style (0 fbm / 1 iris), \
-                         z = rate, w = spare. Underwater (5): x = signed eye depth m, \
+            let hover = "Tears (1-4, 6): x = mask scale (0 = 3), y = mask style (0 fbm / 1 iris), \
+                         z = rate (0 = 6), w = spare. Underwater (5): x = signed eye depth m, \
                          y = sea energy, z = daylight, w = biolum.";
             let r = ui.horizontal(|ui| {
                 ui.label("Params");
@@ -478,6 +639,9 @@ impl RenderDebugPanel {
             if self.debug_mode == DebugMode::StyleMask {
                 style_legend_ui(ui, &self.style_legend);
             }
+            if self.debug_mode == DebugMode::StyleEdges {
+                edge_legend_ui(ui);
+            }
         });
 
         self.flags = f;
@@ -485,6 +649,14 @@ impl RenderDebugPanel {
             self.dirty = true;
         }
     }
+}
+
+/// A look on offer in the picker.
+#[derive(Debug, Clone)]
+struct LookEntry {
+    name: String,
+    /// What it is and where it comes from.
+    hover: String,
 }
 
 /// The Style Mask view's legend: a swatch of each id's hue, its id and
@@ -512,12 +684,50 @@ fn style_legend_ui(ui: &mut egui::Ui, rows: &[LegendEntry]) {
     ui.weak("Grey: unstyled. White: where ids meet.");
 }
 
+/// The Style Edges view's legend (#349): what each colour marks.
+fn edge_legend_ui(ui: &mut egui::Ui) {
+    for (i, ([r, g, b], name)) in flint_render::stylize::EDGE_VIEW_LEGEND.iter().enumerate() {
+        if i == 3 {
+            ui.weak("Each glyph cell:");
+        } else if i == 0 {
+            ui.weak("Each edge pixel:");
+        }
+        ui.horizontal(|ui| {
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+            let byte = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+            ui.painter().rect_filled(
+                rect,
+                2.0,
+                egui::Color32::from_rgb(byte(*r), byte(*g), byte(*b)),
+            );
+            ui.label(*name);
+        });
+    }
+    ui.weak(
+        "A cell's foot bar is its edge length over edge_max, the tick edge_threshold. \
+         Tune them, edge_depth and edge_normal under Styles > ascii.",
+    );
+}
+
 fn fov_label(fov_deg: f32) -> &'static str {
     match fov_deg {
         f if f < 50.0 => "narrow",
         f if f < 72.0 => "natural",
         f if f < 90.0 => "wide",
         _ => "fisheye",
+    }
+}
+
+/// What the wooze field is telling the boil here and now. Its sliders are shares
+/// of this, so a scene with no field needs to say why they do nothing.
+fn boil_status(boil: &flint_wooze::BoilFrame) -> String {
+    if boil.step <= 0.0 {
+        "No [wooze] table here, so nothing boils.".to_string()
+    } else {
+        format!(
+            "Field: step {:.3} s, jitter {:.2}, drawing {}",
+            boil.step, boil.amount, boil.seed
+        )
     }
 }
 
@@ -645,5 +855,31 @@ mod tests {
         panel.set_style_ids(&ids);
         assert_eq!(panel.style_legend()[0].name, "pencil");
         assert_eq!(panel.style_legend()[0].id, 1, "ids renumber by name order");
+    }
+
+    /// #356: F4 offers the scene's looks and a pick reaches the host.
+    #[test]
+    fn the_look_picker_lists_looks_and_raises_a_flag() {
+        let mut panel = RenderDebugPanel::new(true);
+        let looks = flint_render::look::list("nowhere/a.scene.toml");
+        panel.set_looks(&looks, Some("graphite"));
+        let names: Vec<&str> = panel.look_names().collect();
+        assert!(
+            names.contains(&"graphite") && names.contains(&"matrix"),
+            "{names:?}"
+        );
+        assert_eq!(panel.look.as_deref(), Some("graphite"));
+
+        panel.pick_look(Some("graphite"));
+        assert!(!panel.is_dirty(), "the same look is no change");
+        panel.pick_look(Some("matrix"));
+        assert!(panel.is_dirty());
+        let flags = panel.take_flags();
+        assert!(flags.look_changed && !flags.pp_changed);
+        assert_eq!(panel.look.as_deref(), Some("matrix"));
+
+        panel.pick_look(None);
+        assert!(panel.take_flags().look_changed);
+        assert_eq!(panel.look, None);
     }
 }

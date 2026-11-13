@@ -23,6 +23,7 @@ hour_center_tron = { type = "float", description = "Game hour where the Tron tea
 hour_width_tron = { type = "float", description = "Affinity half-width in hours (<= 0 = any hour)", default = 3.0 }
 mask_scale = { type = "float", description = "Bleed-mask patch frequency (higher = smaller patches)", default = 3.0 }
 mask_style = { type = "float", description = "0 = fbm patches, 1 = radial iris", default = 0.0 }
+base_vignette = { type = "float", description = "The scene's [post_process] vignette_intensity, mirrored: the Matrix tear ramps from it and heals back to it", default = 0.18 }
 trigger_mode = { type = "float", description = "One-shot: 1..4 starts that tear now (panel sets; script clears to -1)", default = -1.0 }
 end_now = { type = "bool", description = "One-shot: ease the active tear out immediately (panel sets; script clears)", default = false }
 mix_override = { type = "float", description = "Debug: pin the active tear's mix 0..1 (-1 = script envelope)", default = -1.0 }

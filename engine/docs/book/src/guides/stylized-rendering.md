@@ -6,10 +6,10 @@ Every image here was made with `flint render` from the commands beside it, at 12
 
 ## Three ways to style one frame
 
-The frame is `demo/ascii_entities.scene.toml`, a meadow clearing with a bench, a skinned YBot, a barrel, and a crate with a lantern on it. The camera is the same for each:
+The frame is `examples/ascii_entities.scene.toml`, a meadow clearing with a bench, a skinned YBot, a barrel, and a crate with a lantern on it. The camera is the same for each:
 
 ```bash
-CAM="--no-grid --target 0.7,0.7,4.2 --distance 5.2 --yaw 29 --pitch 10 --width 1280 --height 720 --schemas schemas"
+CAM="--no-grid --target 0.7,0.7,4.2 --distance 5.2 --yaw 29 --pitch 10 --width 1280 --height 720"
 ```
 
 | | |
@@ -55,7 +55,7 @@ For everything else, temporal stability (#277: per-cell history and hysteresis) 
 
 ## Edges give an object its shape
 
-Glyphs alone define an object only by tone, so a prop close to the ground's brightness blurs into it. Without edges, the crate on the right of `demo/stylize_props.scene.toml` is only a patch of brighter glyphs, and the barrel's top runs into the ground behind it. With geometry edges (depth steps, creases and mask changes, never colour), the crate becomes a drawn box with a lid:
+Glyphs alone define an object only by tone, so a prop close to the ground's brightness blurs into it. Without edges, the crate on the right of `examples/stylize_props.scene.toml` is only a patch of brighter glyphs, and the barrel's top runs into the ground behind it. With geometry edges (depth steps, creases and mask changes, never colour), the crate becomes a drawn box with a lid:
 
 | ![No edges: the crate on the right is a patch of brighter glyphs](../images/stylized-edges-off.png) | ![Edges: line glyphs outline the crate, the barrel and the figure](../images/stylized-edges-on.png) |
 |---|---|
@@ -70,7 +70,7 @@ A style runs at one of two stages (the reference's [Where styles run](../concept
 - **HDR**, in linear light at the scene's render scale, before fog, bloom and tonemapping. Painterly filters (Kuwahara) belong here: the fog fades them and the grade tints them like the rest of the scene.
 - **Display**, on the finished picture at output resolution. Glyphs, lines and hatching belong here.
 
-The difference shows under a render scale. Here is `demo/pbr_test.scene.toml` at `--render-scale 0.5`, zoomed 2x:
+The difference shows under a render scale. Here is `examples/pbr_test.scene.toml` at `--render-scale 0.5`, zoomed 2x:
 
 | ![Display stage: sharp 8 px glyphs on a crisp grid](../images/stylized-stage-display-scale05.png) | ![HDR stage: 16 px glyphs, blurred and bloomed](../images/stylized-stage-hdr-scale05.png) |
 |---|---|
@@ -82,7 +82,7 @@ At the HDR stage the glyphs are drawn at half resolution and upscaled: each 8 px
 
 | You want | Use |
 |---|---|
-| The whole game in a look | `[post_process.styles.<name>]`, or a [look](../concepts/stylize-passes.md#looks-and-sweeps) such as `--look ascii_noir` |
+| The whole game in a look | `[post_process.styles.<name>]`, or a [look](../concepts/stylize-passes.md#looks-in-scenes-f4-and-scripts): `look = "ascii_noir"` in the scene's `[post_process]`, `--look ascii_noir` to try one, `set_look` from a script |
 | A few things in a style, the world smooth | an `ascii_style` (or `style_mask`) on those entities, scope `entities` |
 | One thing to stay smooth under a whole-frame style | `enabled = false` on it (descendants follow) |
 | Glyphs that don't crawl as a prop slides | `grid = "object"` on that prop only |
@@ -90,18 +90,18 @@ At the HDR stage the glyphs are drawn at half resolution and upscaled: each 8 px
 | A painterly look that the fog and grade should touch | an HDR-stage style |
 | Marks that stay crisp under `--render-scale` | a Display-stage style |
 
-Today the mask covers static glTF meshes, procedural boxes and skinned meshes. Terrain, grass, particles, sprites and water can only be styled by the whole frame (#290, #310). A frame holds one glyph set (#335) and 63 per-entity variants (#336).
+Today the mask covers static glTF meshes, procedural boxes and skinned meshes. Terrain, grass, particles, sprites and water can only be styled by the whole frame (#290, #310). A frame holds up to 8 glyph sets, one per entity if you like (#335), and up to 4095 per-entity variants (#336).
 
 ## Tuning a look
 
 Tune by sweeping, not by guessing. A sweep renders one frame per value side by side:
 
 ```bash
-flint render demo/ascii_entities.scene.toml --sweep ascii.cell=6,8,12 -o cells.png
-flint render demo/stylize_props.scene.toml --sweep look=ascii_noir,matrix,ink_wash,graphite -o looks.png
+flint render examples/ascii_entities.scene.toml --sweep ascii.cell=6,8,12 -o cells.png
+flint render examples/stylize_props.scene.toml --sweep look=ascii_noir,matrix,ink_wash,graphite -o looks.png
 ```
 
-Then confirm the winner with one render at the final size, since cells are in points. In the player or viewer, **F4 → Styles** tunes the same keys live. Its **Copy TOML** puts the block that reproduces the picture on the clipboard. See [Looks and sweeps](../concepts/stylize-passes.md#looks-and-sweeps) and the reference's advice on [cell size and ramps](../concepts/stylize-passes.md#choosing-cell-size-and-ramp).
+Then confirm the winner with one render at the final size, since cells are in points. In the player or viewer, **F4 → Styles** tunes the same keys live. Its **Copy TOML** puts the block that reproduces the picture on the clipboard, and **Commit to scene** writes it into the scene file. See [Looks and sweeps](../concepts/stylize-passes.md#looks-and-sweeps) and the reference's advice on [cell size and ramps](../concepts/stylize-passes.md#choosing-cell-size-and-ramp).
 
 ## Adding a style
 
