@@ -57,7 +57,8 @@ Pull updates: `git subtree pull --prefix=engine engine main --squash`.
 
 ## Float-specific engine features (live in the subtree, upstreamable)
 
-- `flint-core/src/ocean.rs` — Gerstner spectrum + CPU sampler. SINGLE SOURCE
+- `flint-geometry/src/ocean.rs` (moved out of flint-core upstream, #754) —
+  Gerstner spectrum + CPU sampler. SINGLE SOURCE
   OF TRUTH for wave math: the GPU only sums the wave array uploaded from here.
   Any change to wave math must keep CPU/GPU parity (unit test + in-world buoy
   probe pinned to `ocean_height()`).
@@ -441,10 +442,17 @@ Polish backlog: real M6/M8 + weather SFX from
 `specs/elevenlabs_audio_prompts.md`; the palm is still a sharp-edged box
 (reads as a card in close-up); live playtest of the scoot with the
 new passive-arm ride.
-Engine: `engine/` tracks Flint `main` (last pull 2026-11-08, Flint
-`7e9285e`; everything Float pioneered is upstream). Engine tests:
+Engine: `engine/` tracks Flint `main` (last pull 2026-11-12, Flint
+`44eee61`; everything Float pioneered is upstream). Engine tests:
 `cargo test --release --workspace --exclude flint-android` (the Android
-crate only compiles for Android). Plan (historical):
+crate only compiles for Android; add `--no-fail-fast` or cargo stops at
+the first red binary). Expected red INSIDE this subtree (green in a Flint
+checkout): `examples_cli` / `schema_cli`'s example-scene tests — Flint's
+root `flint.toml` adds the `schemas/examples` layer (furniture, door,
+film...), but project discovery passes through `engine/` to Float, whose
+schemas don't list it. As of 44eee61 `flint-procgen-ai`'s
+`the_loop_sends_validator_reports_back...` is also stale upstream (`cone`
+became a valid crown_shape). Neither touches Float. Plan (historical):
 `C:\Users\chris\.claude\plans\please-make-a-plan-fluffy-pearl.md`
 
 ## Showcase capture (tools/showcase/)
