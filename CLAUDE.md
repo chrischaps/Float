@@ -443,7 +443,7 @@ Polish backlog: real M6/M8 + weather SFX from
 (reads as a card in close-up); live playtest of the scoot with the
 new passive-arm ride.
 Engine: `engine/` tracks Flint `main` (last pull 2026-11-12, Flint
-`44eee61`; everything Float pioneered is upstream). Engine tests:
+`356f44a`; everything Float pioneered is upstream). Engine tests:
 `cargo test --release --workspace --exclude flint-android` (the Android
 crate only compiles for Android; add `--no-fail-fast` or cargo stops at
 the first red binary). Expected red INSIDE this subtree (green in a Flint
