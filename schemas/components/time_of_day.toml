@@ -1,12 +1,13 @@
 [component.time_of_day]
 description = "Day/night controller state (scripts/time_of_day.rhai interpolates keyframes into sun/sky/fog/ocean fields)"
 
+# The F3 panel (Flint #744): each field's `panel` says what it is on it, status, tune or trigger.
 [component.time_of_day.fields]
-time_hours = { type = "float", description = "Current time of day, 0-24 (0 = midnight). Set directly to force a time.", default = 10.5 }
-day_length_sec = { type = "float", description = "Real seconds per full 24h cycle", default = 600.0 }
-auto_advance = { type = "boolean", description = "Advance time naturally; off = frozen at time_hours", default = true }
-sun_path_tilt_deg = { type = "float", description = "Tilt of the sun arc from vertical (higher = lower sun all day)", default = 28.0 }
-day = { type = "float", description = "Current day number; day 0 is the title day (loops while title.locked is up) and drives the first-days day-length ramp", default = 0.0 }
+time_hours = { type = "float", description = "Current time of day, 0-24 (0 = midnight). Set directly to force a time.", default = 10.5, panel = { role = "tune", label = "Time (h)", format = "{:clock}", min = 0.0, max = 24.0, slider = true, presets = [["Dawn", 6.0], ["Noon", 12.5], ["Sunset", 19.0], ["Dusk", 20.4], ["Night", 0.0]] } }
+day_length_sec = { type = "float", description = "Real seconds per full 24h cycle", default = 600.0, panel = { role = "tune", label = "Day length (s)", min = 30.0, max = 86400.0, step = 5.0 } }
+auto_advance = { type = "boolean", description = "Advance time naturally; off = frozen at time_hours", default = true, panel = { role = "tune", label = "Advance naturally" } }
+sun_path_tilt_deg = { type = "float", description = "Tilt of the sun arc from vertical (higher = lower sun all day)", default = 28.0, panel = { role = "tune", label = "Sun path tilt (deg)", min = 0.0, max = 75.0, step = 0.5 } }
+day = { type = "float", description = "Current day number; day 0 is the title day (loops while title.locked is up) and drives the first-days day-length ramp", default = 0.0, panel = { role = "tune", label = "Day", format = "day {:.0}", min = 0.0, max = 9999.0, step = 1.0, commit = false } }
 last_hours = { type = "float", description = "time_hours seen last frame (wrap/scrub detection for the day counter)", default = 10.5 }
 # Declares the first-days ramp to the engine's Day / Time panel so it can
 # report the real length of the current day. time_of_day.rhai applies the

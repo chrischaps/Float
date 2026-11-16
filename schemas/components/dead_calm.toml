@@ -1,6 +1,7 @@
 [component.dead_calm]
 description = "Dead Calm: the ocean goes unnaturally still for ~4 game hours (scripts/dead_calm.rhai). The script publishes factors; weather.rhai applies sea_scale/wind_scale and water_ambience.rhai applies bed_scale at their own write sites. The script directly owns ocean splash_baseline/splash_strength/sky_reflection_strength (capture/restore) — set enabled = false before hand-tuning those in F3."
 
+# The F3 panel (Flint #744): each field's `panel` says what it is on it, status, tune or trigger.
 [component.dead_calm.fields]
 enabled = { type = "bool", description = "false = no autonomous calms (F3 trigger still works)", default = true }
 min_interval_s = { type = "float", description = "Minimum real seconds between autonomous attempts", default = 900.0 }
@@ -19,12 +20,12 @@ trough_bed = { type = "float", description = "Ocean/wind ambience bed fraction a
 calm_splash_baseline = { type = "float", description = "ocean.splash_baseline at full calm (0 = no foam ring on glass)", default = 0.0 }
 calm_splash_strength = { type = "float", description = "ocean.splash_strength at full calm", default = 0.15 }
 calm_sky_reflection = { type = "float", description = "ocean.sky_reflection_strength at full calm (the mirror reads)", default = 0.85 }
-trigger_calm = { type = "float", description = "One-shot: set >= 0.5 to start a calm now, bypassing all gates (panel sets; script clears to -1)", default = -1.0 }
-end_now = { type = "bool", description = "One-shot: ease the active calm out immediately (panel sets; script clears)", default = false }
-calm = { type = "float", description = "PUBLISHED calm envelope 0..1 (script-owned) — read by birds/reality/music", default = 0.0 }
+trigger_calm = { type = "float", description = "One-shot: set >= 0.5 to start a calm now, bypassing all gates (panel sets; script clears to -1)", default = -1.0, panel = { role = "trigger", label = "Calm now" } }
+end_now = { type = "bool", description = "One-shot: ease the active calm out immediately (panel sets; script clears)", default = false, panel = { role = "trigger", label = "End now" } }
 sea_scale = { type = "float", description = "PUBLISHED ocean amplitude factor 0..1 — applied by weather.rhai", default = 1.0 }
 wind_scale = { type = "float", description = "PUBLISHED wind factor 0..1 — applied by weather.rhai to wind_mean", default = 1.0 }
 bed_scale = { type = "float", description = "PUBLISHED ambience-bed factor 0..1 — applied by water_ambience.rhai", default = 1.0 }
-phase = { type = "float", description = "PUBLISHED 0 idle / 1 falling calm / 2 dead calm / 3 life returning (script-owned)", default = 0.0 }
-next_in_s = { type = "float", description = "PUBLISHED real seconds until the next scheduled attempt (-1 = none)", default = -1.0 }
+phase = { type = "float", description = "PUBLISHED 0 idle / 1 falling calm / 2 dead calm / 3 life returning (script-owned)", default = 0.0, panel = { role = "status", labels = ["Idle", "Falling calm", "Dead calm", "Life returning"] } }
+calm = { type = "float", description = "PUBLISHED calm envelope 0..1 (script-owned) — read by birds/reality/music", default = 0.0, panel = { role = "status", format = "calm {:.2}" } }
+next_in_s = { type = "float", description = "PUBLISHED real seconds until the next scheduled attempt (-1 = none)", default = -1.0, panel = { role = "status", format = "next in {:.0}s", unset = -1.0 } }
 debug_log = { type = "bool", description = "Print scheduling and envelope transitions", default = false }
