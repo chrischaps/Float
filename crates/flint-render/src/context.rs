@@ -1,5 +1,6 @@
 //! wgpu render context setup
 
+use crate::gpu_counts::CountedDevice;
 use std::sync::Arc;
 use thiserror::Error;
 use winit::window::Window;
@@ -28,12 +29,10 @@ pub struct RenderContext {
     pub config: wgpu::SurfaceConfiguration,
     pub size: winit::dpi::PhysicalSize<u32>,
     pub depth_texture: wgpu::Texture,
+    /// The renderer keeps bind groups over it for as long as it is the same
+    /// view (#379, #960): a texture made again, here or by a host, is a new
+    /// view and gets new groups.
     pub depth_view: wgpu::TextureView,
-    /// `depth_texture`'s [`new_depth_id`](crate::bind_cache::new_depth_id),
-    /// taken again whenever it is made again, so the renderer can keep bind
-    /// groups over `depth_view` (#379). A host that replaces the texture
-    /// itself takes a new one too.
-    pub depth_id: u64,
     // Retained for surface recreation on Android resume
     instance: wgpu::Instance,
     pub adapter: wgpu::Adapter,
@@ -58,9 +57,9 @@ pub struct RenderContext {
 
 /// The present mode wgpu configures for `requested` on a surface offering
 /// `supported`: an `Auto` mode is the first of its list the surface has,
-/// as wgpu-core 23's `surface_configure` picks it (`AutoVsync`: FifoRelaxed,
-/// Fifo; `AutoNoVsync`: Immediate, Mailbox, Fifo). Any other mode is used
-/// as asked.
+/// as wgpu-core picks it (`AutoVsync`: FifoRelaxed, Fifo; `AutoNoVsync`:
+/// Immediate, Mailbox, Fifo; `device/surface_config.rs` in wgpu-core 30,
+/// the same lists as 23's). Any other mode is used as asked.
 pub fn resolve_present_mode(
     requested: wgpu::PresentMode,
     supported: &[wgpu::PresentMode],
@@ -106,17 +105,15 @@ impl RenderContext {
         let limits = wgpu::Limits::default();
 
         let (device, queue) = adapter
-            .request_device(
-                &wgpu::DeviceDescriptor {
-                    label: Some("Flint Device"),
-                    // Timestamps where the adapter has them, so the
-                    // renderer's GPU timing can be turned on (ADR 0108).
-                    required_features: adapter.features() & wgpu::Features::TIMESTAMP_QUERY,
-                    required_limits: limits,
-                    memory_hints: Default::default(),
-                },
-                None,
-            )
+            .request_device(&wgpu::DeviceDescriptor {
+                label: Some("Flint Device"),
+                // Timestamps where the adapter has them, so the
+                // renderer's GPU timing can be turned on (ADR 0108).
+                required_features: adapter.features() & wgpu::Features::TIMESTAMP_QUERY,
+                required_limits: limits,
+                memory_hints: Default::default(),
+                ..Default::default()
+            })
             .await
             .map_err(|e| RenderError::DeviceCreation(e.to_string()))?;
 
@@ -152,13 +149,9 @@ impl RenderContext {
         // shown at each refresh (no tearing, no Fifo stall). On this Optimus
         // laptop Fifo has been seen pacing at ~7 Hz against a virtual
         // display; mailbox sidesteps it.
-        let present_mode = match std::env::var("FLINT_VSYNC")
-            .unwrap_or_default()
-            .to_ascii_lowercase()
-            .as_str()
-        {
-            "0" | "off" | "immediate" => wgpu::PresentMode::AutoNoVsync,
-            "mailbox" => wgpu::PresentMode::Mailbox,
+        let present_mode = match flint_core::env::VSYNC.choice() {
+            Some("0" | "off" | "immediate") => wgpu::PresentMode::AutoNoVsync,
+            Some("mailbox") => wgpu::PresentMode::Mailbox,
             _ => wgpu::PresentMode::AutoVsync,
         };
         tracing::info!(
@@ -173,6 +166,8 @@ impl RenderContext {
             width: size.width.max(1),
             height: size.height.max(1),
             present_mode,
+            // sRGB, as every wgpu before 30 chose (#945)
+            color_space: wgpu::SurfaceColorSpace::Auto,
             alpha_mode: surface_caps.alpha_modes[0],
             // A non-sRGB view of the swapchain for the HUD pass: egui expects to
             // write sRGB-encoded values itself, so blending a translucent panel
@@ -202,7 +197,6 @@ impl RenderContext {
             size,
             depth_texture,
             depth_view,
-            depth_id: crate::bind_cache::new_depth_id(),
             instance,
             adapter,
             surface_copyable,
@@ -221,9 +215,24 @@ impl RenderContext {
         })
     }
 
+    /// The view of a swapchain texture that an egui pass draws into, in
+    /// [`Self::hud_format`]. egui-wgpu picks its shader by the target's
+    /// format: into this plain view it writes gamma-encoded colour and the
+    /// blend happens in display space, as egui's colours are authored. Into
+    /// an sRGB view it writes linear colour and the GPU blends in linear
+    /// light, which lifts every translucent dark panel towards grey (#428:
+    /// the style-error card read lighter in the scene viewer than in the
+    /// player). Build the egui renderer for `hud_format` too.
+    pub fn hud_view(&self, texture: &wgpu::Texture) -> wgpu::TextureView {
+        texture.create_view(&wgpu::TextureViewDescriptor {
+            format: Some(self.hud_format),
+            ..Default::default()
+        })
+    }
+
     /// Read a surface-sized texture back as tightly packed RGBA8 bytes.
     ///
-    /// Blocks on the GPU (`Maintain::Wait`). The texture must have been
+    /// Blocks on the GPU ([`crate::wait_for_gpu`]). The texture must have been
     /// created with `COPY_SRC` and be in the surface format; Bgra formats are
     /// swizzled to RGBA on the way out. Mirrors `HeadlessContext::read_pixels`.
     pub fn read_surface_rgba(&self, texture: &wgpu::Texture) -> Result<Vec<u8>, RenderError> {
@@ -239,7 +248,7 @@ impl RenderContext {
         let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
         let padded_bytes_per_row = unpadded_bytes_per_row.div_ceil(align) * align;
 
-        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
+        let staging = self.device.create_buffer_counted(&wgpu::BufferDescriptor {
             label: Some("Surface Readback Buffer"),
             size: (padded_bytes_per_row * height) as u64,
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
@@ -252,15 +261,15 @@ impl RenderContext {
                 label: Some("Surface Readback Encoder"),
             });
         encoder.copy_texture_to_buffer(
-            wgpu::ImageCopyTexture {
+            wgpu::TexelCopyTextureInfo {
                 texture,
                 mip_level: 0,
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
             },
-            wgpu::ImageCopyBuffer {
+            wgpu::TexelCopyBufferInfo {
                 buffer: &staging,
-                layout: wgpu::ImageDataLayout {
+                layout: wgpu::TexelCopyBufferLayout {
                     offset: 0,
                     bytes_per_row: Some(padded_bytes_per_row),
                     rows_per_image: Some(height),
@@ -279,12 +288,12 @@ impl RenderContext {
         slice.map_async(wgpu::MapMode::Read, move |result| {
             let _ = tx.send(result);
         });
-        self.device.poll(wgpu::Maintain::Wait);
+        let _ = crate::wait_for_gpu(&self.device);
         rx.recv()
             .map_err(|e| RenderError::BufferReadFailed(e.to_string()))?
             .map_err(|e| RenderError::BufferReadFailed(e.to_string()))?;
 
-        let data = slice.get_mapped_range();
+        let data = slice.get_mapped_range().expect("mapped buffer range");
         let mut pixels = Vec::with_capacity((width * height * bytes_per_pixel) as usize);
         for row in 0..height {
             let start = (row * padded_bytes_per_row) as usize;
@@ -324,6 +333,10 @@ impl RenderContext {
             .map_err(|e| RenderError::SurfaceCreation(e.to_string()))?;
 
         // Reconfigure with current format but new dimensions
+        let _note = flint_core::frame_notes::begin(
+            flint_core::frame_notes::NoteKind::SurfaceReconfigure,
+            || format!("{}x{}, a new surface", size.width, size.height),
+        );
         self.config.width = size.width.max(1);
         self.config.height = size.height.max(1);
         surface.configure(&self.device, &self.config);
@@ -334,7 +347,6 @@ impl RenderContext {
         self.size = size;
         self.depth_texture = depth_texture;
         self.depth_view = depth_view;
-        self.depth_id = crate::bind_cache::new_depth_id();
 
         Ok(())
     }
@@ -342,6 +354,11 @@ impl RenderContext {
     /// Resize the surface
     pub fn resize(&mut self, new_size: winit::dpi::PhysicalSize<u32>) {
         if new_size.width > 0 && new_size.height > 0 {
+            // The swapchain made again is a likely hitch (#1077)
+            let _note = flint_core::frame_notes::begin(
+                flint_core::frame_notes::NoteKind::SurfaceReconfigure,
+                || format!("{}x{}", new_size.width, new_size.height),
+            );
             self.size = new_size;
             self.config.width = new_size.width;
             self.config.height = new_size.height;
@@ -350,7 +367,6 @@ impl RenderContext {
             let (depth_texture, depth_view) = create_depth_texture(&self.device, &self.config);
             self.depth_texture = depth_texture;
             self.depth_view = depth_view;
-            self.depth_id = crate::bind_cache::new_depth_id();
         }
     }
 
@@ -371,10 +387,10 @@ impl RenderContext {
         resolve_present_mode(self.config.present_mode, &self.supported_present_modes)
     }
 
-    /// The depth view with its id, for
+    /// The depth view, for
     /// [`SceneRenderer::encode_to`](crate::SceneRenderer::encode_to).
     pub fn depth_target(&self) -> crate::bind_cache::DepthTarget<'_> {
-        crate::bind_cache::DepthTarget::new(&self.depth_view, self.depth_id)
+        crate::bind_cache::DepthTarget::new(&self.depth_view)
     }
 
     /// Get aspect ratio
@@ -386,11 +402,7 @@ impl RenderContext {
 /// Frames the CPU may queue ahead of the display. `FLINT_FRAME_LATENCY`
 /// overrides the default of 2 (1 to 3).
 fn frame_latency() -> u32 {
-    std::env::var("FLINT_FRAME_LATENCY")
-        .ok()
-        .and_then(|v| v.trim().parse::<u32>().ok())
-        .map(|n| n.clamp(1, 3))
-        .unwrap_or(2)
+    flint_core::env::FRAME_LATENCY.u32().unwrap_or(2)
 }
 
 fn create_depth_texture(
@@ -410,11 +422,14 @@ fn create_depth_texture(
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
         format: wgpu::TextureFormat::Depth32Float,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        // COPY_SRC: a frame capture reads it as its pass left it (#1086)
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+            | wgpu::TextureUsages::TEXTURE_BINDING
+            | wgpu::TextureUsages::COPY_SRC,
         view_formats: &[],
     };
 
-    let texture = device.create_texture(&desc);
+    let texture = device.create_texture_counted(&desc);
     let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
 
     (texture, view)

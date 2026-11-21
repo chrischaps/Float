@@ -38,15 +38,21 @@ mod math;
 mod music;
 #[cfg(test)]
 mod naming_tests;
+mod nav;
+#[cfg(test)]
+mod nav_tests;
 mod ocean;
 mod opts;
 #[cfg(not(target_arch = "wasm32"))]
 #[doc(hidden)]
 pub mod overhead;
+mod panels;
 mod particle;
 mod persistence;
 mod physics;
 mod post_process;
+#[cfg(test)]
+mod post_process_tests;
 mod quality;
 pub mod registry;
 mod scene;
@@ -55,9 +61,12 @@ mod spline;
 mod sprite;
 mod state;
 mod style;
+mod style_field;
 mod terrain;
+mod test;
 mod time;
 mod touch;
+mod tween;
 mod ui;
 mod view;
 
@@ -79,6 +88,7 @@ pub fn register_all(api: &mut ScriptApi, random: &crate::random::ScriptRandom) {
     audio::register(api);
     animation::register(api);
     physics::register(api);
+    nav::register(api);
     camera::register(api);
     post_process::register(api);
     quality::register(api);
@@ -95,6 +105,8 @@ pub fn register_all(api: &mut ScriptApi, random: &crate::random::ScriptRandom) {
     camera_2d::register(api);
     touch::register(api);
     style::register(api);
+    style_field::register(api);
+    panels::register(api);
     particle::register(api);
     spline::register(api);
     ocean::register(api);
@@ -106,4 +118,6 @@ pub fn register_all(api: &mut ScriptApi, random: &crate::random::ScriptRandom) {
     data::register(api);
     expression::register(api);
     music::register(api);
+    test::register(api);
+    tween::register(api);
 }

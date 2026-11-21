@@ -8,6 +8,23 @@ An extension is a type that implements `flint_player::PlayerExtension`. Every me
 
 The game crate depends on the engine crates by path, usually through a subtree at `engine/` (see [Building a Game Project](building-a-game-project.md)). Any third-party crate that crosses the engine boundary (`egui`, `winit`, `wgpu`, `rhai`, `glam`) must use the **same version as `engine/Cargo.toml`**. Otherwise two copies get linked and an `egui::Context` from one isn't the other's type. `rhai` needs its `sync` feature, as the engine uses it.
 
+The game's workspace root names the engine's two patches as well, on every platform. cargo applies `[patch]` only from the root of the workspace it builds, and a game's build has its own root, not the engine's:
+
+```toml
+[workspace]
+exclude = ["engine"]        # the subtree is a workspace of its own
+                            # (with `members = ["."]` added, cargo can't load the engine's crates)
+
+[dependencies]
+flint-player = { path = "engine/crates/flint-player" }
+
+[patch.crates-io]
+mach-dxcompiler-rs = { path = "engine/vendor/static-dxc" }   # Flint's DXC, linked into Windows builds
+egui-winit = { path = "engine/vendor/egui-winit" }            # the function the web build needs
+```
+
+Without the first line cargo stops before building anything, with ``failed to select a version for the requirement `mach-dxcompiler-rs = "=0.1.947"` ``. flint-render asks for exactly Flint's DXC, which crates.io doesn't have, so a game never links someone else's in its place. `flint check` on the game names any line its root lacks (`missing-cargo-patch`). [Upgrading the Engine](upgrading-the-engine.md#cargo) has the case of a lockfile that already holds crates.io's copy.
+
 ```rust
 use flint_player::{ExtensionCtx, PlayerApp, PlayerExtension};
 use winit::event_loop::{ControlFlow, EventLoop};
@@ -21,8 +38,8 @@ impl PlayerExtension for MyGame {
     fn pre_update(&mut self, ctx: &mut ExtensionCtx) {
         // apply network state to ctx.world before scripts run
     }
-    fn ui(&mut self, ctx: &egui::Context) {
-        egui::Window::new("Inventory").show(ctx, |ui| { ui.label("empty"); });
+    fn ui(&mut self, ui: &mut egui::Ui) {
+        egui::Window::new("Inventory").show(ui, |ui| { ui.label("empty"); });
     }
 }
 
@@ -52,6 +69,26 @@ fn main() -> anyhow::Result<()> {
 }
 ```
 
+On Windows a program's main thread gets the stack its exe asks for, 1 MB unless the linker is told otherwise, where Linux and macOS give 8 MB. `flint` and `flint-player` ask for 8 MB in their build scripts, but a build script reaches only its own package's binaries, and the engine's `.cargo/config.toml` is read only by a cargo run inside the engine's checkout. So a game binary asks for itself, in its crate's `build.rs`:
+
+```rust
+// build.rs: an 8 MB main-thread stack on Windows, as flint-player links
+use std::env;
+
+fn main() {
+    let target = |key: &str| env::var(key).unwrap_or_default();
+    if target("CARGO_CFG_TARGET_OS") == "windows" {
+        match target("CARGO_CFG_TARGET_ENV").as_str() {
+            "msvc" => println!("cargo:rustc-link-arg-bins=/STACK:8388608"),
+            "gnu" => println!("cargo:rustc-link-arg-bins=-Wl,--stack,8388608"),
+            _ => {}
+        }
+    }
+}
+```
+
+A debug build's frames are large: a stock `flint-player` playing a `flint init` scene needed 905 KB of a 1 MB stack, and a game's own code, scripts and scenes add to that.
+
 `PlayerApp` is a winit `ApplicationHandler`, so it runs directly with no wrapper. Set the same launch options `flint-player`'s `main.rs` sets for the features your scenes use, on `player.launch` (`window_size`, `msaa_sample_count`, `style_specs`, ...), and `capture` for `--screenshot`-style runs. What the scene's file says is `player.scene` (`SceneSettings`), which `apply_scene_settings` fills in. Pass the engine's `schemas/` yourself, ahead of the game's. The game itself, with no window, is `player.core` (a `GameCore`, [ADR 0117](https://github.com/chrischaps/Flint/blob/main/docs/adr/0117-player-subsystems-and-one-game-step.md)): the world, its clock, scripts, physics, animation and particles are `player.core.world`, `player.core.clock`, `player.core.script` and so on, and each frame runs the core's one frame order, the one `flint render --scripts` runs too.
 
 ### What the player links
@@ -67,11 +104,11 @@ flint-player = { path = "engine/crates/flint-player", default-features = false, 
 |---|---|---|
 | `audio` | The sound card (kira's cpal backend) | The game runs silent |
 | `gamepad` | Pads and `rumble()` (gilrs) | No pad is seen; keyboard, mouse and touch still work |
-| `debug-hud` | The F3/F4 debug panels (`flint-debug-ui`) | No debug surface |
+| `debug-hud` | The F3/F4 debug panels (`flint-debug-ui`), and with `living` the `debug` script module (the A/B and `commit_living`) | No debug surface: `compare_living` and the rest are "module not enabled" errors |
 | `music` | A `music_session`'s suite and `music_beat()` (`flint-music`) | The suite doesn't play and the beat reads -1 |
 | `rhythm` | A charted suite judged (`flint-rhythm`, the 1 kHz pad capture); turns on `music` | A charted suite plays as music |
 | `procgen` | Assets made from `*.procgen.toml` specs, and `register_generators` (`flint-procgen`) | Every model and texture name is a file's |
-| `living` | Living props, `[living]`, `[wooze]`, shallow wooze, woozy grass and the `wooze`, `living` and `debug` script modules; turns on `procgen` | The grove stands still |
+| `living` | Living props, `[living]`, `[wooze]`, shallow wooze, woozy grass and the `wooze` and `living` script modules (and `debug` with `debug-hud`); turns on `procgen` | The grove stands still |
 | `profile` | Tracy's frame profiler (off by default) | The scopes compile to nothing |
 
 A scene that uses a part the build left out prints one line when it's entered, naming what won't run, for example ``[living] this player is built without the `living` feature: the scene's living props, [wooze] stand still``. With every default off the player links neither `flint-music` nor `flint-procgen`.
@@ -90,7 +127,7 @@ A scene that uses a part the build left out prints one line when it's entered, n
 | `script_command(&ScriptCommand, &mut ExtensionCtx) -> bool` | Each script command, after the scene's subsystems pass on it | Carrying out what the module's functions queued |
 | `on_window_event(&WindowEvent) -> bool` | Every window event that egui didn't take | Game input the scene's input config can't express |
 | `on_key(&KeyInput) -> bool` | Every key egui didn't take, real or from `--input-script` | Keys a capture should be able to press |
-| `ui(&egui::Context)` | Every frame, inside the player's egui pass | The game's own panels and windows |
+| `ui(&mut egui::Ui)` | Every frame, inside the player's egui pass, with the frame's root `Ui` | The game's own panels, windows and areas ([ADR 0121](https://github.com/chrischaps/Flint/blob/main/docs/adr/0121-extension-ui-takes-the-root-ui.md)) |
 | `fonts(&mut egui::FontDefinitions)` | Whenever the player installs egui's fonts | Fonts the project's `fonts/` folder can't give |
 | `debug_panels() -> Vec<String>` | When the player builds its debug panels: each scene load, and at `add_extension` | Naming the game's own [debug panels](debug-panels.md#adding-a-panel-from-a-game) ([ADR 0107](https://github.com/chrischaps/Flint/blob/main/docs/adr/0107-debug-panels-from-the-game.md)) |
 | `debug_panel_ui(name, &mut egui::Ui)` | Every frame one of them is open, after `ui` | Drawing that panel's contents from the game's state |
@@ -158,9 +195,9 @@ impl PlayerExtension for SunPrints {
 }
 ```
 
-`add_extension` registers each one with `flint_render::stylize::register`, and from then on the style is like a built-in: F4's Styles list shows it (tagged `game`), a scene's `[post_process.styles.<name>]` and a `--style <name>:key=value` word switch it on and set it, a style chain orders it, and the player draws it. Add the extension before the event loop starts. The scene's `[post_process]` tables are kept as written and read against the registry when the renderer is made, so a scene loaded before `add_extension` still finds the style; a table naming a style that is never registered is dropped with a warning.
+`add_extension` registers each one in the player's style registry (`app.core.styles`, a `StyleRegistry`), and from then on the style is like a built-in: F4's Styles list shows it (tagged `game`), a scene's `[post_process.styles.<name>]` and a `--style <name>:key=value` word switch it on and set it, a style chain orders it, and the player draws it. Add the extension before the event loop starts. The scene's `[post_process]` tables are kept as written and read against the registry when the renderer is made, so a scene loaded before `add_extension` still finds the style; a table naming a style that is never registered is dropped with a warning.
 
-A name that is taken is refused with an error in the log, and the extension's other styles still register: a built-in's, a user `.shader.toml` style already loaded, or another game style's (as is a per-entity `component` another style takes). A user style can't take a game style's name afterwards, and a hot reload never replaces one. The registry is the process's, so a second `PlayerApp` given the same descriptor changes nothing. A game that doesn't embed `PlayerApp`, or wants a style registered before it reads anything, calls `flint_render::stylize::register(&STYLE)` from `main` itself; it returns the refusal as an `Err`.
+A name that is taken is refused with an error in the log, and the extension's other styles still register: a built-in's, a user `.shader.toml` style already loaded, or another game style's (as is a per-entity `component` another style takes). A user style can't take a game style's name afterwards, and a hot reload never replaces one. Each `PlayerApp` has a registry of its own, so a second one knows only the styles given to it. A game that doesn't embed `PlayerApp` makes a `StyleRegistry`, calls `styles.register(&STYLE)` (it returns the refusal as an `Err`), reads its scenes against it and hands it to its renderer: `SceneBinding::over(scope, &styles)` for `bind_scene`, or `renderer.set_styles(styles.clone())`.
 
 Only the game's binary knows these styles: the stock `flint-player`, `flint render` and the viewer are other programs, and say the style is unknown. A complete game binary with a two-pass style is in the engine: `cargo run -p flint-player --example cyanotype` (`crates/flint-player/examples/cyanotype/`) prints two palms against the sky the way Anna Atkins printed algae, and takes `--style`, `--scene`, `--input-script` and `--screenshot`.
 
@@ -284,7 +321,7 @@ In the other direction, scripts call the native functions the extension register
 
 ### Reading components
 
-Components are TOML tables, so reading one by hand is a chain of `get`, a type test and a default, and each link fails in silence: `as_float` reads the integer `8` as nothing, and a misspelled option falls through to whatever the `match` ends with. Read through a **view** instead ([ADR 0115](https://github.com/chrischaps/Flint/blob/main/docs/adr/0115-scene-diagnostics-and-complete-schemas.md)), as the engine's physics and audio do:
+Components are TOML tables, so reading one by hand is a chain of `get`, a type test and a default, and each link fails in silence: `as_float` reads the integer `8` as nothing, and a misspelled option falls through to whatever the `match` ends with. Read through a **view** instead ([ADR 0115](https://github.com/chrischaps/Flint/blob/main/docs/adr/0115-scene-diagnostics-and-complete-schemas.md)), as the engine's physics, audio, animation, renderer and script system do:
 
 ```rust
 use flint_core::components as comp;
@@ -309,6 +346,7 @@ let hp = ctx.world.view(id, "health").i64("max", 100);
 | `vec3(field, default)` | `[x, y, z]`, or a table with any of `x`, `y`, `z` | `opt_vec3` |
 | `vec4(field, default)` | `[a, b, c, d]` | `opt_vec4` |
 | `color(field, default)` | `[r, g, b]` (alpha 1) or `[r, g, b, a]` | `opt_color` |
+| `tables(field)` | an array of tables; each entry is a view of its own, reported as `field[i].key` | (none: missing is no entries) |
 
 A field that isn't written reads as the default, and so does every field of a component the entity doesn't have (`exists()` says which); neither is reported. A value of the wrong type, or a string that is none of a `choice`'s values, reads as the default too, and is **reported once** for that entity, component and field: a warning in the log with the entity's name, what was expected and, for a choice, the allowed values and the nearest one.
 
@@ -397,12 +435,17 @@ ctx.audio.load_bytes("door", include_bytes!("door.ogg").to_vec())?;
 ctx.audio.play("blip", &SoundOptions::new().volume(0.5).pitch(1.2))?;
 ctx.audio.play("door", &SoundOptions::new().at(pos).distances(2.0, 60.0))?;
 ctx.audio.play("bell", &SoundOptions::new().at(pos).distances(20.0, 600.0).rolloff(0.7))?;
-ctx.audio.set_bus_volume(Bus::Music, 0.4);
+ctx.audio.set_bus_volume(Bus::MUSIC, 0.4);
+// A bus the game declares in flint.toml ([audio.buses.voice]):
+if let Some(voice) = ctx.audio.bus("voice") {
+    ctx.audio.play("line_04", &SoundOptions::new().bus(voice))?;
+    ctx.audio.set_bus_volume(voice, 0.8);
+}
 ```
 
-- **`play`** plays a sound once. Without `at`, it plays flat, from nowhere. With `at`, it pans and fades with distance from the listener: full volume within `distances`' first value and silent past its second (by default 1 and 25, the same as a script's `play_sound_at`). `rolloff` sets the curve between them: the default 2 holds a sound up and drops it near the far distance, and a value below 1 fades it like a sound in the open (see [Audio](../concepts/audio.md#scripting-integration)). `bus` routes it through `Bus::Sfx` (the default) or `Bus::Music`. An unknown name is an error.
+- **`play`** plays a sound once. Without `at`, it plays flat, from nowhere. With `at`, it pans and fades with distance from the listener: full volume within `distances`' first value and silent past its second (by default 1 and 25, the same as a script's `play_sound_at`). `rolloff` sets the curve between them: the default 2 holds a sound up and drops it near the far distance, and a value below 1 fades it like a sound in the open (see [Audio](../concepts/audio.md#scripting-integration)). `bus` routes it through `Bus::SFX` (the default), `Bus::MUSIC` or a bus the game declares, found by name with `ctx.audio.bus("voice")` ([Audio: Mixer Buses](../concepts/audio.md#mixer-buses)). An unknown sound name is an error.
 - **`load_samples`** and **`load_bytes`** replace any sound already cached under the name. A sound that's already playing carries on with the old data. A looping `audio_source` whose sound isn't cached yet stays silent, so load the sound before spawning the entity that plays it.
-- **`set_bus_volume`** scales everything on the bus, including scripts' sounds and `audio_source`s, on top of each sound's own volume. It holds across scene transitions. A game's volume settings belong here rather than in each sound's volume.
+- **`set_bus_volume`** scales everything on the bus, including scripts' sounds and `audio_source`s, on top of each sound's own volume. It holds across scene transitions. A game's volume settings belong here rather than in each sound's volume. `set_buses` declares buses in code, as `flint.toml`'s `[audio.buses]` does, for a mix built at run time.
 
 Loading needs no audio device. Without one, `play` does nothing and returns `Ok`, so a game doesn't need to check `is_available()` first. Like the rest of `ExtensionCtx`, `audio` is only reachable from `pre_update`. A sound triggered in `ui` (a button's click) is queued and played in the next `pre_update`.
 
@@ -431,13 +474,28 @@ An upload without the option, or `remove_mesh`, stops it being a target. The tri
 `ui()` draws into the same egui pass as the script HUD and the debug panels. Back to front, the order is:
 
 1. script UI (`on_draw_ui`)
-2. each extension's `ui()`
+2. each extension's `ui()`, in the order they were added
 3. script UI drawn between `push_over_ui()` and `pop_over_ui()` ([Scripting: Over the UI](../concepts/scripting.md#over-the-ui))
 4. the [debug panels](debug-panels.md)
 
 Egui popups and tooltips draw over the first three.
 
-Use `egui::Window`, `egui::Area`, or side and top panels. Don't use a `CentralPanel`: it covers the whole window and takes every click away from the game.
+`ui()` gets the frame's root `egui::Ui`, the one egui's `Context::run_ui` hands out: the shape of eframe's `App::ui` ([ADR 0121](https://github.com/chrischaps/Flint/blob/main/docs/adr/0121-extension-ui-takes-the-root-ui.md)). It covers the whole window, with no margin or background. Show panels on it (`Panel::show` takes a `Ui`), and windows and areas from it: `Window::show` and `Area::show` take a `&Context`, and a `Ui` derefs to its `Context`, so they take `ui` as it is. `ui.ctx()` is the `Context`, to clone and keep.
+
+```rust
+fn ui(&mut self, ui: &mut egui::Ui) {
+    egui::Panel::left("inventory").default_size(220.0).show(ui, |ui| {
+        ui.heading("Inventory");
+    });
+    egui::Window::new("Quests").show(ui, |ui| ui.label("none yet"));
+}
+```
+
+A panel on the root takes its room from the whole window and sits on the background layer; a window floats on the Middle layer, over the panels and under the debug panels. `crates/flint-player/examples/cave_game` draws both: a survey of its stones in a side panel and a field note in a window.
+
+Before ADR 0121, `ui()` took `&egui::Context`, and `root_ui(&mut egui::Ui)` (#946) was where panels went. `root_ui()` is deprecated and still called: rename it to `ui`. An old `fn ui(&mut self, ctx: &egui::Context)` no longer compiles; change the type to `ctx: &mut egui::Ui` and the body compiles as it was ([Upgrading the Engine](upgrading-the-engine.md#the-game-ui-hook)).
+
+Don't use a `CentralPanel`: it covers the whole window and takes every click away from the game. Coming from egui 0.30: [Upgrading the Engine](upgrading-the-engine.md#egui-030-to-036).
 
 ### Who gets an input event
 
