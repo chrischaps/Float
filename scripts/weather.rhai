@@ -84,6 +84,7 @@ let next_strike = -1.0; // seconds to the next lightning strike (-1 = idle)
 let flash_t = -1.0;     // seconds into the current flash (-1 = none)
 let flash_dur = 0.6;
 let flash_amp = 1.0;    // exposure punch (near strikes hit harder)
+let flash_exposed = false;  // exposure is off 1.0 (it HOLDS until set again)
 let flash_p2 = 0.32;    // flicker pulse centers (fractions of flash_dur)
 let flash_p3 = 0.65;
 let booms_t = [];       // pending thunder: countdowns, volumes, files
@@ -153,7 +154,7 @@ fn bump(u, c, w) {
 }
 
 fn on_update() {
-    let me = this_entity();
+    let me = self_entity();
     let dt = delta_time();
     if dt <= 0.0 { return; }
 
@@ -504,8 +505,9 @@ fn on_update() {
     }
 
     // The flash itself: 2-3 flicker pulses over ~0.6 s. Published for
-    // time_of_day.rhai (sun/cloud whiteout); exposure spike is transient
-    // (the player reverts it the frame we stop calling set_exposure).
+    // time_of_day.rhai (sun/cloud whiteout). The exposure spike is ours,
+    // and post keys HOLD until set again: put it back to 1.0 once when the
+    // flash ends, or the last flicker frame's punch stays on the world.
     let f = 0.0;
     if flash_t >= 0.0 {
         flash_t += dt;
@@ -524,7 +526,11 @@ fn on_update() {
         last_flash = f;
     }
     if f > 0.01 {
-        set_exposure(1.0 + 2.2 * f * flash_amp);
+        set_post("exposure", 1.0 + 2.2 * f * flash_amp);
+        flash_exposed = true;
+    } else if flash_exposed {
+        set_post("exposure", 1.0);
+        flash_exposed = false;
     }
 
     // ── Publish the light/fog factors time_of_day.rhai applies ────────

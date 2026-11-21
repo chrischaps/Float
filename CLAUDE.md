@@ -233,12 +233,15 @@ root). Rain impact rings are IN THE OCEAN SHADER (`ocean.rain_ripple`
 cell neighborhood (rings clipped to one cell tile into visible squares),
 faded out by ~30 m.
 Lightning: strikes scheduled in-storm, flicker flash = published
-`flash` (TOD whites out sun/clouds) + transient `set_exposure`; thunder
+`flash` (TOD whites out sun/clouds) + an exposure spike, `set_post("exposure",
+..)`, put back to 1.0 once when the flash ends (post keys HOLD until set
+again — before 2026-11-21 the last flicker frame's punch stuck, leaving the
+storm frame at 90 mean luma against 54 after its first strike); thunder
 delayed dist/340, distance-graded crack/mid/far, always non-spatial.
 Beds `rain_loop`/`storm_howl` faded by weather; music ducks 80% in
-storms; whale/birds skip when `state > 2.5`. F3 Weather panel
-(engine `weather_panel.rs`) forces states, snaps, fires strikes, tunes
-taus. Fixture: `scenes/snap_storm.scene.toml`. Set `enabled = false`
+storms; whale/birds skip when `state > 2.5`. F3 Weather panel (schema
+lines in `schemas/components/weather.toml` since Flint #744) forces
+states, snaps, fires strikes, tunes taus. Fixture: `scenes/snap_storm.scene.toml`. Set `enabled = false`
 on the weather component to hand-tune the ocean.
 
 Reality tears ✅: rare world events — the world's skin splits and another
@@ -292,8 +295,8 @@ storm-shy `state > 2.5`); an ACTIVE visit always completes on real
 seconds. raft2 is scene-declared parked at (-80,-50,-80) — there's no
 3D-model hide and `spawn_entity` attaches no mesh. Faint spatial
 laps/creaks reuse `lap_*`/`creak_*` inside the 25 m one-shot cap.
-F3 Visitor panel (engine `visitor_panel.rs`, keyed on the
-`raft_visitor` component): phase/day status line + "Visit now" button
+F3 Visitor panel (schema lines in `schemas/components/raft_visitor.toml`,
+Flint #744): phase/day status line + "Visit now" button
 (writes the `trigger_visit` one-shot; the script publishes `phase`/
 `day` back, write-guarded). GOTCHA: schema defaults do NOT materialize
 component fields — every field a script `get_field`s must be listed in
@@ -319,8 +322,8 @@ never force them. Gates: hour affinity 3h±3, weather state < 1.2 AND
 weather enabled (weather is the applier — no weather, no event), day ≥
 min_day 2, title-day skip; mid-event weather rides through (product amp
 stays glassy, swells back on release). Birds + reality tears sit out
-`calm > 0.1`; music ducks 85%. F3 Dead Calm panel (engine
-`dead_calm_panel.rs`, visitor-pattern): status + "Calm now"/"End now"
+`calm > 0.1`; music ducks 85%. F3 Dead Calm panel (schema lines in
+`schemas/components/dead_calm.toml`): status + "Calm now"/"End now"
 one-shots (`trigger_calm`/`end_now`).
 Title card ✅: `title.rhai` (title_controller entity) draws pre-rendered
 sprites (`tools/generate_title.py` → `sprites/title_setdrift.png` +
@@ -456,17 +459,30 @@ Polish backlog: real M6/M8 + weather SFX from
 `specs/elevenlabs_audio_prompts.md`; the palm is still a sharp-edged box
 (reads as a card in close-up); live playtest of the scoot with the
 new passive-arm ride.
-Engine: `engine/` tracks Flint `main` (last pull 2026-11-12, Flint
-`356f44a`; everything Float pioneered is upstream). Engine tests:
-`cargo test --release --workspace --exclude flint-android` (the Android
-crate only compiles for Android; add `--no-fail-fast` or cargo stops at
-the first red binary). Expected red INSIDE this subtree (green in a Flint
-checkout): `examples_cli` / `schema_cli`'s example-scene tests — Flint's
-root `flint.toml` adds the `schemas/examples` layer (furniture, door,
-film...), but project discovery passes through `engine/` to Float, whose
-schemas don't list it. As of 44eee61 `flint-procgen-ai`'s
-`the_loop_sends_validator_reports_back...` is also stale upstream (`cone`
-became a valid crown_shape). Neither touches Float. Plan (historical):
+Engine: `engine/` tracks Flint `main` (last pull 2026-11-21, Flint
+`3772abca`) plus one local fix not yet upstream: `stylize/reality.rs` keys
+each reality style's uniform bind group by its own pass label (all five
+shared one cache key, so the first reality style drawn lent its uniforms
+to the rest — underwater during a drunk tear drew nothing; test
+`render_reality_cli`). Engine tests:
+`cargo test --release --workspace --exclude flint-android --no-fail-fast
+--features flint-player/trace` (the Android crate only compiles for
+Android; without `--no-fail-fast` cargo stops at the first red binary;
+without the `trace` feature flint-player's #1096 `scope_coverage_tests`
+don't compile in release — `profile::with_rings` exists only under
+`debug_assertions` or `trace`). Flint's CI does NOT run the workspace
+suite (only checks and targeted test binaries), so "CI green" upstream
+doesn't clear it. Expected red INSIDE this subtree at 3772abca (17 of
+4847; none touches code Float runs): the examples layer (`fixture_scenes_cli`
+`ascii_edges`' `furniture`, `schema_cli` × 2 — Flint's root `flint.toml`
+adds `schemas/examples`, but discovery passes through `engine/` to Float);
+subtree provenance (`provenance` "engine/" subdir, `render_frame_capture_cli`
+names Float's commit); Windows socket 10049 (`frame_grab_tests`); and stale
+upstream tests (`diagnostic` code count 55/54, `extension_tests` diagnostics
+gained line numbers, `scene_tables` × 2 the new `field` table missing from
+the book, `table_schemas` post range, `project_done_when_cli` × 2 incl. a
+placeholder `Mono.ttf` egui rejects, `check_cli` × 2, `init_cli`, `json_cli`
+`play --json`). Plan (historical):
 `C:\Users\chris\.claude\plans\please-make-a-plan-fluffy-pearl.md`
 
 ## Showcase capture (tools/showcase/)
@@ -495,12 +511,17 @@ F3 toggles the panels (grouped into ≤3 scrollable columns, size-balanced
 via `flint_debug_ui::assign_columns`; each panel is a fold-open
 CollapsingHeader — panel `name()` strings are load-bearing dispatch keys,
 don't rename casually): **Ocean Debug** (waves, colors, foam, water
-clarity/turbidity, grid), **Day / Time** (Day N · HH:MM · phase status,
-0-24h scrub slider + preset hour buttons, natural advance toggle, day
-counter display/set — a one-shot override since `time_of_day.rhai` owns
-the counter — day length with effective ramped length readout, sun path
-tilt), and **Camera** (vertical FOV slider — FOV lives in the seat_camera
-entity's `camera_tuning` component, not in `seat_camera.rhai`). Edits
+clarity/turbidity, grid; its Wave probe switch now draws the CPU/GPU parity
+cross itself, Flint #749 — `ocean.show_probe` is gone, so
+`scripts/wave_probe.rhai` + the buoy entity are dead weight kept for now),
+**Camera** (vertical FOV slider — FOV lives in the seat_camera entity's
+`camera_tuning` component, not in `seat_camera.rhai`), and since Flint #744
+one panel per Float component whose schema has `panel = ...` field lines
+(`schemas/components/{time_of_day,weather,reality,raft_visitor,dead_calm}.toml`:
+`status` rows, `tune` fields with Reset/Commit, `trigger` one-shot buttons
+the script clears; `flint schema <name>` prints a component's panel line, a
+mistake is a `bad-panel` load warning). The old hand-built Day / Time
+panel's preset-hour buttons and effective-length readout went with it. Edits
 apply live through the world's components; "Commit to File" writes them
 back into the scene TOML (day/`last_hours` are never committed — day 0 is
 the title day). Escape releases the mouse (for panel use); click

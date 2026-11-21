@@ -66,7 +66,7 @@ fn affinity(hours, center, width) {
 }
 
 fn on_update() {
-    let me = this_entity();
+    let me = self_entity();
     let dt = delta_time();
     if dt <= 0.0 { return; }
 
