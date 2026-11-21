@@ -241,32 +241,38 @@ storms; whale/birds skip when `state > 2.5`. F3 Weather panel
 taus. Fixture: `scenes/snap_storm.scene.toml`. Set `enabled = false`
 on the weather component to hand-tune the ocean.
 
-Reality tears ✅: rare render-mode world events — the world's skin splits
-and another view bleeds through. Modes: 1 Matrix code (composite branch:
-procedural dot-matrix glyphs per 8x12 px cell, brightness AND density from
-scene luminance so foam reads as bright code, per-column rain heads),
-2 blood ocean (ocean-shader palette remap through locals at the top of
-fs_main — deep/shallow/SSS/foam AND the sky-reflection snapshot — scaled by
-the TOD palette's own luminance so night blood stays dark; viscosity =
-bands→2 + wobble; world-fbm pools spread with mix), 3 drunk (pre-sample UV
-sway warps the whole composite chain + ghost double-tap; script adds FOV
-breathing, radial blur, chromatic aberration, and an audio muffle via the
-published `lowpass_scale` factor water_ambience applies), 4 Tron (depth
-Sobel + luminance edges in cyan over a dimmed scene + world-space grid from
-depth reconstruction that rides the swells). Shared rails: `render_mode`/
-`mode_mix`/`mode_time`/`mode_params` in PostProcessConfig+Uniforms (208 B,
-size-tested) branch AFTER ACES/before vignette; fbm bleed-mask (threshold
-swept across the fbm span so patch coverage tracks mix, pinned full at 1);
-ocean uniforms mirror mode/mix from postprocess_config (832 B test).
-`set_render_mode(mode, mix)` + `set_render_mode_params` are TRANSIENT
-(unlike every other pp override, which is sticky): the player zeroes the
-mode the frame calls stop — dead script = healed world. `reality.rhai`
+Reality tears ✅: rare world events — the world's skin splits and another
+view bleeds through. Since Flint #746 each reality is an engine display
+style (`flint render --list-styles`): 1 `matrix` (dot-matrix glyphs whose
+brightness AND density track the picture's luminance, so foam reads as
+bright code, per-column rain heads), 2 `blood` (a crimson key) plus the
+ocean's own `tint` (the sea's palette moves to the crimson tide, scaled by
+the TOD palette's luminance so night blood stays dark; two wobbling bands;
+world-fbm pools spread with the mix), 3 `drunk` (sway + ghost double-tap,
+its `blend` is how drunk; the script adds FOV breathing, radial blur,
+chromatic aberration, and an audio muffle via the published
+`lowpass_scale` factor water_ambience applies), 4 `tron` (cyan edges over a
+dimmed scene + a world grid that rides the swells). Matrix, blood and Tron
+show only inside the frame's tear: `[post_process] tear` (0..1, fbm patches
+or `tear_iris`), `tear_scale` (= the reality `mask_scale`), which
+`reality.rhai`'s on_init follows with `blend_source = "tear"` on the three.
+Styles and the tear HOLD until set again (the old render modes were
+TRANSIENT — a dead script no longer heals the world): the script switches
+the styles once each time the shown reality changes (`shown` write guard;
+`set_post_style` fires `post_style_changed` every call), sets the tear and
+drunk's blend every shown frame, and switches all off on heal and while a
+dunk hides the tear. The blood sea's `tint` is written by
+`seat_camera.rhai`, the tint's ONE owner (see Underwater moments): it reads
+reality's published `active_mode`/`mix`. `reality.rhai`
 (reality_controller entity) schedules tears whale-style on real seconds
 with per-mode hour affinities (Matrix 23h±3, blood dusk 19h±1.5, Tron
 22h±3, drunk hour-blind), storm-shy, helpers kept PURE (scope gotcha).
 F3 Reality panel: trigger/end buttons, pin-mix slider, weights/intervals.
-Headless: `flint render ... --render-mode N --mode-mix X`. Sticky FX the
-drunk mode borrows (fov/blur/CA) are zeroed on heal.
+Headless: `flint render <scene> --script-time 3` on a scene copy with
+`trigger_mode = N` and `mix_override = 0.6` in the reality block (the
+panel's one-shots), or by flags alone, e.g. `--style
+matrix:blend_source=tear,rate=6 --set post.tear=0.6`. Sticky FX the drunk
+mode borrows (fov/blur/CA) are zeroed on heal.
 
 The Visitor ✅: around noon of in-game day 1 (the first counted day
 after the title's looping day 0) a weathered twin raft
@@ -360,41 +366,49 @@ fallback for ramp-less scenes).
 
 Underwater moments ✅: when a swell buries the eye (the raft's smoothed
 heave can't chase a steep face) the frame goes truly underwater instead
-of no-clip — **render mode 5** on the reality-tear rails, but NOT a tear:
-no tear_mask; the composite masks per pixel by a WATERLINE tested against
-the plane `camera_y + mode_params.x` (near-plane world reconstruction),
-with a wobbled hard white foam lip on the line, 3-step banded murk
-absorption (cel, not exponential), two-step light shafts, Snell-window
-brightening, biolum specks when `foam_glow` is up, and a mode-5 UV sway
-(hook A) that only engages once genuinely submerged so a straddle frame's
-air half stays steady. Param contract: x = signed eye depth m
-(+ = under), y = sea energy 0..1, z = daylight (from live
-`sun.light.intensity`), w = biolum. Ocean shader: `front_facing` now
-feeds an ALWAYS-ON underside fix (flip N for ndv/fresnel, kill sky
-reflection + specular on back faces — the old opaque sky-mirror was the
-no-clip look; script-less renders benefit too) plus a mode-5 back-face
-palette remap (murk blues, luminous white foam panes, 2 bands).
+of no-clip — the engine's **`underwater` style** (it was render mode 5),
+NOT a tear: it masks per pixel by a WATERLINE tested against the plane
+`depth` m above the eye (near-plane world reconstruction), with a wobbled
+hard white foam lip on the line, 3-step banded murk absorption (cel, not
+exponential), two-step light shafts, Snell-window brightening, biolum
+specks when `glow` is up, and a UV sway that only engages once genuinely
+submerged so a straddle frame's air half stays steady. Params:
+`blend` = the dunk's mix, `depth` = signed eye depth m (+ = under),
+`churn` = sea energy 0..1, `daylight` (from live `sun.light.intensity`),
+`glow` = biolum. Ocean shader: `front_facing` feeds an ALWAYS-ON
+underside fix (flip N for ndv/fresnel, kill sky reflection + specular on
+back faces — the old opaque sky-mirror was the no-clip look; script-less
+renders benefit too), and the ceiling seen from below is the ocean's tint
+with `tint_preset = "underside"` (murk blues, luminous white foam panes,
+2 bands, back faces only). seat_camera.rhai OWNS the ocean's
+`tint_preset`/`tint` (write-guarded): the underside at the dunk's mix while
+the eye is under, else reality's blood tear (`tint_preset = "blood"` at
+its published mix), else 0 — one writer, so the two looks can't race.
 DETECTION LIVES IN seat_camera.rhai — the only place the eye position
 exists this frame (published fields are a frame stale = too late for the
 attack frame): `d = ocean_height(eye) - eye_y`, hysteresis −0.15/−0.25 m
 (the near plane sees the line before the eye is wet; chop moves the LINE,
-never the gate), ~1-frame attack / `submerge_release_s` release, calls
-`set_render_mode(5, mix)` ONLY while active (transient — dead script =
-healed), publishes `seat.submerged` 0..1. reality.rhai yields: skips its
-set_render_mode calls AND scheduling while `submerged > 0.01` (envelope
-keeps ticking; sticky drunk FX ride through). water_ambience.rhai owns
+never the gate), ~1-frame attack / `submerge_release_s` release, switches
+the `underwater` style on once as the mix rises and off once it dies (it
+HOLDS between: a dead script leaves it as it was), publishes
+`seat.submerged` 0..1. reality.rhai yields: hides its tear AND skips
+scheduling while `submerged > 0.01` (envelope keeps ticking; sticky drunk
+FX ride through). water_ambience.rhai owns
 the audio: lowpass = `min(proximity·lp_scale, 400 Hz muffle)` (min, not
 multiply — a drunk tear and a dunk must not stack sub-audible), wind/fizz
 duck 80% / washes 50% at their write sites (ocean bed stays — bodily
 rumble), `dunk_in_*`/`dunk_out_*` one-shots on 0.65↑/0.35↓ crossings with
 a shared 0.8 s refractory + drip tail (thresholds independent of the
 visual hysteresis). Debug: `seat.force_submerge_s` one-shot fakes 0.4 m
-for N seconds; headless `--render-mode 5 --mode-mix 1 --mode-params
-0.7,0.5,1,0` + `scenes/snap_underwater.scene.toml` (render runs no
-scripts — the CLI flags ARE the fixture; camera targets under the
-surface are hit-or-miss vs the t=0 wave phase, check the no-mode render
-first). New fields must be LISTED in the scene seat block (schema
-defaults don't materialize).
+for N seconds (`flint render --script-time 3` on a scene copy with it
+set draws a real dunk); headless by flags, `--style
+underwater:blend=1,depth=0.7,churn=0.5,daylight=1,glow=0` on
+`scenes/snap_underwater.scene.toml`, whose ocean block carries
+`tint_preset = "underside"` and `tint = 1.0` (no scripts run there — the
+flags and the block ARE the fixture; camera targets under the surface are
+hit-or-miss vs the t=0 wave phase, check the plain render first). New
+fields must be LISTED in the scene seat block (schema defaults don't
+materialize).
 
 Raft detail pass ✅ (#5): `tools/generate_raft.py` builds logs as
 hand-gridded meshes (taper, bow, ovality, flank knots, chamfered

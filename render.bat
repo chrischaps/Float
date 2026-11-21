@@ -23,8 +23,8 @@ echo Rendering seated view (approximate player eye, looking down at raft edge)..
 echo Rendering raft overview...
 %FLINT% render %SCENE% %SCHEMAS% %QUICK% --output snapshots\overview.png --distance 8 --pitch 25 --yaw 35 --target 0,0.3,0
 
-echo Rendering underwater moment (render mode 5, fixture scene)...
-%FLINT% render scenes\snap_underwater.scene.toml %SCHEMAS% %QUICK% --output snapshots\underwater.png --distance 3 --pitch=-35 --yaw 35 --target 0,0.5,0 --render-mode 5 --mode-mix 1.0 --mode-params 1.2,0.5,1,0
+echo Rendering underwater moment (the underwater style, fixture scene)...
+%FLINT% render scenes\snap_underwater.scene.toml %SCHEMAS% %QUICK% --output snapshots\underwater.png --distance 3 --pitch=-35 --yaw 35 --target 0,0.5,0 --style underwater:blend=1,depth=1.2,churn=0.5,daylight=1,glow=0
 
 echo Rendering body from the eye (bind pose: hands on thighs) -- day, dusk, night...
 set EYE=--distance 0.55 --pitch 55 --yaw 180 --target 0,0.36,1.25
@@ -72,24 +72,26 @@ echo [press]  dead calm (baked fixture)...
 echo [press]  the visitor (baked fixture)...
 %FLINT% render scenes\snap_visitor.scene.toml %SCHEMAS% %PRESS% --output snapshots\press\visitor.png --distance 16 --pitch 10 --yaw 240 --target 7,0.4,4.5
 
-echo [press]  underwater (render mode 5)...
-%FLINT% render scenes\snap_underwater.scene.toml %SCHEMAS% %PRESS% --output snapshots\press\underwater.png --distance 3 --pitch=-35 --yaw 35 --target 0,0.5,0 --render-mode 5 --mode-mix 1.0 --mode-params 1.2,0.5,1,0
+echo [press]  underwater (the underwater style)...
+%FLINT% render scenes\snap_underwater.scene.toml %SCHEMAS% %PRESS% --output snapshots\press\underwater.png --distance 3 --pitch=-35 --yaw 35 --target 0,0.5,0 --style underwater:blend=1,depth=1.2,churn=0.5,daylight=1,glow=0
 
 REM Reality tears. Matrix and Tron read best in DAYLIGHT even though they
 REM schedule at night: glyph density and edge contrast both follow scene
-REM luminance, so a night scene renders them nearly black.
+REM luminance, so a night scene renders them nearly black. Each is an
+REM engine style (Flint #746); matrix, blood and tron show through the
+REM tear (post.tear, 1 = the whole frame), as reality.rhai sets them.
 
 echo [press]  reality tear 1 — matrix...
-%FLINT% render %SCENE% %SCHEMAS% %PRESS% --output snapshots\press\tear_matrix.png --distance 9 --pitch 18 --yaw 35 --target 0,0.4,0 --render-mode 1 --mode-mix 1.0 --mode-params 3,0,6,0
+%FLINT% render %SCENE% %SCHEMAS% %PRESS% --output snapshots\press\tear_matrix.png --distance 9 --pitch 18 --yaw 35 --target 0,0.4,0 --style matrix:blend_source=tear,rate=6 --set post.tear=1 --set post.tear_scale=3
 
 echo [press]  reality tear 2 — blood ocean...
-%FLINT% render scenes\snap_dusk.scene.toml %SCHEMAS% %PRESS% --output snapshots\press\tear_blood.png --distance 9 --pitch 12 --yaw 200 --target 0,0.4,0 --render-mode 2 --mode-mix 1.0 --mode-params 3,0,6,0
+%FLINT% render scenes\snap_blood.scene.toml %SCHEMAS% %PRESS% --output snapshots\press\tear_blood.png --distance 9 --pitch 12 --yaw 200 --target 0,0.4,0 --style blood:blend_source=tear --set post.tear=1 --set post.tear_scale=3
 
 echo [press]  reality tear 3 — drunk...
-%FLINT% render %SCENE% %SCHEMAS% %PRESS% --output snapshots\press\tear_drunk.png --distance 8 --pitch 16 --yaw 35 --target 0,0.4,0 --render-mode 3 --mode-mix 1.0 --mode-params 3,0,6,0
+%FLINT% render %SCENE% %SCHEMAS% %PRESS% --output snapshots\press\tear_drunk.png --distance 8 --pitch 16 --yaw 35 --target 0,0.4,0 --style drunk:blend=1
 
 echo [press]  reality tear 4 — tron...
-%FLINT% render %SCENE% %SCHEMAS% %PRESS% --output snapshots\press\tear_tron.png --distance 9 --pitch 18 --yaw 35 --target 0,0.4,0 --render-mode 4 --mode-mix 1.0 --mode-params 3,0,6,0
+%FLINT% render %SCENE% %SCHEMAS% %PRESS% --output snapshots\press\tear_tron.png --distance 9 --pitch 18 --yaw 35 --target 0,0.4,0 --style tron:blend_source=tear --set post.tear=1 --set post.tear_scale=3
 
 goto :done
 

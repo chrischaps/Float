@@ -48,8 +48,11 @@ let step_t = 0.0;       // seconds into the current step
 let step_seq = 0.0;     // increments on every step START (chained or not)
 let pause_left = 0.0;   // rest before a step that follows a released key
 let uw_active = false;  // underwater hysteresis gate (see block below)
-let uw_mix = 0.0;       // eased mode-5 mix: ~1-frame attack, short release
+let uw_mix = 0.0;       // eased underwater mix: ~1-frame attack, short release
 let last_sub = -1.0;    // write guard for the published submerged factor
+let uw_on = false;      // the `underwater` style is on (write guard)
+let sent_preset = "";   // last ocean tint_preset / tint written (we OWN them)
+let sent_tint = -1.0;
 
 const STICK_SPEED = 2.4;   // rad/s at full deflection
 const PITCH_MIN = -1.3;    // ~-75 deg (down at your legs)
@@ -361,13 +364,15 @@ fn on_update() {
     set_camera_position(eye_x, eye_y, eye_z);
     set_camera_target(eye_x + dir_x, eye_y + dir_y, eye_z + dir_z);
 
-    // ── Underwater moments: a swell buries the eye (render mode 5) ──
+    // ── Underwater moments: a swell buries the eye (the `underwater` style) ──
     // Detection lives HERE, not in its own script: this is the only place
     // the eye position exists THIS frame (set_field publishes are a frame
     // stale — fine for the audio muffle, too late for the attack frame).
-    // set_render_mode is transient: called only while active; the player
-    // heals the frame the calls stop. reality.rhai yields the slot by
-    // watching the published `submerged` factor.
+    // The style HOLDS until set again (the old render mode 5 was
+    // transient), so it is switched on once as the mix rises, its params
+    // follow every frame, and it is switched off once the mix dies.
+    // reality.rhai hides its tear by watching the published `submerged`
+    // factor.
     let d = ocean_height(eye_x, eye_z) - eye_y;   // + = eye under water
     let force = get_field(me, "seat", "force_submerge_s");
     if force != () && force > 0.0 {
@@ -411,8 +416,49 @@ fn on_update() {
             let si = get_field(sun, "light", "intensity");
             if si != () { daylight = clamp(si / 2.0, 0.0, 1.0); }
         }
-        set_render_mode(5, uw_mix);
-        set_render_mode_params(d, energy, daylight, glow);
+        if !uw_on {
+            set_post_style("underwater", true);
+            uw_on = true;
+        }
+        set_post_style_param("underwater", "blend", uw_mix);
+        set_post_style_param("underwater", "depth", d);
+        set_post_style_param("underwater", "churn", energy);
+        set_post_style_param("underwater", "daylight", daylight);
+        set_post_style_param("underwater", "glow", glow);
+    } else if uw_on {
+        set_post_style("underwater", false);
+        uw_on = false;
+    }
+
+    // ── The sea's tint: this script OWNS the ocean's tint fields ────────
+    // The surface seen from below while the eye is under (the same
+    // zero-latency mix as the style), else reality.rhai's blood tear from
+    // its published mode and mix (a frame stale; a tear eases over
+    // seconds), else off. One writer, so the two looks can't race for the
+    // fields; `tint_preset` names the engine's colours for each.
+    let tint_name = "blood";
+    let tint_amt = 0.0;
+    if uw_on {
+        tint_name = "underside";
+        tint_amt = uw_mix;
+    } else {
+        let rce = get_entity("reality_controller");
+        if rce >= 0 {
+            let am = get_field(rce, "reality", "active_mode");
+            let rm = get_field(rce, "reality", "mix");
+            if am != () && rm != () && am > 1.5 && am < 2.5 { tint_amt = rm; }
+        }
+    }
+    let sea = get_entity("ocean");
+    if sea >= 0 {
+        if tint_name != sent_preset {
+            set_field(sea, "ocean", "tint_preset", tint_name);
+            sent_preset = tint_name;
+        }
+        if abs(tint_amt - sent_tint) > 0.002 || (tint_amt <= 0.0 && sent_tint > 0.0) {
+            set_field(sea, "ocean", "tint", tint_amt);
+            sent_tint = tint_amt;
+        }
     }
     // Published factor for water_ambience (muffle/duck) and reality
     // (slot yield). One-frame stale is fine for both readers.
