@@ -44,6 +44,9 @@
 //!                   the last 10 s, each phase's CPU time, each pass's GPU
 //!                   time where the adapter has timestamp-query (`cpu`
 //!                   leaves GPU timing off), and a line to copy
+//!   scissor=0       per-entity styles draw their whole frame instead of
+//!                   only their entities' (`FLINT_STYLE_SCISSOR=0`), to
+//!                   measure what the scissor saves (#385, #538)
 //!   fps=30|60|auto|native  which refreshes are drawn (#140). A rate is
 //!                   drawn as a whole number of refreshes (30 is every
 //!                   other at 60 Hz, every fourth at 120); `auto` draws
@@ -121,6 +124,42 @@ mod web {
         quality: String,
         /// `style=name[:key=value,...]`, repeatable (#328).
         styles: Vec<String>,
+        /// `gpu_labels=1|groups|0`: name the frame for a GPU debugger, as
+        /// `FLINT_GPU_LABELS` does natively (#1083); none by default, so a
+        /// frame makes no WebGPU call more.
+        gpu_labels: Option<flint_render::gpu_labels::GpuLabels>,
+        /// `scissor=0`: per-entity styles draw their whole frame, as
+        /// `FLINT_STYLE_SCISSOR=0` does natively, to measure what the
+        /// scissor saves in a browser (#538).
+        scissor: Option<bool>,
+        /// `skip_pass=<label>[,..]` and `repeat_pass=<label>:<N>[,..]`,
+        /// each repeatable: cost a part of the frame on a GPU whose
+        /// timestamps read 0 by taking it away or drawing it N times
+        /// (#1317, `flint_render::pass_knobs`). A word that doesn't read is
+        /// a console warning.
+        pass_knobs: Option<flint_render::PassKnobs>,
+    }
+
+    /// The pass knobs the query's `skip_pass` and `repeat_pass` ask for.
+    fn pass_knobs(params: Option<&web_sys::UrlSearchParams>) -> Option<flint_render::PassKnobs> {
+        let params = params?;
+        let all = |key: &str| -> Vec<String> {
+            params
+                .get_all(key)
+                .iter()
+                .filter_map(|v| v.as_string())
+                .collect()
+        };
+        let mut knobs = flint_render::PassKnobs::new();
+        for list in all("skip_pass") {
+            knobs.skip_list(&list);
+        }
+        for list in all("repeat_pass") {
+            if let Err(e) = knobs.repeat_list(&list) {
+                web_sys::console::warn_1(&format!("[flint-web] {e}").into());
+            }
+        }
+        (!knobs.is_empty()).then_some(knobs)
     }
 
     impl WebArgs {
@@ -179,6 +218,11 @@ mod web {
                             .collect()
                     })
                     .unwrap_or_default(),
+                gpu_labels: flint_render::gpu_labels::GpuLabels::parse(
+                    get("gpu_labels").as_deref(),
+                ),
+                scissor: get("scissor").map(|v| v != "0"),
+                pass_knobs: pass_knobs(params.as_ref()),
             }
         }
     }
@@ -223,6 +267,19 @@ mod web {
 
     async fn start() -> Result<(), String> {
         let args = WebArgs::from_query();
+        // `?perf=1`: the start-up's load report (#1092), from the page's
+        // first line here to the first frame, printed to the console. The
+        // fetches and the device's promise are waits no stage names.
+        if args.perf.is_some() {
+            flint_core::load_report::begin(flint_core::load_report::LoadKind::Start, "");
+        }
+        // Before the renderer reads it
+        if let Some(level) = args.gpu_labels {
+            flint_render::gpu_labels::set_level(level);
+        }
+        if let Some(on) = args.scissor {
+            flint_render::stylize::set_scissor_enabled(on);
+        }
         if let Some((w, h)) = args.size {
             fix_canvas_size(w, h);
         }
@@ -268,23 +325,24 @@ mod web {
             loaded.scene_file.scene.input_config.clone(),
         );
         app.launch.msaa_sample_count = args.msaa;
+        app.launch.pass_knobs = args.pass_knobs;
         app.launch.render_scale = args.render_scale;
         app.launch.quality_overrides = args.quality;
         // A bad word is a warning in the console, not a page that won't
         // start: the scene's user styles register later, at init (#274)
         app.launch.style_specs = args.styles;
         app.input.touch_controls_mut().set_mode(args.touch);
-        app.core.clock.frame_step = args.frame_step;
-        if let Some(seed) = args
-            .seed
-            .or(args.frame_step.map(|_| flint_player::SCRIPT_SEED))
-        {
-            app.core.script.seed_random(seed);
-        }
+        // The desktop's --frame-step and --seed rule (#705)
+        app.step_frames(args.frame_step, args.seed);
         app.launch.hold_at = args.hold_at;
         app.set_frame_rate(args.fps);
         if let Some(gpu) = args.perf {
             app.enable_perf(gpu);
+            // The scope recorder's look-back, which the readout's Save
+            // trace downloads (#1097), in a build that has the recorder
+            if flint_core::profile::COMPILED_IN {
+                app.trace_scopes(flint_player::TraceSetup::default());
+            }
         }
         app.audio.set_old_mix(args.old_mix);
         app.apply_scene_settings(&loaded.scene_file);

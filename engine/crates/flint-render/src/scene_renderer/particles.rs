@@ -18,7 +18,7 @@ pub const SOFT_DISC_TEXTURE: &str = "__particle_soft_disc";
 impl SceneRenderer {
     /// Upload every packed emitter of a [`ParticleSync`]. Call after
     /// `ParticleSystem::pack`.
-    pub fn update_particles_from(
+    pub(crate) fn update_particles_from(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
@@ -38,15 +38,20 @@ impl SceneRenderer {
     }
 
     /// Low-level upload: concatenate all emitters' instances into the shared
-    /// storage buffer (one `write_buffer`) and build sorted draw calls.
+    /// storage buffer (one `write_buffer`) and build sorted draw calls. For
+    /// a host with particle draws of its own, after `prepare` (which uploads
+    /// `FrameInputs::particles` and clears the last frame's otherwise), so
+    /// they last one frame like every other input.
     pub fn update_particles(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         draws: &[ParticleDrawData<'_>],
     ) {
+        flint_core::scope!("particles::upload", draws.len());
         self.particle_draws.clear();
-        if self.particle_pipeline.is_none() {
+        self.draws.set_particles(std::iter::empty());
+        if self.pipelines.particle.is_none() || self.particle_buffers.is_none() {
             return;
         }
         self.ensure_soft_disc_texture(device, queue);
@@ -77,11 +82,14 @@ impl SceneRenderer {
             });
         }
 
-        if let Some(pp) = &mut self.particle_pipeline {
-            pp.ensure_capacity(device, scratch.len() as u32);
-            pp.write_instances(queue, &scratch);
+        if let (Some(pipeline), Some(buffers)) =
+            (&self.pipelines.particle, &mut self.particle_buffers)
+        {
+            buffers.ensure_capacity(device, pipeline, scratch.len() as u32);
+            buffers.write_instances(queue, &scratch);
         }
         sort_particle_draws(&mut calls);
+        self.draws.set_particles(calls.iter());
         self.particle_draws = calls;
         self.particle_upload_scratch = scratch;
     }
@@ -107,7 +115,8 @@ impl SceneRenderer {
             return bg.clone();
         }
         let pp = self
-            .particle_pipeline
+            .pipelines
+            .particle
             .as_ref()
             .expect("particle pipeline present");
         let tc = self
@@ -174,7 +183,7 @@ impl SceneRenderer {
         let tex_cache = self.texture_cache.as_ref().expect("texture cache");
         let draw: DrawCall = Self::create_draw_call(
             device,
-            &self.pipeline,
+            &self.layouts,
             mesh,
             true,
             TransformUniforms::new(),
@@ -188,20 +197,6 @@ impl SceneRenderer {
         self.debug_overlay_draws.clear();
     }
 
-    /// Depth-tested world lines for the frames that follow, until replaced
-    /// (ADR 0083). They're projected with each frame's own camera and drawn
-    /// over the finished image, hidden behind nearer geometry. Widths are in
-    /// logical points; `px_per_point` converts them to the target's pixels.
-    /// Pass an empty `Vec` to clear them.
-    pub fn set_world_lines(
-        &mut self,
-        lines: Vec<flint_core::world_line::WorldLine>,
-        px_per_point: f32,
-    ) {
-        self.world_lines = lines;
-        self.world_line_px_per_point = px_per_point;
-    }
-
     /// Whether, once `render` returns, the context's depth view holds the
     /// frame's scene depth, single sample, for overlays drawn against it
     /// such as world text (ADR 0104). It doesn't with MSAA and no HDR
@@ -209,7 +204,7 @@ impl SceneRenderer {
     pub fn frame_depth_ready(&self) -> bool {
         let has_postprocess =
             self.postprocess_pipeline.is_some() && self.postprocess_resources.is_some();
-        !self.device_lost && (has_postprocess || self.sample_count == 1)
+        !self.device_lost && (has_postprocess || self.pipelines.samples() == 1)
     }
 
     /// Background colour of the main pass (linear RGBA). Editors use this
@@ -259,7 +254,7 @@ fn load_textures_found(
         match find(&tex_name) {
             Ok(path) => match renderer.load_texture_file(device, queue, &tex_name, &path) {
                 Ok(true) => {
-                    eprintln!("Loaded particle texture: {tex_name}");
+                    tracing::debug!(target: "load", kind = "texture", "Loaded particle texture: {tex_name}");
                     any_new = true;
                 }
                 Ok(false) => {} // already cached
