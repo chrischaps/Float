@@ -176,13 +176,35 @@ impl StylePass for RealityPass {
                     ],
                 })
         });
+        // Each reality style is its own pass with its own uniform buffer, but
+        // they share this file: a group kept under one name for all five was
+        // the first-drawn style's buffer for every other (an underwater
+        // moment after a drunk tear drew with drunk's numbers, and nothing).
+        // Keyed by the pass's own label, over the buffer it binds.
+        let uniform = frame.bind_over(
+            self.label,
+            0,
+            &[crate::bind_cache::Bound::Buffer(&self.uniforms)],
+            || {
+                frame
+                    .device
+                    .create_bind_group_counted(&wgpu::BindGroupDescriptor {
+                        label: Some(self.label),
+                        layout: &self.uniform_bgl,
+                        entries: &[wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: self.uniforms.as_entire_binding(),
+                        }],
+                    })
+            },
+        );
         kit::fullscreen_pass(
             encoder,
             self.label,
             output,
             &self.pipeline,
             &[
-                &frame.uniform("Reality Uniform BG", &self.uniform_bgl, &self.uniforms),
+                &uniform,
                 &frame.sampled_input("Reality Input BG", &self.input_bgl, input),
                 &depth,
             ],
