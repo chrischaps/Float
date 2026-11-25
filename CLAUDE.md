@@ -233,40 +233,49 @@ root). Rain impact rings are IN THE OCEAN SHADER (`ocean.rain_ripple`
 cell neighborhood (rings clipped to one cell tile into visible squares),
 faded out by ~30 m.
 Lightning: strikes scheduled in-storm, flicker flash = published
-`flash` (TOD whites out sun/clouds) + transient `set_exposure`; thunder
+`flash` (TOD whites out sun/clouds) + an exposure spike, `set_post("exposure",
+..)`, put back to 1.0 once when the flash ends (post keys HOLD until set
+again — before 2026-11-21 the last flicker frame's punch stuck, leaving the
+storm frame at 90 mean luma against 54 after its first strike); thunder
 delayed dist/340, distance-graded crack/mid/far, always non-spatial.
 Beds `rain_loop`/`storm_howl` faded by weather; music ducks 80% in
-storms; whale/birds skip when `state > 2.5`. F3 Weather panel
-(engine `weather_panel.rs`) forces states, snaps, fires strikes, tunes
-taus. Fixture: `scenes/snap_storm.scene.toml`. Set `enabled = false`
+storms; whale/birds skip when `state > 2.5`. F3 Weather panel (schema
+lines in `schemas/components/weather.toml` since Flint #744) forces
+states, snaps, fires strikes, tunes taus. Fixture: `scenes/snap_storm.scene.toml`. Set `enabled = false`
 on the weather component to hand-tune the ocean.
 
-Reality tears ✅: rare render-mode world events — the world's skin splits
-and another view bleeds through. Modes: 1 Matrix code (composite branch:
-procedural dot-matrix glyphs per 8x12 px cell, brightness AND density from
-scene luminance so foam reads as bright code, per-column rain heads),
-2 blood ocean (ocean-shader palette remap through locals at the top of
-fs_main — deep/shallow/SSS/foam AND the sky-reflection snapshot — scaled by
-the TOD palette's own luminance so night blood stays dark; viscosity =
-bands→2 + wobble; world-fbm pools spread with mix), 3 drunk (pre-sample UV
-sway warps the whole composite chain + ghost double-tap; script adds FOV
-breathing, radial blur, chromatic aberration, and an audio muffle via the
-published `lowpass_scale` factor water_ambience applies), 4 Tron (depth
-Sobel + luminance edges in cyan over a dimmed scene + world-space grid from
-depth reconstruction that rides the swells). Shared rails: `render_mode`/
-`mode_mix`/`mode_time`/`mode_params` in PostProcessConfig+Uniforms (208 B,
-size-tested) branch AFTER ACES/before vignette; fbm bleed-mask (threshold
-swept across the fbm span so patch coverage tracks mix, pinned full at 1);
-ocean uniforms mirror mode/mix from postprocess_config (832 B test).
-`set_render_mode(mode, mix)` + `set_render_mode_params` are TRANSIENT
-(unlike every other pp override, which is sticky): the player zeroes the
-mode the frame calls stop — dead script = healed world. `reality.rhai`
+Reality tears ✅: rare world events — the world's skin splits and another
+view bleeds through. Since Flint #746 each reality is an engine display
+style (`flint render --list-styles`): 1 `matrix` (dot-matrix glyphs whose
+brightness AND density track the picture's luminance, so foam reads as
+bright code, per-column rain heads), 2 `blood` (a crimson key) plus the
+ocean's own `tint` (the sea's palette moves to the crimson tide, scaled by
+the TOD palette's luminance so night blood stays dark; two wobbling bands;
+world-fbm pools spread with the mix), 3 `drunk` (sway + ghost double-tap,
+its `blend` is how drunk; the script adds FOV breathing, radial blur,
+chromatic aberration, and an audio muffle via the published
+`lowpass_scale` factor water_ambience applies), 4 `tron` (cyan edges over a
+dimmed scene + a world grid that rides the swells). Matrix, blood and Tron
+show only inside the frame's tear: `[post_process] tear` (0..1, fbm patches
+or `tear_iris`), `tear_scale` (= the reality `mask_scale`), which
+`reality.rhai`'s on_init follows with `blend_source = "tear"` on the three.
+Styles and the tear HOLD until set again (the old render modes were
+TRANSIENT — a dead script no longer heals the world): the script switches
+the styles once each time the shown reality changes (`shown` write guard;
+`set_post_style` fires `post_style_changed` every call), sets the tear and
+drunk's blend every shown frame, and switches all off on heal and while a
+dunk hides the tear. The blood sea's `tint` is written by
+`seat_camera.rhai`, the tint's ONE owner (see Underwater moments): it reads
+reality's published `active_mode`/`mix`. `reality.rhai`
 (reality_controller entity) schedules tears whale-style on real seconds
 with per-mode hour affinities (Matrix 23h±3, blood dusk 19h±1.5, Tron
 22h±3, drunk hour-blind), storm-shy, helpers kept PURE (scope gotcha).
 F3 Reality panel: trigger/end buttons, pin-mix slider, weights/intervals.
-Headless: `flint render ... --render-mode N --mode-mix X`. Sticky FX the
-drunk mode borrows (fov/blur/CA) are zeroed on heal.
+Headless: `flint render <scene> --script-time 3` on a scene copy with
+`trigger_mode = N` and `mix_override = 0.6` in the reality block (the
+panel's one-shots), or by flags alone, e.g. `--style
+matrix:blend_source=tear,rate=6 --set post.tear=0.6`. Sticky FX the drunk
+mode borrows (fov/blur/CA) are zeroed on heal.
 
 The Visitor ✅: around noon of in-game day 1 (the first counted day
 after the title's looping day 0) a weathered twin raft
@@ -286,8 +295,8 @@ storm-shy `state > 2.5`); an ACTIVE visit always completes on real
 seconds. raft2 is scene-declared parked at (-80,-50,-80) — there's no
 3D-model hide and `spawn_entity` attaches no mesh. Faint spatial
 laps/creaks reuse `lap_*`/`creak_*` inside the 25 m one-shot cap.
-F3 Visitor panel (engine `visitor_panel.rs`, keyed on the
-`raft_visitor` component): phase/day status line + "Visit now" button
+F3 Visitor panel (schema lines in `schemas/components/raft_visitor.toml`,
+Flint #744): phase/day status line + "Visit now" button
 (writes the `trigger_visit` one-shot; the script publishes `phase`/
 `day` back, write-guarded). GOTCHA: schema defaults do NOT materialize
 component fields — every field a script `get_field`s must be listed in
@@ -313,8 +322,8 @@ never force them. Gates: hour affinity 3h±3, weather state < 1.2 AND
 weather enabled (weather is the applier — no weather, no event), day ≥
 min_day 2, title-day skip; mid-event weather rides through (product amp
 stays glassy, swells back on release). Birds + reality tears sit out
-`calm > 0.1`; music ducks 85%. F3 Dead Calm panel (engine
-`dead_calm_panel.rs`, visitor-pattern): status + "Calm now"/"End now"
+`calm > 0.1`; music ducks 85%. F3 Dead Calm panel (schema lines in
+`schemas/components/dead_calm.toml`): status + "Calm now"/"End now"
 one-shots (`trigger_calm`/`end_now`).
 Title card ✅: `title.rhai` (title_controller entity) draws pre-rendered
 sprites (`tools/generate_title.py` → `sprites/title_setdrift.png` +
@@ -360,41 +369,49 @@ fallback for ramp-less scenes).
 
 Underwater moments ✅: when a swell buries the eye (the raft's smoothed
 heave can't chase a steep face) the frame goes truly underwater instead
-of no-clip — **render mode 5** on the reality-tear rails, but NOT a tear:
-no tear_mask; the composite masks per pixel by a WATERLINE tested against
-the plane `camera_y + mode_params.x` (near-plane world reconstruction),
-with a wobbled hard white foam lip on the line, 3-step banded murk
-absorption (cel, not exponential), two-step light shafts, Snell-window
-brightening, biolum specks when `foam_glow` is up, and a mode-5 UV sway
-(hook A) that only engages once genuinely submerged so a straddle frame's
-air half stays steady. Param contract: x = signed eye depth m
-(+ = under), y = sea energy 0..1, z = daylight (from live
-`sun.light.intensity`), w = biolum. Ocean shader: `front_facing` now
-feeds an ALWAYS-ON underside fix (flip N for ndv/fresnel, kill sky
-reflection + specular on back faces — the old opaque sky-mirror was the
-no-clip look; script-less renders benefit too) plus a mode-5 back-face
-palette remap (murk blues, luminous white foam panes, 2 bands).
+of no-clip — the engine's **`underwater` style** (it was render mode 5),
+NOT a tear: it masks per pixel by a WATERLINE tested against the plane
+`depth` m above the eye (near-plane world reconstruction), with a wobbled
+hard white foam lip on the line, 3-step banded murk absorption (cel, not
+exponential), two-step light shafts, Snell-window brightening, biolum
+specks when `glow` is up, and a UV sway that only engages once genuinely
+submerged so a straddle frame's air half stays steady. Params:
+`blend` = the dunk's mix, `depth` = signed eye depth m (+ = under),
+`churn` = sea energy 0..1, `daylight` (from live `sun.light.intensity`),
+`glow` = biolum. Ocean shader: `front_facing` feeds an ALWAYS-ON
+underside fix (flip N for ndv/fresnel, kill sky reflection + specular on
+back faces — the old opaque sky-mirror was the no-clip look; script-less
+renders benefit too), and the ceiling seen from below is the ocean's tint
+with `tint_preset = "underside"` (murk blues, luminous white foam panes,
+2 bands, back faces only). seat_camera.rhai OWNS the ocean's
+`tint_preset`/`tint` (write-guarded): the underside at the dunk's mix while
+the eye is under, else reality's blood tear (`tint_preset = "blood"` at
+its published mix), else 0 — one writer, so the two looks can't race.
 DETECTION LIVES IN seat_camera.rhai — the only place the eye position
 exists this frame (published fields are a frame stale = too late for the
 attack frame): `d = ocean_height(eye) - eye_y`, hysteresis −0.15/−0.25 m
 (the near plane sees the line before the eye is wet; chop moves the LINE,
-never the gate), ~1-frame attack / `submerge_release_s` release, calls
-`set_render_mode(5, mix)` ONLY while active (transient — dead script =
-healed), publishes `seat.submerged` 0..1. reality.rhai yields: skips its
-set_render_mode calls AND scheduling while `submerged > 0.01` (envelope
-keeps ticking; sticky drunk FX ride through). water_ambience.rhai owns
+never the gate), ~1-frame attack / `submerge_release_s` release, switches
+the `underwater` style on once as the mix rises and off once it dies (it
+HOLDS between: a dead script leaves it as it was), publishes
+`seat.submerged` 0..1. reality.rhai yields: hides its tear AND skips
+scheduling while `submerged > 0.01` (envelope keeps ticking; sticky drunk
+FX ride through). water_ambience.rhai owns
 the audio: lowpass = `min(proximity·lp_scale, 400 Hz muffle)` (min, not
 multiply — a drunk tear and a dunk must not stack sub-audible), wind/fizz
 duck 80% / washes 50% at their write sites (ocean bed stays — bodily
 rumble), `dunk_in_*`/`dunk_out_*` one-shots on 0.65↑/0.35↓ crossings with
 a shared 0.8 s refractory + drip tail (thresholds independent of the
 visual hysteresis). Debug: `seat.force_submerge_s` one-shot fakes 0.4 m
-for N seconds; headless `--render-mode 5 --mode-mix 1 --mode-params
-0.7,0.5,1,0` + `scenes/snap_underwater.scene.toml` (render runs no
-scripts — the CLI flags ARE the fixture; camera targets under the
-surface are hit-or-miss vs the t=0 wave phase, check the no-mode render
-first). New fields must be LISTED in the scene seat block (schema
-defaults don't materialize).
+for N seconds (`flint render --script-time 3` on a scene copy with it
+set draws a real dunk); headless by flags, `--style
+underwater:blend=1,depth=0.7,churn=0.5,daylight=1,glow=0` on
+`scenes/snap_underwater.scene.toml`, whose ocean block carries
+`tint_preset = "underside"` and `tint = 1.0` (no scripts run there — the
+flags and the block ARE the fixture; camera targets under the surface are
+hit-or-miss vs the t=0 wave phase, check the plain render first). New
+fields must be LISTED in the scene seat block (schema defaults don't
+materialize).
 
 Raft detail pass ✅ (#5): `tools/generate_raft.py` builds logs as
 hand-gridded meshes (taper, bow, ovality, flank knots, chamfered
@@ -442,17 +459,30 @@ Polish backlog: real M6/M8 + weather SFX from
 `specs/elevenlabs_audio_prompts.md`; the palm is still a sharp-edged box
 (reads as a card in close-up); live playtest of the scoot with the
 new passive-arm ride.
-Engine: `engine/` tracks Flint `main` (last pull 2026-11-12, Flint
-`356f44a`; everything Float pioneered is upstream). Engine tests:
-`cargo test --release --workspace --exclude flint-android` (the Android
-crate only compiles for Android; add `--no-fail-fast` or cargo stops at
-the first red binary). Expected red INSIDE this subtree (green in a Flint
-checkout): `examples_cli` / `schema_cli`'s example-scene tests — Flint's
-root `flint.toml` adds the `schemas/examples` layer (furniture, door,
-film...), but project discovery passes through `engine/` to Float, whose
-schemas don't list it. As of 44eee61 `flint-procgen-ai`'s
-`the_loop_sends_validator_reports_back...` is also stale upstream (`cone`
-became a valid crown_shape). Neither touches Float. Plan (historical):
+Engine: `engine/` tracks Flint `main` (last pull 2026-11-21, Flint
+`3772abca`) plus one local fix not yet upstream: `stylize/reality.rs` keys
+each reality style's uniform bind group by its own pass label (all five
+shared one cache key, so the first reality style drawn lent its uniforms
+to the rest — underwater during a drunk tear drew nothing; test
+`render_reality_cli`). Engine tests:
+`cargo test --release --workspace --exclude flint-android --no-fail-fast
+--features flint-player/trace` (the Android crate only compiles for
+Android; without `--no-fail-fast` cargo stops at the first red binary;
+without the `trace` feature flint-player's #1096 `scope_coverage_tests`
+don't compile in release — `profile::with_rings` exists only under
+`debug_assertions` or `trace`). Flint's CI does NOT run the workspace
+suite (only checks and targeted test binaries), so "CI green" upstream
+doesn't clear it. Expected red INSIDE this subtree at 3772abca (17 of
+4847; none touches code Float runs): the examples layer (`fixture_scenes_cli`
+`ascii_edges`' `furniture`, `schema_cli` × 2 — Flint's root `flint.toml`
+adds `schemas/examples`, but discovery passes through `engine/` to Float);
+subtree provenance (`provenance` "engine/" subdir, `render_frame_capture_cli`
+names Float's commit); Windows socket 10049 (`frame_grab_tests`); and stale
+upstream tests (`diagnostic` code count 55/54, `extension_tests` diagnostics
+gained line numbers, `scene_tables` × 2 the new `field` table missing from
+the book, `table_schemas` post range, `project_done_when_cli` × 2 incl. a
+placeholder `Mono.ttf` egui rejects, `check_cli` × 2, `init_cli`, `json_cli`
+`play --json`). Plan (historical):
 `C:\Users\chris\.claude\plans\please-make-a-plan-fluffy-pearl.md`
 
 ## Showcase capture (tools/showcase/)
@@ -481,12 +511,17 @@ F3 toggles the panels (grouped into ≤3 scrollable columns, size-balanced
 via `flint_debug_ui::assign_columns`; each panel is a fold-open
 CollapsingHeader — panel `name()` strings are load-bearing dispatch keys,
 don't rename casually): **Ocean Debug** (waves, colors, foam, water
-clarity/turbidity, grid), **Day / Time** (Day N · HH:MM · phase status,
-0-24h scrub slider + preset hour buttons, natural advance toggle, day
-counter display/set — a one-shot override since `time_of_day.rhai` owns
-the counter — day length with effective ramped length readout, sun path
-tilt), and **Camera** (vertical FOV slider — FOV lives in the seat_camera
-entity's `camera_tuning` component, not in `seat_camera.rhai`). Edits
+clarity/turbidity, grid; its Wave probe switch now draws the CPU/GPU parity
+cross itself, Flint #749 — `ocean.show_probe` is gone, so
+`scripts/wave_probe.rhai` + the buoy entity are dead weight kept for now),
+**Camera** (vertical FOV slider — FOV lives in the seat_camera entity's
+`camera_tuning` component, not in `seat_camera.rhai`), and since Flint #744
+one panel per Float component whose schema has `panel = ...` field lines
+(`schemas/components/{time_of_day,weather,reality,raft_visitor,dead_calm}.toml`:
+`status` rows, `tune` fields with Reset/Commit, `trigger` one-shot buttons
+the script clears; `flint schema <name>` prints a component's panel line, a
+mistake is a `bad-panel` load warning). The old hand-built Day / Time
+panel's preset-hour buttons and effective-length readout went with it. Edits
 apply live through the world's components; "Commit to File" writes them
 back into the scene TOML (day/`last_hours` are never committed — day 0 is
 the title day). Escape releases the mouse (for panel use); click

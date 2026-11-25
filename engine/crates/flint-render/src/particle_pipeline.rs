@@ -6,9 +6,10 @@
 //! is grown on demand and written once per frame (ADR 0068). Instance data
 //! is the same `#[repr(C)]` type the simulation packs — no per-crate copy.
 
+use crate::gpu_counts::{CountedDevice, CountedQueue};
+use crate::TrustedShader;
 use bytemuck::{Pod, Zeroable};
 use std::sync::Arc;
-use wgpu::util::DeviceExt;
 
 pub use flint_particles::{ParticleBlendMode, ParticleInstance};
 
@@ -43,12 +44,21 @@ pub struct ParticleDrawCall {
     pub sort_key: f32,
 }
 
-/// The particle rendering pipeline (one variant per blend mode)
+/// The particle rendering pipeline (one variant per blend mode) and the
+/// layouts its bind groups are made against. The sample count is baked in,
+/// so `ScenePipelines` owns it and an MSAA change replaces it (#735); what
+/// the draws read stays in [`ParticleBuffers`].
 pub struct ParticlePipeline {
     pipelines: [wgpu::RenderPipeline; 4],
     pub uniform_bind_group_layout: wgpu::BindGroupLayout,
     pub instance_bind_group_layout: wgpu::BindGroupLayout,
     pub texture_bind_group_layout: wgpu::BindGroupLayout,
+}
+
+/// What every particle draw reads: the quad, the camera uniforms and the one
+/// instance buffer all emitters are packed into (ADR 0068). It outlives an
+/// MSAA change, so instances uploaded before one still draw after it.
+pub struct ParticleBuffers {
     pub quad_index_buffer: wgpu::Buffer,
     pub uniform_buffer: wgpu::Buffer,
     pub uniform_bind_group: wgpu::BindGroup,
@@ -60,21 +70,10 @@ pub struct ParticlePipeline {
 const INITIAL_INSTANCE_CAPACITY: u32 = 1024;
 
 impl ParticlePipeline {
-    /// Rebuild the blend-mode pipelines for `sample_count` (an MSAA change,
-    /// FlintKart#55), keeping the buffers and bind groups.
-    pub fn rebuild_for_samples(
-        &mut self,
-        device: &wgpu::Device,
-        format: wgpu::TextureFormat,
-        sample_count: u32,
-    ) {
-        self.pipelines = Self::new(device, format, sample_count).pipelines;
-    }
-
     pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat, sample_count: u32) -> Self {
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        let shader = device.create_trusted_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Particle Shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("particle_shader.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(crate::wgsl_sources::PARTICLE.into()),
         });
 
         // Group 0: ParticleUniforms (camera data)
@@ -136,24 +135,24 @@ impl ParticlePipeline {
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Particle Pipeline Layout"),
             bind_group_layouts: &[
-                &uniform_bind_group_layout,
-                &instance_bind_group_layout,
-                &texture_bind_group_layout,
+                Some(&uniform_bind_group_layout),
+                Some(&instance_bind_group_layout),
+                Some(&texture_bind_group_layout),
             ],
-            push_constant_ranges: &[],
+            immediate_size: 0,
         });
 
         // Shared depth stencil: depth test enabled, depth write DISABLED (translucent)
         let depth_stencil = wgpu::DepthStencilState {
             format: wgpu::TextureFormat::Depth32Float,
-            depth_write_enabled: false,
-            depth_compare: wgpu::CompareFunction::Less,
+            depth_write_enabled: Some(false),
+            depth_compare: Some(wgpu::CompareFunction::Less),
             stencil: wgpu::StencilState::default(),
             bias: wgpu::DepthBiasState::default(),
         };
 
         let make = |mode: ParticleBlendMode| {
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            device.create_render_pipeline_counted(&wgpu::RenderPipelineDescriptor {
                 label: Some(&format!("Particle {} Pipeline", mode.as_str())),
                 layout: Some(&pipeline_layout),
                 vertex: wgpu::VertexState {
@@ -186,7 +185,7 @@ impl ParticlePipeline {
                     count: sample_count,
                     ..Default::default()
                 },
-                multiview: None,
+                multiview_mask: None,
                 cache: None,
             })
         };
@@ -197,16 +196,57 @@ impl ParticlePipeline {
             make(ParticleBlendMode::Multiply),
         ];
 
+        Self {
+            pipelines,
+            uniform_bind_group_layout,
+            instance_bind_group_layout,
+            texture_bind_group_layout,
+        }
+    }
+
+    /// Pipeline variant for a blend mode.
+    pub fn pipeline(&self, mode: ParticleBlendMode) -> &wgpu::RenderPipeline {
+        &self.pipelines[mode.index()]
+    }
+
+    /// Bind group for a sprite texture.
+    pub fn create_texture_bind_group(
+        &self,
+        device: &wgpu::Device,
+        view: &wgpu::TextureView,
+        sampler: &wgpu::Sampler,
+        label: &str,
+    ) -> wgpu::BindGroup {
+        device.create_bind_group_counted(&wgpu::BindGroupDescriptor {
+            layout: &self.texture_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(sampler),
+                },
+            ],
+            label: Some(label),
+        })
+    }
+}
+
+impl ParticleBuffers {
+    pub fn new(device: &wgpu::Device, pipeline: &ParticlePipeline) -> Self {
         // Shared quad index buffer
         let quad_indices: [u32; 6] = [0, 1, 2, 2, 1, 3];
-        let quad_index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Particle Quad Index Buffer"),
-            contents: bytemuck::cast_slice(&quad_indices),
-            usage: wgpu::BufferUsages::INDEX,
-        });
+        let quad_index_buffer =
+            device.create_buffer_init_counted(&wgpu::util::BufferInitDescriptor {
+                label: Some("Particle Quad Index Buffer"),
+                contents: bytemuck::cast_slice(&quad_indices),
+                usage: wgpu::BufferUsages::INDEX,
+            });
 
         // Persistent uniform buffer for camera data
-        let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        let uniform_buffer = device.create_buffer_init_counted(&wgpu::util::BufferInitDescriptor {
             label: Some("Particle Uniform Buffer"),
             contents: bytemuck::cast_slice(&[ParticleUniforms {
                 view_proj: [[0.0; 4]; 4],
@@ -218,8 +258,8 @@ impl ParticlePipeline {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
-        let uniform_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            layout: &uniform_bind_group_layout,
+        let uniform_bind_group = device.create_bind_group_counted(&wgpu::BindGroupDescriptor {
+            layout: &pipeline.uniform_bind_group_layout,
             entries: &[wgpu::BindGroupEntry {
                 binding: 0,
                 resource: uniform_buffer.as_entire_binding(),
@@ -229,15 +269,11 @@ impl ParticlePipeline {
 
         let (instance_buffer, instance_bind_group) = Self::create_instance_buffer(
             device,
-            &instance_bind_group_layout,
+            &pipeline.instance_bind_group_layout,
             INITIAL_INSTANCE_CAPACITY,
         );
 
         Self {
-            pipelines,
-            uniform_bind_group_layout,
-            instance_bind_group_layout,
-            texture_bind_group_layout,
             quad_index_buffer,
             uniform_buffer,
             uniform_bind_group,
@@ -252,13 +288,13 @@ impl ParticlePipeline {
         layout: &wgpu::BindGroupLayout,
         capacity: u32,
     ) -> (wgpu::Buffer, wgpu::BindGroup) {
-        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        let buffer = device.create_buffer_counted(&wgpu::BufferDescriptor {
             label: Some("Particle Instance Buffer"),
             size: capacity as u64 * std::mem::size_of::<ParticleInstance>() as u64,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        let bind_group = device.create_bind_group_counted(&wgpu::BindGroupDescriptor {
             layout,
             entries: &[wgpu::BindGroupEntry {
                 binding: 0,
@@ -269,28 +305,24 @@ impl ParticlePipeline {
         (buffer, bind_group)
     }
 
-    /// Pipeline variant for a blend mode.
-    pub fn pipeline(&self, mode: ParticleBlendMode) -> &wgpu::RenderPipeline {
-        &self.pipelines[mode.index()]
-    }
-
     pub fn instance_bind_group(&self) -> &wgpu::BindGroup {
         &self.instance_bind_group
     }
 
-    pub fn instance_capacity(&self) -> u32 {
-        self.instance_capacity
-    }
-
     /// Grow the shared instance buffer (next power of two) so it holds at
     /// least `needed` instances. Returns `true` when it was reallocated.
-    pub fn ensure_capacity(&mut self, device: &wgpu::Device, needed: u32) -> bool {
+    pub fn ensure_capacity(
+        &mut self,
+        device: &wgpu::Device,
+        pipeline: &ParticlePipeline,
+        needed: u32,
+    ) -> bool {
         if needed <= self.instance_capacity {
             return false;
         }
         let capacity = needed.max(INITIAL_INSTANCE_CAPACITY).next_power_of_two();
         let (buffer, bind_group) =
-            Self::create_instance_buffer(device, &self.instance_bind_group_layout, capacity);
+            Self::create_instance_buffer(device, &pipeline.instance_bind_group_layout, capacity);
         self.instance_buffer = buffer;
         self.instance_bind_group = bind_group;
         self.instance_capacity = capacity;
@@ -303,31 +335,7 @@ impl ParticlePipeline {
             return;
         }
         debug_assert!(instances.len() as u32 <= self.instance_capacity);
-        queue.write_buffer(&self.instance_buffer, 0, bytemuck::cast_slice(instances));
-    }
-
-    /// Bind group for a sprite texture.
-    pub fn create_texture_bind_group(
-        &self,
-        device: &wgpu::Device,
-        view: &wgpu::TextureView,
-        sampler: &wgpu::Sampler,
-        label: &str,
-    ) -> wgpu::BindGroup {
-        device.create_bind_group(&wgpu::BindGroupDescriptor {
-            layout: &self.texture_bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(sampler),
-                },
-            ],
-            label: Some(label),
-        })
+        queue.write_buffer_counted(&self.instance_buffer, 0, bytemuck::cast_slice(instances));
     }
 }
 
@@ -366,6 +374,13 @@ pub fn blend_state(mode: ParticleBlendMode) -> wgpu::BlendState {
 
 /// Order draws for correct blending: order-dependent modes far-to-near
 /// (stable on the caller's deterministic order), additive last.
+///
+/// Emitters on one origin tie exactly, and the caller's order decides
+/// them: `ParticleSync` hands its instances over by `EntityId`, which is
+/// the name's rank for a scene's entities (#688). The `style-veil` golden
+/// has such a tie (`blaze` and the campfire's alpha emitters), and drew one
+/// of two images run to run while ids followed `HashMap` spawn order
+/// (#858; `crates/flint-cli/tests/particle_tie_order.rs`).
 pub fn sort_particle_draws(draws: &mut [ParticleDrawCall]) {
     draws.sort_by(|a, b| {
         let ka = a.blend.is_order_independent();

@@ -1,26 +1,27 @@
 # Underwater-moment fixture — bright noon over a heavy (but not storm-
-# gray) sea, for eyeballing render mode 5: the composite murk/waterline/
-# shafts and the ocean shader's underside "ceiling". `flint render` runs
-# no scripts, so the CLI flags ARE the fixture — the orbit camera is
-# placed under the surface and the mode params are passed by hand
-# (x = signed eye depth m, y = sea energy, z = daylight, w = biolum).
+# gray) sea, for eyeballing the `underwater` style (render mode 5 until
+# Flint #746): the murk/waterline/shafts and the ocean's underside
+# "ceiling", which is the ocean block's tint below (`tint_preset =
+# "underside"`, back faces only). `flint render` runs no scripts, so the
+# CLI flags ARE the fixture — the orbit camera is placed under the surface
+# and the style's params are passed by hand (as seat_camera.rhai sets them).
 #
 # Fully submerged (murk + ceiling + shafts):
 #   flint render scenes/snap_underwater.scene.toml --schemas engine\schemas \
 #     --schemas schemas --output snapshots/underwater.png --no-grid \
 #     --distance 0.4 --pitch 5 --yaw 35 --target 0,-1.2,0 \
-#     --render-mode 5 --mode-mix 1.0 --mode-params 0.7,0.5,1,0
+#     --style underwater:blend=1,depth=0.7,churn=0.5,daylight=1,glow=0
 #
 # Straddling the line (waterline + foam lip across the frame):
-#   ... --target 0,0.3,0 --pitch 2 --mode-params -0.05,0.5,1,0
+#   ... --target 0,0.3,0 --pitch 2 --style underwater:blend=1,depth=-0.05,churn=0.5,daylight=1
 #
-# Back-face fix alone (no mode flags): same camera, no --render-mode —
+# Back-face fix alone: same camera, no --style, and `tint = 0.0` below —
 # the surface from below must read as a dim ceiling, never a sky mirror.
 
 [scene]
 name = "Float — underwater fixture"
 version = "0.1"
-description = "Noon heavy sea for render-mode-5 underwater snapshots"
+description = "Noon heavy sea for underwater-moment snapshots"
 
 [post_process]
 bloom_enabled = true
@@ -92,6 +93,9 @@ fade_end = 170.0
 foam_glow_color = [0.35, 0.95, 0.75, 1.0]
 foam_glow = 0.0
 rain_ripple = 0.0
+# The ceiling seen from below, as seat_camera.rhai draws it in a dunk
+tint_preset = "underside"
+tint = 1.0
 
 # Scale reference: the raft riding overhead when the camera is under.
 [entities.raft]

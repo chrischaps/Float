@@ -1,4 +1,4 @@
-// reality.rhai — reality tears: rare render-mode world events.
+// reality.rhai — reality tears: rare world events drawn by engine styles.
 //
 // Every so often the world's skin splits and something else shows through:
 // the waves as falling code (Matrix), the sea turned to blood at dusk, a
@@ -7,11 +7,14 @@
 // mode has a time-of-day affinity (Matrix wants deep night, blood wants the
 // sunset band) and the F3 Reality panel can force one at any hour.
 //
-// The renderer work lives in composite_shader.wgsl / ocean_shader.wgsl,
-// driven by set_render_mode(mode, mix): 1 = Matrix, 2 = blood, 3 = drunk,
-// 4 = Tron. The call is TRANSIENT — the engine zeroes the mode the frame we
-// stop calling it — so this script simply calls it every active frame and
-// the failure mode of a dead script is a healed world, never a stuck tear.
+// Each reality is an engine display style (Flint #746): 1 = `matrix`,
+// 2 = `blood`, 3 = `drunk`, 4 = `tron`. Matrix, blood and Tron show only
+// inside the frame's tear (`set_post("tear", mix)`), which on_init sets up
+// with `blend_source = "tear"`; drunk shows by its own `blend`. Styles and
+// the tear HOLD until set again (the old render modes were transient), so
+// the styles are switched once each time the shown reality changes, the
+// tear and drunk's blend are set every shown frame from the envelope, and
+// the heal path (and a dunk) switches everything back off.
 //
 // Race audit (script order is a HashMap — see CLAUDE.md): fog and exposure
 // belong to time_of_day/weather, the audio lowpass belongs to
@@ -19,6 +22,10 @@
 // published `lowpass_scale` factor water_ambience applies at its own write
 // site, and the drunk haze uses radial blur + chromatic aberration, which
 // nothing else drives. Those two ARE sticky, so the heal path zeroes them.
+// The blood sea is the ocean's `tint`, which seat_camera.rhai OWNS (the
+// underside seen from a buried eye is the same fields): it reads our
+// published `active_mode` / `mix` and draws blood when no dunk wants the
+// tint. We never write the ocean.
 //
 // Engine gotcha honored here: the scope with these globals is visible only
 // to on_update itself, NOT to sub-functions — so every helper below is
@@ -35,6 +42,25 @@ let pub_mode = -9.0;      // last published values (write guards)
 let pub_mix = -9.0;
 let pub_next = -9.0;
 let pub_lp = -9.0;
+let shown = -1;           // reality whose styles are on (write guard; -1 = unsent)
+
+// The styles of reality `mode` on, the others off; 0 also closes the tear.
+// PURE of this script's globals (the scope gotcha): engine calls only.
+fn show_styles(mode) {
+    set_post_style("matrix", mode == 1);
+    set_post_style("blood", mode == 2);
+    set_post_style("drunk", mode == 3);
+    set_post_style("tron", mode == 4);
+    if mode == 0 { set_post("tear", 0.0); }
+}
+
+fn on_init() {
+    // The three that tear show only inside the tear's holes
+    set_post_style_param("matrix", "blend_source", "tear");
+    set_post_style_param("blood", "blend_source", "tear");
+    set_post_style_param("tron", "blend_source", "tear");
+    set_post_style_param("matrix", "rate", 6.0);   // the old mode's code reroll
+}
 
 fn sstep(t) {
     let c = clamp(t, 0.0, 1.0);
@@ -76,7 +102,7 @@ fn pick_mode(me, hours) {
 }
 
 fn on_update() {
-    let me = this_entity();
+    let me = self_entity();
     let dt = delta_time();
     if dt <= 0.0 { return; }
 
@@ -113,11 +139,11 @@ fn on_update() {
         if phase != 0 && phase != 3 { phase = 3; t = 0.0; }
     }
 
-    // Underwater moments own the render-mode slot while a swell buries the
-    // eye (seat_camera.rhai drives mode 5 with zero latency; script order
-    // is a HashMap, so BOTH of us calling set_render_mode would be a
-    // coin-flip race every frame). One-frame-stale read is fine — worst
-    // case is a single contested frame at the dip boundary.
+    // Underwater moments own the frame while a swell buries the eye
+    // (seat_camera.rhai drives the `underwater` style with zero latency):
+    // a tear is hidden under the sea, as it was when the two shared one
+    // render-mode slot. One-frame-stale read is fine — worst case is a
+    // single frame of both at the dip boundary.
     let dunked = false;
     let sce = get_entity("seat_camera");
     if sce >= 0 {
@@ -205,12 +231,13 @@ fn on_update() {
     if healed {
         if mode == 3 {
             if base_fov > 0.0 { set_camera_fov(base_fov); }
-            set_radial_blur(0.0);
-            set_chromatic_aberration(0.0);
+            set_post("radial_blur", 0.0);
+            set_post("chromatic_aberration", 0.0);
         } else if mode == 1 {
             // Sticky override: heal back to the scene's own vignette, or
             // the Matrix tear would leave the frame vignette-free forever
-            set_vignette(base_vignette);
+            set_post("vignette_enabled", base_vignette > 0.001);
+            set_post("vignette_intensity", base_vignette);
         }
         phase = 0; mode = 0; t = 0.0;
         next_timer = -1.0;         // roll a fresh interval next frame
@@ -221,18 +248,26 @@ fn on_update() {
 
     // ── Drive the renderer + per-mode side effects ──────────────────────
     let lp_scale = 1.0;
+    // The reality on screen: none while idle, healed, or yielding to the
+    // underwater moment (the tear's envelope keeps ticking under it and
+    // shows again when the eye clears; sticky side effects below stay live
+    // either way).
+    let show = if phase != 0 && !dunked { mode } else { 0 };
+    if show != shown {
+        show_styles(show);
+        shown = show;
+    }
+    if show == 1 || show == 2 || show == 4 {
+        set_post("tear", mix);
+        let scale = get_field(me, "reality", "mask_scale");
+        if scale == () || scale <= 0.0 { scale = 3.0; }
+        let iris = get_field(me, "reality", "mask_style");
+        set_post("tear_scale", scale);
+        set_post("tear_iris", iris != () && iris >= 0.5);
+    } else if show == 3 {
+        set_post_style_param("drunk", "blend", mix);
+    }
     if phase != 0 {
-        // Yield the transient slot to the underwater moment; the tear's
-        // envelope keeps ticking and its calls resume when the eye clears
-        // (sticky side effects below stay live either way).
-        if !dunked {
-            set_render_mode(mode, mix);
-            let rate = if mode == 1 { 6.0 } else { 0.0 };
-            set_render_mode_params(
-                get_field(me, "reality", "mask_scale"),
-                get_field(me, "reality", "mask_style"),
-                rate, 0.0);
-        }
 
         if mode == 3 {
             // Drunk: the world leans. FOV breathing on top of the shader's
@@ -242,13 +277,15 @@ fn on_update() {
             if base_fov > 0.0 {
                 set_camera_fov(base_fov + 6.0 * sin(wobble_t * 0.5) * mix);
             }
-            set_radial_blur(0.35 * mix);
-            set_chromatic_aberration(0.6 * mix);
+            set_post("radial_blur", 0.35 * mix);
+            set_post("chromatic_aberration", 0.6 * mix);
             lp_scale = 1.0 - 0.6 * mix;
         } else if mode == 1 {
             // From the scene's vignette up to the tear's 0.3, so the edge
             // never dips as the code bleeds in
-            set_vignette(base_vignette + (0.3 - base_vignette) * mix);
+            let v = base_vignette + (0.3 - base_vignette) * mix;
+            set_post("vignette_enabled", v > 0.001);
+            set_post("vignette_intensity", v);
         }
     }
 

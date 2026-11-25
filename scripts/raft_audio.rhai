@@ -50,7 +50,7 @@ fn on_update() {
     let dt = delta_time();
     if dt <= 0.0 { return; }
 
-    let me = this_entity();
+    let me = self_entity();
     let raft = get_entity("raft");
     if raft < 0 { return; }
 

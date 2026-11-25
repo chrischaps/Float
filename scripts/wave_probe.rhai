@@ -18,12 +18,12 @@ fn on_update() {
     // Guarded read: unit until the field materializes on the first frames.
     let show = get_field(get_entity("ocean"), "ocean", "show_probe");
     if show.type_of() != "bool" || !show {
-        set_position(this_entity(), 0.0, PARK_Y, 0.0);
+        set_position(self_entity(), 0.0, PARK_Y, 0.0);
         return;
     }
     let t = total_time();
     let x = cos(t * ORBIT_SPEED) * ORBIT_RADIUS;
     let z = sin(t * ORBIT_SPEED) * ORBIT_RADIUS + 4.0;
     let h = ocean_height(x, z);
-    set_position(this_entity(), x, h, z);
+    set_position(self_entity(), x, h, z);
 }

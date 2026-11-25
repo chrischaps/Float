@@ -25,7 +25,7 @@ fn sstep(t) {
 }
 
 fn on_update() {
-    let me = this_entity();
+    let me = self_entity();
     let ocean = get_entity("ocean");
     let tod = get_entity("tod");
     if ocean < 0 || tod < 0 { return; }

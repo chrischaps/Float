@@ -29,7 +29,7 @@ fn sstep(t) {
 
 fn on_update() {
     if done { return; }
-    let me = this_entity();
+    let me = self_entity();
 
     let enabled = get_field(me, "title", "enabled");
     if enabled == () { return; }   // fields not materialized yet
@@ -68,7 +68,7 @@ fn on_update() {
 
 fn on_draw_ui() {
     if done { return; }
-    let me = this_entity();
+    let me = self_entity();
 
     let fade_in = get_field(me, "title", "fade_in_s");
     if fade_in == () { return; }
@@ -106,10 +106,10 @@ fn on_draw_ui() {
     // than blinks.
     let breath = 0.70 + 0.30 * sin(t * 1.4);
 
-    draw_sprite_ex(tx, ty, tw, th, "title_setdrift.png",
-        0.0, 0.0, 1.0, 1.0,
-        1.0, 0.99, 0.96, 0.94 * ease_in * ease_out, 10);
-    draw_sprite_ex(px, py, pw, ph, "title_presskey.png",
-        0.0, 0.0, 1.0, 1.0,
-        1.0, 0.99, 0.96, 0.78 * sub_in * breath * ease_out, 10);
+    draw_sprite(tx, ty, tw, th, "title_setdrift.png", #{
+        uv: [0.0, 0.0, 1.0, 1.0],
+        color: [1.0, 0.99, 0.96, 0.94 * ease_in * ease_out], layer: 10 });
+    draw_sprite(px, py, pw, ph, "title_presskey.png", #{
+        uv: [0.0, 0.0, 1.0, 1.0],
+        color: [1.0, 0.99, 0.96, 0.78 * sub_in * breath * ease_out], layer: 10 });
 }

@@ -83,7 +83,7 @@ fn smooth(t) {
 }
 
 fn on_update() {
-    let me = this_entity();
+    let me = self_entity();
     let dt = delta_time();
 
     let hours = get_field(me, "time_of_day", "time_hours");
@@ -254,8 +254,8 @@ fn on_update() {
     let fr = v[22] + (gray * 0.9 - v[22]) * wx_fog_g;
     let fg = v[23] + (gray * 0.95 - v[23]) * wx_fog_g;
     let fb = v[24] + (gray - v[24]) * wx_fog_g;
-    set_fog_color(fr, fg, fb);
-    set_fog_density(v[25] * wx_fog_m);
+    set_post("fog_color", [fr, fg, fb]);
+    set_post("fog_density", v[25] * wx_fog_m);
 
     // ── Ocean palette (32-34 deep, 35-37 shallow, 38-40 sss) ────────
     // Heavy weather both darkens (wx_ocean ×) and DESATURATES the water:

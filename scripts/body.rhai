@@ -83,7 +83,7 @@ fn on_update() {
     let py = rp["y"] + (cy * sz) * lx + (sx * sy * sz + cx * cz) * ly + (cx * sy * sz - sx * cz) * lz;
     let pz = rp["z"] + (-sy) * lx + (sx * cy) * ly + (cx * cy) * lz;
 
-    let me = this_entity();
+    let me = self_entity();
     set_position(me, px, py, pz);
 
     // Body faces seat-outward and inherits the raft attitude; the
