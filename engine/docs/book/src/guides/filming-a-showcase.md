@@ -71,14 +71,34 @@ an error, fails the run (exit 1) and names its log.
 | `--tolerance N` | With `--verify`: how many 8-bit levels still count as the same frame (default 0) |
 | `--encode mp4` | Also `<shot>/<take>.mp4` from each take: H.264, BT.709, no sound (needs ffmpeg on `PATH`) |
 | `--dry-run` | Print the takes, their frames and each command line; capture nothing |
+| `--no-disk-check` | Capture even when the estimate passes 90% of the disk's free space |
 | `--schemas DIR` | Schema directories for the player (default: the scene's project's `flint.toml`) |
 | `-- FLAGS` | Anything after `--` goes to every take's `flint play` |
 
 With `--json` the answer is one document: each take's record (`take.json`'s
 fields, its folder, `ok`, and `verify` with `--verify`), `failed` and a
-summary. The run prints a disk estimate first, at about 8 MB a 4K frame:
-the film's 10,940 frames at 60 fps were 77 GB, so big runs go outside the
-repository (`out = "~/flint-film"`; `captures/` is in `.gitignore`).
+summary. The run prints a disk estimate first, at about 8 MB a 4K frame,
+and the free space of the disk under `out`: the film's 10,940 frames at
+60 fps were 77 GB, so big runs go outside the repository
+(`out = "~/flint-film"`; `captures/` is in `.gitignore`).
+
+A run whose estimate passes 90% of that free space stops before the first
+take. Old takes the run replaces count as room, since each take's folder is
+emptied before it is written, and with `--verify` the second run of a take
+counts only while it sits beside the first. The error says what it would
+need and offers the ways out:
+
+```text
+Error: this capture won't fit: it needs ~688.4 GB at once, and the disk under showcase_game\captures\trailer has 420.4 GB free (a run may fill 90% of it)
+ways out:
+  --scale 20        ~172.1 GB: smaller frames, the same layout
+  --shot <id>       fewer shots (the largest, garden, is ~344.2 GB)
+  --out <dir>       a disk with more room
+  --no-disk-check   capture anyway
+```
+
+`--dry-run` prints the same warning and still lists the takes; its JSON
+has a `disk` block (`need_bytes`, `free_bytes`, `reclaimed_bytes`, `fits`).
 
 ### The shot list
 
@@ -155,13 +175,13 @@ flint play flint-examples/film/02_type.scene.toml \
 
 ## The showcase film
 
-The film's shot list is `flint-examples/tools/showcase/film.toml`, a shot per beat, at
+The film's shot list is `flint-examples/film/film.toml`, a shot per beat, at
 3840x2160 and 60 fps on a 1920-point canvas, into `~/flint-film/`:
 
 ```bash
 cargo build --release --bin flint
-flint capture flint-examples/tools/showcase/film.toml                       # every beat, every take
-flint capture flint-examples/tools/showcase/film.toml --shot 02_type --scale 0.5
+flint capture flint-examples/film/film.toml                       # every beat, every take
+flint capture flint-examples/film/film.toml --shot 02_type --scale 0.5
 ```
 
 ## A beat
@@ -169,7 +189,7 @@ flint capture flint-examples/tools/showcase/film.toml --shot 02_type --scale 0.5
 A beat is a scene whose script drives the camera and the styles on game
 time. The film's beats share one set, [`flint-examples/film/set.toml`](https://github.com/chrischaps/flint-examples/blob/main/film/set.toml); each adds a
 fragment (`flint-examples/film/beats/<beat>.toml`: its `[scene]`, `[camera]`, styles
-and script entity) and `python flint-examples/tools/showcase/build_scenes.py` writes the
+and script entity) and `python flint-examples/film/build_scenes.py` writes the
 scene from the two (`--check` says whether any is stale; `cut.py --capture`
 runs it first, and after editing a fragment run it before `flint capture`). The fragment may add components to the set's props
 (`[entities.barrel.ascii_style]`) and its style tables
@@ -195,6 +215,46 @@ fn on_update() {
 A one-shot change (a style switched on at 5 s) goes through a step number
 kept in a component on the script's entity, so it is applied on the frame
 the step starts and not again; see [`flint-examples/film/scripts/02_type.rhai`](https://github.com/chrischaps/flint-examples/blob/main/film/scripts/02_type.rhai).
+The camera rig's `shot` does the same without the component (next section).
+
+### The camera rig
+
+A beat that flies, banks, shakes and cuts needs no camera maths of its own:
+the `camera_rig` module ([Scripting → Camera Rig
+API](../concepts/scripting.md#camera-rig-api)) has a path through a list of
+points, a bank into its turns, a shake in the camera's own frame, a
+hand-held camera and a shot list, all on game time. This beat flies a
+banked arc round the still life, kicks the camera on each cut, and hands
+the second shot to an operator on foot:
+
+```rust
+const ARC = [[0.0, 2.2, 7.0], [5.5, 2.8, 3.0], [4.0, 3.4, -4.0], [-3.0, 2.6, -5.0]];
+const WALK = [[-4.0, 1.7, 3.0], [-1.5, 1.6, 4.5], [1.5, 1.7, 5.0]];
+
+fn on_update() {
+    let s = shot(total_time(), [0.0, 6.0, 10.0]);
+    if s.index == 0 {
+        set_camera_on_path(global::ARC, film::ease(s.u), #{ bank: 6.0, look_at: [0.0, 0.8, 0.0] });
+    } else {
+        set_camera_on_path(global::WALK, s.u, #{ look_at: [0.0, 0.9, 0.0] });
+    }
+    if s.first { shake_view(0.12, 14.0, 4.0); set_hand_held(if s.index == 1 { 1.0 } else { 0.0 }, #{ steps: 1.8 }); }
+}
+```
+
+- `u` is distance along the path, so a path with uneven points still moves
+  at an even speed; ease it (`film::ease(s.u)`) for a start and a landing at
+  rest.
+- `bank: 6.0` leans 45 degrees in a 6 m turn, eased in and out of each one.
+- The shake and the hand-held drift are laid over the camera after every
+  script has set it, so they ride on `film::orbit` and `film::dolly` too:
+  call `shake_view` once and keep placing the camera as before.
+- `s.first` is true on the frame each shot begins, once, so the kick and
+  the hand change on the cut and not again.
+
+`flint capture --verify` holds a rigged beat to the same frames twice like
+any other: the shake and the hand are seeded noise of game time, never of
+the frame's step.
 
 Everything a beat does comes from game time. Never wall time, never an
 entity id (ids differ between runs; seed from names), and one directional
@@ -202,12 +262,12 @@ light (the sky's sun disc follows the first one, and entities load in no
 fixed order).
 
 The storyboard (each beat, its feature, its camera, and how the cuts are
-meant to go) is [the storyboard](https://github.com/chrischaps/flint-examples/blob/main/tools/showcase/storyboard.md) in flint-examples.
+meant to go) is [the storyboard](https://github.com/chrischaps/flint-examples/blob/main/film/storyboard.md) in flint-examples.
 
 ## A cut
 
 A cut is a film edited for one place, and is one file,
-`flint-examples/tools/showcase/cuts/<name>.toml`: a `[cut]` table (frame size, frame rate,
+`flint-examples/film/cuts/<name>.toml`: a `[cut]` table (frame size, frame rate,
 the music's bar grid, where captions may go) and its `[[shot]]`s in order,
 each a take of a beat from `start_s` seconds for a number of bars. Both
 films are made this way, by one editor, `cut.py`: the 16:9 master
@@ -240,10 +300,10 @@ Shots are measured in bars, not seconds, so the music (#438) can be
 written to the same list and change on every cut. Then:
 
 ```bash
-python flint-examples/tools/showcase/cut.py reel --capture   # the takes the cut uses, at its size
-python flint-examples/tools/showcase/music.py reel           # its score, to the same list
-python flint-examples/tools/showcase/cut.py reel             # the MP4s, with the score
-python flint-examples/tools/showcase/check_cut.py reel       # every frame, the sound, every shot on its bar
+python flint-examples/film/cut.py reel --capture   # the takes the cut uses, at its size
+python flint-examples/film/music.py reel           # its score, to the same list
+python flint-examples/film/cut.py reel             # the MP4s, with the score
+python flint-examples/film/check_cut.py reel       # every frame, the sound, every shot on its bar
 ```
 
 `cut.py <cut> --capture` writes a shot list for the cut,
@@ -349,17 +409,17 @@ be reshot and cut against an earlier take frame for frame.
 ## Cutting the film
 
 The 16:9 film, for YouTube and the Flint page on chaps.dev, is the cut
-`master` (`flint-examples/tools/showcase/cuts/master.toml`), made like the reel:
+`master` (`flint-examples/film/cuts/master.toml`), made like the reel:
 
 ```bash
-python flint-examples/tools/showcase/cut.py master --capture   # the takes it uses, 3840x2160 at 60 fps
-python flint-examples/tools/showcase/music.py master           # its score
-python flint-examples/tools/showcase/cut.py master             # master MP4, web MP4 + WebM, poster
-python flint-examples/tools/showcase/check_cut.py master       # every frame, the sound, every shot on its bar
+python flint-examples/film/cut.py master --capture   # the takes it uses, 3840x2160 at 60 fps
+python flint-examples/film/music.py master           # its score
+python flint-examples/film/cut.py master             # master MP4, web MP4 + WebM, poster
+python flint-examples/film/check_cut.py master       # every frame, the sound, every shot on its bar
 ```
 
 Everything lands in `~/flint-film/master/edit/`. Takes already captured
-for the whole film (`flint capture flint-examples/tools/showcase/film.toml`, `~/flint-film/<beat>/`)
+for the whole film (`flint capture flint-examples/film/film.toml`, `~/flint-film/<beat>/`)
 are at the master's size and rate, so `cut.py master --frames ~/flint-film`
 cuts from them. `--scale` (or `--width`) cuts takes captured smaller, for a
 preview on a disk without room for 4K.
@@ -470,22 +530,22 @@ every frame, 3,780 of 3,780, each one step after the last, none dropped.
 
 The film's music (#438) is written and mixed with Flint too, and its clock
 is the film's: 100 bpm in 4/4, so a bar is 2.4 s, 72 frames at 30 fps. Each
-cut is a list of shots in `flint-examples/tools/showcase/cuts/<cut>.toml` (`master` for the
+cut is a list of shots in `flint-examples/film/cuts/<cut>.toml` (`master` for the
 16:9 film, `reel` for the vertical one): the beat and take, where in the
 take it starts, and how many bars it lasts. Cuts sit on bar or half-bar
 lines, so the music can change where the picture does.
 
 ```bash
 cargo build --release --bin flint
-python flint-examples/tools/showcase/music.py                # every cut, into ~/flint-film/music/
-python flint-examples/tools/showcase/music.py reel --plot    # one, with a sheet of its shots and levels
-python flint-examples/tools/showcase/music.py --verify       # build twice, compare every byte
+python flint-examples/film/music.py                # every cut, into ~/flint-film/music/
+python flint-examples/film/music.py reel --plot    # one, with a sheet of its shots and levels
+python flint-examples/film/music.py --verify       # build twice, compare every byte
 ```
 
-For each cut it arranges the score (`flint-examples/tools/showcase/score.py`) to the shot
-list, synthesizes six stems (`flint-examples/tools/showcase/synth.py`: sines, noise and FM,
+For each cut it arranges the score (`flint-examples/film/score.py`) to the shot
+list, synthesizes six stems (`flint-examples/film/synth.py`: sines, noise and FM,
 no samples), writes a suite and its mix automation
-(`flint-examples/tools/showcase/music/<cut>.suite.toml`, `<cut>.events.toml`), renders
+(`flint-examples/film/music/<cut>.suite.toml`, `<cut>.events.toml`), renders
 them with `flint music render`, and masters the result to -14 LUFS under a
 -1.5 dBTP ceiling: `many-hands-<cut>.wav`, 48 kHz 24-bit, exactly as long as
 the cut. The JSON beside it has its length in samples and frames, its

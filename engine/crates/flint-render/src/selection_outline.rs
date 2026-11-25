@@ -117,6 +117,7 @@ pub(crate) struct SelectionOutline {
 }
 
 struct MaskTarget {
+    texture: wgpu::Texture,
     view: wgpu::TextureView,
     size: (u32, u32),
     outline_bind: wgpu::BindGroup,
@@ -129,18 +130,23 @@ fn module(device: &wgpu::Device, label: &str, source: &str) -> wgpu::ShaderModul
     })
 }
 
-/// The mask shader's source; `woozy` prefixes the wooze noise and turns on
-/// the drift lines.
+/// The mask shader's source: a mesh's vertex side (`wgsl_sources::MASK_VERTEX`,
+/// the scene's products, #1244), then `selection_mask.wgsl`; `woozy`
+/// prefixes the wooze noise and turns on the drift lines.
 pub(crate) fn mask_source(woozy: bool) -> String {
-    let base = include_str!("selection_mask.wgsl");
+    let base = format!(
+        "{}\n{}",
+        crate::wgsl_sources::MASK_VERTEX,
+        include_str!("selection_mask.wgsl")
+    );
     if woozy {
         format!(
             "{}\n{}",
             include_str!("wooze_noise.wgsl"),
-            base.replace("//FLINT_WOOZE ", "")
+            crate::wgsl_sources::woozy(&base)
         )
     } else {
-        base.to_string()
+        base
     }
 }
 
@@ -386,6 +392,12 @@ impl SelectionOutline {
         }
     }
 
+    /// The mask's texture, once [`ensure_mask`](Self::ensure_mask) made it:
+    /// what a frame capture reads after the mask pass (#1161).
+    pub fn mask_texture(&self) -> Option<&wgpu::Texture> {
+        self.target.as_ref().map(|t| &t.texture)
+    }
+
     /// The mask's view, once [`ensure_mask`](Self::ensure_mask) made it.
     pub fn mask_view(&self) -> &wgpu::TextureView {
         &self.target.as_ref().expect("ensure_mask first").view
@@ -406,8 +418,10 @@ impl SelectionOutline {
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
                 format: SELECTION_MASK_FORMAT,
+                // Copied out by a frame capture (#1161)
                 usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                    | wgpu::TextureUsages::TEXTURE_BINDING,
+                    | wgpu::TextureUsages::TEXTURE_BINDING
+                    | wgpu::TextureUsages::COPY_SRC,
                 view_formats: &[],
             });
             let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
@@ -426,6 +440,7 @@ impl SelectionOutline {
                 ],
             });
             self.target = Some(MaskTarget {
+                texture,
                 view,
                 size,
                 outline_bind,

@@ -719,6 +719,66 @@ fn a_look_fade_is_captured_at_each_moment_of_it() {
     );
 }
 
+/// Kindling's shape (#1157): the scene authors one look, a script cuts to a
+/// second and later fades to a third. The cut and the fade are taken at the
+/// same capture, so a capture that laid only the last request faded from the
+/// authored look, not from the cut's.
+const THREE_LOOKS: &str = r#"
+let cut = false;
+let faded = false;
+fn on_update() {
+    let t = total_time();
+    if !cut && t >= 0.5 { set_look("graphite"); cut = true; }
+    if !faded && t >= 1.0 { set_look("ink_wash", 2.0); faded = true; }
+}
+"#;
+
+/// A scene that authors `look`, and a script set to `THREE_LOOKS`.
+fn author_look(dir: &Path, look: &str) {
+    std::fs::write(
+        dir.join("floor.scene.toml"),
+        format!("{SCENE}\n[post_process]\nlook = \"{look}\"\n"),
+    )
+    .unwrap();
+    std::fs::write(dir.join("scripts/tint.rhai"), THREE_LOOKS).unwrap();
+}
+
+/// #1157: a fade's source is the look on screen when it was asked. At the
+/// midpoint of a graphite to ink wash fade, a scene authoring blueprint
+/// (cut to graphite first) draws what a scene authoring graphite does,
+/// byte for byte; before the fix it drew blueprint's white lines on blue.
+#[test]
+fn a_fade_after_a_cut_starts_from_the_cut_not_the_authored_look() {
+    let dir = project("three_looks");
+    author_look(&dir, "blueprint");
+    let args = |t: &'static str| ["--scripts", "--time", t];
+    let o = render(&dir, "blueprint_mid.png", &args("2"));
+    if no_gpu(&o) {
+        return;
+    }
+    ok(&o);
+    ok(&render(&dir, "blueprint_at_start.png", &args("0")));
+    ok(&render(&dir, "graphite_held.png", &args("0.9")));
+    ok(&render(&dir, "ink_wash_arrived.png", &args("3")));
+    author_look(&dir, "graphite");
+    ok(&render(&dir, "graphite_mid.png", &args("2")));
+    let read = |name: &str| std::fs::read(dir.join(name)).unwrap();
+    assert!(
+        read("blueprint_mid.png") == read("graphite_mid.png"),
+        "the fade's middle depends on the look authored before the cut"
+    );
+    for other in [
+        "blueprint_at_start.png",
+        "graphite_held.png",
+        "ink_wash_arrived.png",
+    ] {
+        assert!(
+            read("blueprint_mid.png") != read(other),
+            "the fade's middle is {other}"
+        );
+    }
+}
+
 /// #497: a capture's scripts read the look it draws with (`--look` here,
 /// over the scene's none) from `on_init`, and the one they set from the
 /// frame after the capture applied it; `list_looks()` has the built-ins.
@@ -1288,4 +1348,51 @@ fn a_ui_document_is_drawn_over_the_capture() {
     let wrong = render(&dir, "wrong.png", &["--ui-focus", "goo"]);
     assert!(!wrong.status.success());
     assert!(stderr(&wrong).contains("goo"), "{}", stderr(&wrong));
+}
+
+/// A text input's caret is drawn headless (#1229): `--ui-focus` gives the
+/// name field focus as a click would, and its caret (pure red here) is drawn
+/// at the start of its empty box; without focus there is none.
+#[test]
+fn ui_focus_shows_a_text_inputs_caret() {
+    let dir = project("ui_text_input");
+    std::fs::create_dir_all(dir.join("ui")).unwrap();
+    std::fs::write(dir.join("flint.toml"), "[project]\n").unwrap();
+    std::fs::write(
+        dir.join("scripts/tint.rhai"),
+        "load_ui(\"ui/name.ui.toml\");\nfn on_update() {}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("ui/name.ui.toml"),
+        "[ui]\nstyle = \"ui/name.style.toml\"\n\n[elements.name]\ntype = \"text_input\"\nclass = \"field\"\n",
+    )
+    .unwrap();
+    // A black box 4..60 x 4..44, its inside from 10; a 24-point font makes
+    // a 2-point caret, 10..12 across
+    std::fs::write(
+        dir.join("ui/name.style.toml"),
+        "[styles.field]\nx = 4\ny = 4\nwidth = 56\nheight = 40\npadding = [6, 6, 6, 6]\nfont_size = 24\nbg_color = [0.0, 0.0, 0.0, 1.0]\ncaret_color = [1.0, 0.0, 0.0, 1.0]\n",
+    )
+    .unwrap();
+    let at = |name: &str, x: u32| {
+        let image = image::open(dir.join(name)).unwrap().to_rgba8();
+        let p = image.get_pixel(x, 24);
+        [p[0], p[1], p[2]]
+    };
+
+    let unfocused = render(&dir, "unfocused.png", &["--scripts"]);
+    if no_gpu(&unfocused) {
+        return;
+    }
+    ok(&unfocused);
+    assert_eq!(at("unfocused.png", 10), [0, 0, 0], "no focus, no caret");
+
+    ok(&render(&dir, "focused.png", &["--ui-focus", "name"]));
+    let caret = at("focused.png", 10);
+    assert!(
+        caret[0] > 200 && caret[1] < 40 && caret[2] < 40,
+        "the caret at the box's start: {caret:?}"
+    );
+    assert_eq!(at("focused.png", 30), [0, 0, 0], "and only there");
 }

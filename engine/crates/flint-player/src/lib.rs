@@ -12,10 +12,16 @@ pub mod load_args;
 pub mod logging;
 #[cfg(feature = "music")]
 mod music;
+// Whether this build has a project's packages, and `flint build`'s
+// set-aside binaries (#1335)
+pub mod packages;
 // `--skip-pass` / `--repeat-pass` (#1317)
 pub mod pass_knob_args;
+pub mod present_args;
 // `--perf-report FILE` (#1093)
 pub mod perf_report_args;
+// What a launch's options mean, whichever host read them (#1142)
+pub mod play_options;
 mod player_app;
 // The desktop launch, shared by `flint play` and `flint-player` (#705)
 pub mod player_args;
@@ -46,6 +52,7 @@ pub use hitch_args::{HitchArgs, HitchClass, HitchGate};
 pub use load_args::LoadReportArgs;
 pub use pass_knob_args::PassKnobArgs;
 pub use perf_report_args::PerfReportArgs;
+pub use play_options::{PlayOptions, Query};
 #[cfg(not(target_arch = "wasm32"))]
 pub use player_app::expression_feed::ExpressionListener;
 pub use player_app::expression_feed::{ExpressionFeed, ExpressionTimeline, TimedState};
@@ -53,7 +60,8 @@ pub use player_app::fonts::project_font_definitions;
 pub use player_app::frame_rate::FrameRateSetting;
 pub use player_app::headless_animation::HeadlessAnimation;
 pub use player_app::headless_game::{
-    apply_look, HeadlessGame, LookRequest, ScriptLook, Skipped, PRESENTATION_ONLY, SCRIPT_SEED,
+    apply_look, CaptureStart, HeadlessGame, LookRequest, ScriptLook, Skipped, PRESENTATION_ONLY,
+    SCRIPT_SEED,
 };
 #[cfg(not(target_arch = "wasm32"))]
 pub use player_app::headless_hud::HeadlessHud;
@@ -70,7 +78,7 @@ pub use player_app::living_props::{
 };
 pub use player_app::playtest::{
     run as playtest, Ended as PlaytestEnded, Failure as PlaytestFailure, PlaytestOptions,
-    PlaytestReport, DEFAULT_STEP as PLAYTEST_STEP,
+    PlaytestReport, SaveReport as PlaytestSave, DEFAULT_STEP as PLAYTEST_STEP,
 };
 pub use player_app::playtest_warnings::warning_layer as playtest_warning_layer;
 #[cfg(feature = "procgen")]
@@ -98,6 +106,7 @@ pub use player_app::ProcGenMode;
 pub use player_app::StatsView;
 pub use player_app::{CaptureConfig, GameCore, LaunchOptions, PlayerApp, SceneSettings};
 pub use player_args::{launch, launch_bundle, PlayerArgs, PlayerCli, Prepared};
+pub use present_args::PresentArgs;
 #[cfg(not(target_arch = "wasm32"))]
 pub use provenance::git_state;
 pub use provenance::Provenance;

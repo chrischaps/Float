@@ -1,7 +1,7 @@
 //! `flint render`'s flags (#708): grouped by what they do, so `--help` reads
 //! by heading. The per-effect post flags it had are `--set` and `--style`
-//! now ([`super::render_post`]); they are still parsed, hidden, for a
-//! release, from [`super::render_post::LegacyPostArgs`].
+//! now ([`super::render_post`]); given, each is an error naming its spelling
+//! ([`super::render_retired`], #1144).
 
 use super::render_plan::{self, TimeSpec};
 use crate::commands::common_args::{parse_debug_mode, parse_vec3};
@@ -22,7 +22,7 @@ const DEBUG_LISTS: &str = "Debug, lists, GPU and schemas";
 /// and that is for the stack as much as for `--help`: in a debug build a
 /// derived `augment_args` is one frame of about 8 KB a flag, and the
 /// 130-flag struct this was needed 1.3 MB to parse any command line (#708).
-/// Keep a struct to a dozen or so flags; `main.rs`'s `stack_tests` hold the
+/// Keep a struct to a dozen or so flags; `lib.rs`'s `stack_tests` hold the
 /// whole parser to 1 MB.
 #[derive(clap::Args)]
 #[command(group(clap::ArgGroup::new("sequence").multiple(true).args(["frames", "mesh"])))]
@@ -113,9 +113,9 @@ pub struct RenderArgs {
     #[command(flatten)]
     pub debug: DebugArgs,
 
-    /// The per-effect flags `--set` and `--style` replaced, hidden.
+    /// The deprecated render mode (#746), hidden until #1036.
     #[command(flatten)]
-    pub legacy: super::render_post::LegacyPostArgs,
+    pub render_mode: super::render_post::RenderModeArgs,
 }
 
 /// What a render writes besides -o, and --watch.

@@ -87,6 +87,9 @@ pub struct InputSnapshot {
     pub touch_taps: Vec<(f64, f64)>,
     /// Swipe gestures detected this frame (direction_str, start_norm_x, start_norm_y)
     pub touch_swipes: Vec<(String, f64, f64)>,
+    /// What was typed this frame, in order: what a focused `text_input`
+    /// takes (#1229).
+    pub text_edits: Vec<flint_runtime::TextEdit>,
 }
 
 /// Where a scene's music is this frame (#745): what `music_beat()`,
@@ -199,6 +202,18 @@ pub enum ScriptCommand {
     SetBusVolume {
         bus: String,
         volume: f64,
+    },
+    /// `set_user_bus_volume`: the player's own volume for a bus (0..1),
+    /// multiplied with the game's and saved for the next run (#1217).
+    SetUserBusVolume {
+        bus: String,
+        volume: f64,
+    },
+    /// `set_bus_lowpass`: a mixer bus's own low-pass cutoff, Hz (20000 is
+    /// open), by name (#1218).
+    SetBusLowpass {
+        bus: String,
+        hz: f64,
     },
     FireEvent {
         name: String,
@@ -859,6 +874,9 @@ pub struct ScriptCallContext {
     pub camera_follow: CameraFollowState,
     /// Persistent screen shake state
     pub shake: ShakeState,
+    /// The 3D camera rig's shake, hand-held camera and shot lists (#1158),
+    /// laid over the camera asked for when the requests are taken
+    pub camera_rig: crate::rig::CameraRig,
     /// Set of currently loaded chunk IDs (synced from PlayerApp before scripts run)
     pub loaded_chunk_ids: HashSet<String>,
     /// The modules an optional feature owns that may run now (#698): what
@@ -891,6 +909,11 @@ pub struct ScriptCallContext {
     /// scripts run, as it does `audio_positions`; a headless host never
     /// does, so there every handle is silent.
     pub sounds_playing: HashSet<u64>,
+    /// The player's own volume for each bus they set, by name, for
+    /// `user_bus_volume` (#1217). The host sets it at start and whenever
+    /// it changes; `set_user_bus_volume` writes it too, so a script reads
+    /// back what it set on the same frame.
+    pub user_bus_volumes: std::collections::HashMap<String, f64>,
     /// How long after it is mixed a sound is heard, seconds, where the
     /// platform says (the browser), for `audio_output_latency`.
     pub audio_output_latency: Option<f64>,
@@ -986,6 +1009,7 @@ impl ScriptCallContext {
             text_measurer: None,
             camera_follow: CameraFollowState::default(),
             shake: ShakeState::default(),
+            camera_rig: crate::rig::CameraRig::default(),
             loaded_chunk_ids: HashSet::new(),
             enabled_modules: Vec::new(),
             module_state: Default::default(),
@@ -995,6 +1019,7 @@ impl ScriptCallContext {
             opts_warned: HashSet::new(),
             audio_positions: std::collections::HashMap::new(),
             sounds_playing: HashSet::new(),
+            user_bus_volumes: std::collections::HashMap::new(),
             audio_output_latency: None,
             test: Default::default(),
         }
@@ -1121,10 +1146,18 @@ impl ScriptCallContext {
     /// commands in the order they were made, then this frame's requests
     /// (camera, post-processing, time scale...), one command each, for
     /// those asked for. A distance scale asked for reads back from here on
-    /// (`get_lod_scale()`) until the host says what it applied.
+    /// (`get_lod_scale()`) until the host says what it applied. A camera
+    /// asked for takes the rig's shake and hand-held jitter here, after
+    /// every script's own position and target (#1158).
     pub fn take_commands(&mut self) -> Vec<ScriptCommand> {
         let mut out = std::mem::take(&mut self.commands);
-        let r = std::mem::take(&mut self.requests);
+        let mut r = std::mem::take(&mut self.requests);
+        self.camera_rig.shake_requested(
+            self.total_time,
+            &mut r.camera,
+            self.camera_position,
+            self.camera_direction,
+        );
         if r.camera != CameraOverrides::default() {
             out.push(ScriptCommand::SetCamera { camera: r.camera });
         }

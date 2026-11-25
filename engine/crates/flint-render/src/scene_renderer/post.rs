@@ -163,7 +163,7 @@ impl SceneRenderer {
     }
 
     /// This frame's drawing for the shading boil (#214), from the wooze field.
-    pub(crate) fn set_boil(&mut self, boil: flint_wooze::BoilFrame) {
+    pub(crate) fn set_boil(&mut self, boil: flint_core::field_frame::BoilFrame) {
         self.postprocess_config.boil = boil;
         self.authored_postprocess.boil = boil;
     }
@@ -218,6 +218,8 @@ impl SceneRenderer {
     /// - `post_process`, `bloom`, `ssao`, `ssao_samples`, `fog`,
     ///   `volumetric` cap the post config: off turns the effect off, on
     ///   leaves it as set.
+    /// - `lod_scale`, `draw_distance_scale`: the distance levers, as
+    ///   [`set_lod_settings`](Self::set_lod_settings) sets them (#1149).
     pub fn set_quality(
         &mut self,
         device: &wgpu::Device,
@@ -282,17 +284,33 @@ impl SceneRenderer {
         device: &wgpu::Device,
         config: &PostProcessConfig,
     ) -> Vec<&'static str> {
+        self.prepare_styles_with(device, config, &[])
+    }
+
+    /// [`prepare_styles`](Self::prepare_styles), with every stage draw
+    /// built for the styles named in `every_draw` (#1159): the blend, the
+    /// reveal and the tear, whatever their tables in `config` say now. A
+    /// frame otherwise builds each the first time a style's `reveal` lies
+    /// between 0 and 1 (Plaintext's tear: 92 ms), its `blend` drops under 1
+    /// or it follows the tear. A scene's `[post_process] preload_styles`.
+    pub fn prepare_styles_with(
+        &mut self,
+        device: &wgpu::Device,
+        config: &PostProcessConfig,
+        every_draw: &[&str],
+    ) -> Vec<&'static str> {
         flint_core::scope!("prepare_styles");
         let Some(pp) = &mut self.postprocess_pipeline else {
             return Vec::new();
         };
         let surface_format = pp.surface_format;
-        pp.styles.prepare(
+        pp.styles.prepare_with(
             device,
             surface_format,
             config,
             &self.style_mask.ids,
             &self.styles,
+            every_draw,
         )
     }
 
@@ -344,11 +362,15 @@ impl SceneRenderer {
                 resources.binds.clear();
             }
         }
-        // A user style replaced by an edit (#275) left its old groups under
-        // names nothing asks for again (#427). Asked of whichever view is
-        // swapped in, so each comic panel's cache drops them at its draw
+        // A user style replaced by an edit (#275) left its old install's
+        // groups, which nothing asks for again (#427). Gone is what this
+        // renderer's registry no longer holds, never what another renderer
+        // replaced (#1271). Asked of whichever view is swapped in, so each
+        // comic panel's cache drops them at its draw
         if let Some(resources) = &self.postprocess_resources {
-            resources.binds.evict_retired();
+            resources
+                .binds
+                .evict_gone_installs(|install| self.styles.holds_install(install));
         }
         for failed in failures {
             if failed.is_user() {
