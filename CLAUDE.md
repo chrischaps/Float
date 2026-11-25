@@ -27,7 +27,7 @@ reference/    Visual reference images (water/, raft/)
 ## Build & run
 
 ```
-build.bat                 # cargo build --release in engine/ (flint, flint-player)
+build.bat                 # flint build --release in engine/ (flint, flint-player)
 play.bat [scene]          # run scenes/float.scene.toml (default)
 play_sfx_only.bat [scene] # same, music bus muted (--music-volume 0)
 render.bat                # headless PNG snapshots into snapshots/
@@ -47,6 +47,12 @@ scene + scripts and fails on any asset they name but that didn't ship
 this matters because missing one-shots fail silently at runtime.
 
 Schemas are layered: `--schemas engine\schemas --schemas schemas` (game wins).
+`flint.toml` (Flint #1338) marks the project root and carries that list, the
+main scene and the input layer, so flint commands need no `--schemas`. Its
+`[packages]` sets `procgen = false`: `flint build` makes a player and CLI with
+only the kernel + `debug-hud` (no procgen/wooze/living/music/rhythm).
+`build.bat` bootstraps a `flint` that knows `build` on the first run (cargo,
+inside `engine\` with `flint build`'s own features), then calls it.
 
 ## Engine subtree workflow
 
@@ -470,7 +476,9 @@ to the rest — underwater during a drunk tear drew nothing; test
 Android; without `--no-fail-fast` cargo stops at the first red binary;
 without the `trace` feature flint-player's #1096 `scope_coverage_tests`
 don't compile in release — `profile::with_rings` exists only under
-`debug_assertions` or `trace`). Flint's CI does NOT run the workspace
+`debug_assertions` or `trace`). The suite rebuilds `engine\target\release\flint.exe` with EVERY
+package (`flint package list --built` → 7 of 7): run `build.bat` after it to
+get the slim pair back (~7 s). Flint's CI does NOT run the workspace
 suite (only checks and targeted test binaries), so "CI green" upstream
 doesn't clear it. Expected red INSIDE this subtree at 3772abca (17 of
 4847; none touches code Float runs): the examples layer (`fixture_scenes_cli`
