@@ -65,14 +65,386 @@ const GRASS_SHADOW_CASCADES: usize = 2;
 /// rebinds only what changes.
 #[derive(Default)]
 struct MainPassState<'a> {
-    /// Opaque skinned: woozy or not, double-sided or not.
-    skinned: Option<(bool, bool)>,
-    /// Echoes: lighten or not, and the transform and bones bound.
-    echo_lighten: Option<bool>,
+    /// The pipeline bound, set only when a draw needs another.
+    bound: BoundPipeline<'a>,
+    /// Echoes: the transform and bones bound.
     transform: Option<&'a std::sync::Arc<wgpu::BindGroup>>,
     bones: Option<&'a std::sync::Arc<wgpu::BindGroup>>,
-    /// Particles: the blend bound.
-    particles: Option<flint_particles::ParticleBlendMode>,
+}
+
+/// The pipeline the main pass draws one item through (#1151), chosen once
+/// by [`SceneRenderer::main_pipe`]: [`draw_main`](SceneRenderer::draw_main)
+/// binds only what [`pipelines`](Self::pipelines) hands it, and the frame's
+/// description names it by [`name`](Self::name). Both are matches with no
+/// wildcard arm, so a new choice is a new variant, and it can't be drawn
+/// without its name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum MainPipe {
+    Terrain,
+    /// An opaque wireframe box.
+    Line,
+    /// An opaque mesh: through the woozy vertex stage (#215), and culling
+    /// nothing for a glTF `doubleSided` material (#623).
+    Mesh {
+        woozy: bool,
+        double_sided: bool,
+    },
+    /// A blended mesh; alpha draws its back faces first, then its front.
+    MeshBlended {
+        woozy: bool,
+        mode: crate::pipeline::BlendMode,
+    },
+    Skinned {
+        woozy: bool,
+        double_sided: bool,
+    },
+    /// A skinned mesh translucent only for its soft edge (#582).
+    SkinnedSoftEdge,
+    SkinnedBlended {
+        woozy: bool,
+        mode: crate::pipeline::BlendMode,
+    },
+    Billboard,
+    /// A living prop's echo (#228), max-blended when it may only add light.
+    Echo {
+        lighten: bool,
+    },
+    Particles(flint_particles::ParticleBlendMode),
+}
+
+/// What one [`MainPipe`] binds: for alpha, the back faces' pipeline drawn
+/// first, then the draw's own.
+struct MainPipelines<'a> {
+    back: Option<&'a wgpu::RenderPipeline>,
+    front: &'a wgpu::RenderPipeline,
+}
+
+impl MainPipe {
+    /// Whether it draws through shallow wooze's vertex stage (#215). The
+    /// veils redraw an item and follow this (#1241), so they put each
+    /// vertex where this pass did.
+    pub(super) fn woozy(self) -> bool {
+        match self {
+            MainPipe::Mesh { woozy, .. }
+            | MainPipe::MeshBlended { woozy, .. }
+            | MainPipe::Skinned { woozy, .. }
+            | MainPipe::SkinnedBlended { woozy, .. } => woozy,
+            MainPipe::Terrain
+            | MainPipe::Line
+            | MainPipe::SkinnedSoftEdge
+            | MainPipe::Billboard
+            | MainPipe::Echo { .. }
+            | MainPipe::Particles(_) => false,
+        }
+    }
+
+    /// What the frame's description calls it.
+    pub(super) fn name(self) -> &'static str {
+        use crate::pipeline::BlendMode as M;
+        use flint_particles::ParticleBlendMode as P;
+        match self {
+            MainPipe::Terrain => "terrain",
+            MainPipe::Line => "line",
+            MainPipe::Mesh {
+                woozy: true,
+                double_sided: true,
+            } => "wooze opaque double-sided",
+            MainPipe::Mesh {
+                woozy: true,
+                double_sided: false,
+            } => "wooze opaque",
+            MainPipe::Mesh {
+                woozy: false,
+                double_sided: true,
+            } => "pbr double-sided",
+            MainPipe::Mesh {
+                woozy: false,
+                double_sided: false,
+            } => "pbr",
+            MainPipe::MeshBlended { woozy: true, mode } => match mode {
+                M::Alpha => "wooze alpha (back, then front)",
+                M::Additive => "wooze additive",
+                M::Multiply => "wooze multiply",
+            },
+            MainPipe::MeshBlended { woozy: false, mode } => match mode {
+                M::Alpha => "pbr alpha (back, then front)",
+                M::Additive => "pbr additive",
+                M::Multiply => "pbr multiply",
+            },
+            MainPipe::Skinned {
+                woozy: true,
+                double_sided: true,
+            } => "wooze skinned double-sided",
+            MainPipe::Skinned {
+                woozy: true,
+                double_sided: false,
+            } => "wooze skinned",
+            MainPipe::Skinned {
+                woozy: false,
+                double_sided: true,
+            } => "skinned double-sided",
+            MainPipe::Skinned {
+                woozy: false,
+                double_sided: false,
+            } => "skinned",
+            MainPipe::SkinnedSoftEdge => "skinned soft edge",
+            MainPipe::SkinnedBlended { woozy: true, mode } => match mode {
+                M::Alpha => "wooze skinned alpha (back, then front)",
+                M::Additive => "wooze skinned additive",
+                M::Multiply => "wooze skinned multiply",
+            },
+            MainPipe::SkinnedBlended { woozy: false, mode } => match mode {
+                M::Alpha => "skinned alpha (back, then front)",
+                M::Additive => "skinned additive",
+                M::Multiply => "skinned multiply",
+            },
+            MainPipe::Billboard => "billboard",
+            MainPipe::Echo { lighten: true } => "echo lighten",
+            MainPipe::Echo { lighten: false } => "skinned alpha (echo)",
+            MainPipe::Particles(blend) => match blend {
+                P::Alpha => "particles alpha",
+                P::Premultiplied => "particles premultiplied",
+                P::Additive => "particles additive",
+                P::Multiply => "particles multiply",
+            },
+        }
+    }
+
+    /// The pipelines it draws through, `None` when they weren't made (a
+    /// shader that failed, a woozy set not yet built).
+    fn pipelines(self, p: &super::pipelines::ScenePipelines) -> Option<MainPipelines<'_>> {
+        use crate::pipeline::BlendMode as M;
+        let one = |front| MainPipelines { back: None, front };
+        // Alpha draws back faces first so the front faces blend over them
+        let blended = |mode, back, alpha, additive, multiply| match mode {
+            M::Alpha => MainPipelines {
+                back: Some(back),
+                front: alpha,
+            },
+            M::Additive => one(additive),
+            M::Multiply => one(multiply),
+        };
+        fn wooze(w: &crate::wooze_pipeline::WoozePipelineSet, mode: M) -> MainPipelines<'_> {
+            MainPipelines {
+                back: (mode == M::Alpha).then_some(&w.alpha_back),
+                front: w.blended(mode),
+            }
+        }
+        let m = &p.main;
+        Some(match self {
+            MainPipe::Terrain => one(&p.terrain.as_ref()?.pipeline),
+            MainPipe::Line => one(&m.line_pipeline),
+            MainPipe::Mesh {
+                woozy: true,
+                double_sided,
+            } => {
+                let w = p.wooze_standard.as_deref()?;
+                one(if double_sided {
+                    &w.opaque_double_sided
+                } else {
+                    &w.opaque
+                })
+            }
+            MainPipe::Mesh {
+                woozy: false,
+                double_sided,
+            } => one(if double_sided {
+                &m.pipeline_double_sided
+            } else {
+                &m.pipeline
+            }),
+            MainPipe::MeshBlended { woozy: true, mode } => {
+                wooze(p.wooze_standard.as_deref()?, mode)
+            }
+            MainPipe::MeshBlended { woozy: false, mode } => blended(
+                mode,
+                &m.transparent_alpha_back_pipeline,
+                &m.transparent_alpha_pipeline,
+                &m.transparent_additive_pipeline,
+                &m.transparent_multiply_pipeline,
+            ),
+            MainPipe::Skinned {
+                woozy: true,
+                double_sided,
+            } => {
+                p.skinned.as_ref()?;
+                let w = p.wooze_skinned.as_deref()?;
+                one(if double_sided {
+                    &w.opaque_double_sided
+                } else {
+                    &w.opaque
+                })
+            }
+            MainPipe::Skinned {
+                woozy: false,
+                double_sided,
+            } => {
+                let sp = p.skinned.as_ref()?;
+                one(if double_sided {
+                    &sp.pipeline_double_sided
+                } else {
+                    &sp.pipeline
+                })
+            }
+            MainPipe::SkinnedSoftEdge => one(&p.skinned.as_ref()?.soft_edge_pipeline),
+            MainPipe::SkinnedBlended { woozy: true, mode } => {
+                p.skinned.as_ref()?;
+                wooze(p.wooze_skinned.as_deref()?, mode)
+            }
+            MainPipe::SkinnedBlended { woozy: false, mode } => {
+                let sp = p.skinned.as_ref()?;
+                blended(
+                    mode,
+                    &sp.transparent_alpha_back_pipeline,
+                    &sp.transparent_alpha_pipeline,
+                    &sp.transparent_additive_pipeline,
+                    &sp.transparent_multiply_pipeline,
+                )
+            }
+            MainPipe::Billboard => one(&p.billboard.as_ref()?.pipeline),
+            MainPipe::Echo { lighten } => {
+                let sp = p.skinned.as_ref()?;
+                one(if lighten {
+                    &sp.echo_lighten_pipeline
+                } else {
+                    &sp.transparent_alpha_pipeline
+                })
+            }
+            MainPipe::Particles(blend) => one(p.particle.as_ref()?.pipeline(blend)),
+        })
+    }
+}
+
+/// The pipeline the shadow pass draws one caster through (#1151): what
+/// [`draw_caster`] binds and what the description names, from one choice,
+/// as [`MainPipe`] is for the main pass.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum CasterPipe {
+    /// A mesh or a terrain chunk (which never drifts and culls back faces).
+    Mesh {
+        woozy: bool,
+        double_sided: bool,
+    },
+    Skinned {
+        woozy: bool,
+        double_sided: bool,
+    },
+}
+
+impl CasterPipe {
+    /// What `caster` casts through, `woozy` when it drifts and the pass has
+    /// its woozy set.
+    fn of(caster: &Caster<'_>, woozy: bool) -> Self {
+        match caster {
+            Caster::Mesh(d) => CasterPipe::Mesh {
+                woozy,
+                double_sided: d.double_sided,
+            },
+            Caster::Skinned(d) => CasterPipe::Skinned {
+                woozy,
+                double_sided: d.double_sided,
+            },
+            Caster::Terrain(_) => CasterPipe::Mesh {
+                woozy: false,
+                double_sided: false,
+            },
+        }
+    }
+
+    /// What the frame's description calls it.
+    pub(super) fn name(self) -> &'static str {
+        match self {
+            CasterPipe::Mesh {
+                woozy: true,
+                double_sided: true,
+            } => "wooze shadow double-sided",
+            CasterPipe::Mesh {
+                woozy: true,
+                double_sided: false,
+            } => "wooze shadow",
+            CasterPipe::Mesh {
+                woozy: false,
+                double_sided: true,
+            } => "shadow double-sided",
+            CasterPipe::Mesh {
+                woozy: false,
+                double_sided: false,
+            } => "shadow",
+            CasterPipe::Skinned {
+                woozy: true,
+                double_sided: true,
+            } => "wooze skinned shadow double-sided",
+            CasterPipe::Skinned {
+                woozy: true,
+                double_sided: false,
+            } => "wooze skinned shadow",
+            CasterPipe::Skinned {
+                woozy: false,
+                double_sided: true,
+            } => "skinned shadow double-sided",
+            CasterPipe::Skinned {
+                woozy: false,
+                double_sided: false,
+            } => "skinned shadow",
+        }
+    }
+
+    /// The pipeline and draw bind group it binds; `None` for a woozy one
+    /// without the pass's woozy set.
+    fn pipeline<'p>(
+        self,
+        sp: &'p crate::shadow::ShadowPass,
+        woozy: Option<&'p crate::shadow::ShadowWooze>,
+    ) -> Option<(&'p wgpu::RenderPipeline, &'p wgpu::BindGroup)> {
+        Some(match self {
+            CasterPipe::Mesh {
+                woozy: true,
+                double_sided,
+            } => {
+                let w = woozy?;
+                let p = if double_sided {
+                    &w.pipeline_double_sided
+                } else {
+                    &w.pipeline
+                };
+                (p, &w.bind_group)
+            }
+            CasterPipe::Mesh {
+                woozy: false,
+                double_sided,
+            } => {
+                let p = if double_sided {
+                    &sp.shadow_pipeline_double_sided
+                } else {
+                    &sp.shadow_pipeline
+                };
+                (p, &sp.draw_bind_group)
+            }
+            CasterPipe::Skinned {
+                woozy: true,
+                double_sided,
+            } => {
+                let w = woozy?;
+                let p = if double_sided {
+                    &w.skinned_pipeline_double_sided
+                } else {
+                    &w.skinned_pipeline
+                };
+                (p, &w.bind_group)
+            }
+            CasterPipe::Skinned {
+                woozy: false,
+                double_sided,
+            } => {
+                let p = if double_sided {
+                    &sp.skinned_shadow_pipeline_double_sided
+                } else {
+                    &sp.skinned_shadow_pipeline
+                };
+                (p, &sp.draw_bind_group)
+            }
+        })
+    }
 }
 
 /// What the shadow map draws an item as.
@@ -203,13 +575,29 @@ impl LayerGroup {
 
 /// The pipeline a pass has bound, so it sets one only when it changes.
 #[derive(Default)]
-struct BoundPipeline<'p>(Option<&'p wgpu::RenderPipeline>);
+struct BoundPipeline<'p> {
+    bound: Option<&'p wgpu::RenderPipeline>,
+    /// The overdraw view's twins (#1203): each pipeline asked for is bound
+    /// as its twin. The draw loop skips a draw with none
+    /// ([`SceneRenderer::twinned`]), so one is always found.
+    twins: Option<&'p Twins>,
+}
+
+/// Each scene pipeline's overdraw twin (#1203).
+pub(super) type Twins = std::collections::HashMap<wgpu::RenderPipeline, wgpu::RenderPipeline>;
 
 impl<'p> BoundPipeline<'p> {
     fn set(&mut self, pass: &mut wgpu::RenderPass<'_>, pipeline: &'p wgpu::RenderPipeline) {
-        if self.0.is_none_or(|b| !std::ptr::eq(b, pipeline)) {
+        let pipeline = match self.twins {
+            Some(twins) => match twins.get(pipeline) {
+                Some(twin) => twin,
+                None => return,
+            },
+            None => pipeline,
+        };
+        if self.bound.is_none_or(|b| !std::ptr::eq(b, pipeline)) {
             pass.set_pipeline(pipeline);
-            self.0 = Some(pipeline);
+            self.bound = Some(pipeline);
         }
     }
 }
@@ -225,25 +613,10 @@ fn draw_caster<'p>(
 ) {
     let offset = (*next_slot as u64 * SHADOW_DRAW_STRIDE) as u32;
     *next_slot += 1;
-    let sp = shadow_pass;
-    let (pipeline, bind) = match (caster, woozy) {
-        (Caster::Mesh(d), Some(w)) if d.double_sided => (&w.pipeline_double_sided, &w.bind_group),
-        (Caster::Mesh(_), Some(w)) => (&w.pipeline, &w.bind_group),
-        (Caster::Mesh(d), None) if d.double_sided => {
-            (&sp.shadow_pipeline_double_sided, &sp.draw_bind_group)
-        }
-        (Caster::Skinned(d), Some(w)) if d.double_sided => {
-            (&w.skinned_pipeline_double_sided, &w.bind_group)
-        }
-        (Caster::Skinned(_), Some(w)) => (&w.skinned_pipeline, &w.bind_group),
-        (Caster::Skinned(d), None) if d.double_sided => (
-            &sp.skinned_shadow_pipeline_double_sided,
-            &sp.draw_bind_group,
-        ),
-        (Caster::Skinned(_), None) => (&sp.skinned_shadow_pipeline, &sp.draw_bind_group),
-        (Caster::Mesh(_), None) | (Caster::Terrain(_), _) => {
-            (&sp.shadow_pipeline, &sp.draw_bind_group)
-        }
+    let Some((pipeline, bind)) =
+        CasterPipe::of(caster, woozy.is_some()).pipeline(shadow_pass, woozy)
+    else {
+        return;
     };
     bound.set(pass, pipeline);
     pass.set_bind_group(0, bind, &[offset]);
@@ -258,20 +631,6 @@ fn draw_caster<'p>(
     pass.set_vertex_buffer(0, vertex.slice(..));
     pass.set_index_buffer(index.slice(..), wgpu::IndexFormat::Uint32);
     pass.draw_indexed(0..count, 0, 0..1);
-}
-
-/// The pipeline [`draw_caster`] draws `caster` through, by its choices.
-fn caster_pipeline_name(caster: &Caster<'_>, woozy: bool) -> &'static str {
-    match (caster, woozy) {
-        (Caster::Mesh(d), true) if d.double_sided => "wooze shadow double-sided",
-        (Caster::Mesh(_), true) => "wooze shadow",
-        (Caster::Mesh(d), false) if d.double_sided => "shadow double-sided",
-        (Caster::Skinned(d), true) if d.double_sided => "wooze skinned shadow double-sided",
-        (Caster::Skinned(_), true) => "wooze skinned shadow",
-        (Caster::Skinned(d), false) if d.double_sided => "skinned shadow double-sided",
-        (Caster::Skinned(_), false) => "skinned shadow",
-        (Caster::Mesh(_), false) | (Caster::Terrain(_), _) => "shadow",
-    }
 }
 
 impl SceneRenderer {
@@ -301,7 +660,7 @@ impl SceneRenderer {
             }
             for (item, caster) in shadow_casters(&self.draws, &self.terrain.draws) {
                 let woozy = item.wooze().is_some() && woozy_pass;
-                let name = caster_pipeline_name(&caster, woozy);
+                let name = CasterPipe::of(&caster, woozy).name();
                 if !drawn.sees(&caster) {
                     logged
                         .culled
@@ -884,7 +1243,7 @@ impl SceneRenderer {
             }
         } else {
             // The editor grid is drawn in here, after the opaque geometry.
-            self.render_normal_pass(render_pass, phase);
+            self.render_normal_pass(render_pass, phase, None);
         }
 
         // Normal arrows pass (always uses line pipeline)
@@ -1026,14 +1385,32 @@ impl SceneRenderer {
     /// skinned → billboards → grid → sprites → blended statics → blended
     /// skinned → echoes → particles → wireframe. The list's layers in their
     /// order, with what isn't a draw item between them.
-    fn render_normal_pass<'a>(
+    ///
+    /// `twins` draws it as the overdraw view (#1203): every draw of the
+    /// description's list through its pipeline's counting twin, the water
+    /// through its depth-only one, and nothing else (no grid, no overlay).
+    /// Without them the frame's draw times are taken here, if asked.
+    pub(super) fn render_normal_pass<'a>(
         &'a self,
         render_pass: &mut wgpu::RenderPass<'a>,
         phase: RenderPhase,
+        twins: Option<(&'a Twins, &'a Twins)>,
     ) {
+        let (twins, depth_twins) = match twins {
+            Some((t, d)) => (Some(t), Some(d)),
+            None => (None, None),
+        };
+        // The pipeline a draw outside the list's items binds: its twin in
+        // the overdraw view, where one with none draws nothing
+        let pick = |p: &'a wgpu::RenderPipeline| match twins {
+            Some(t) => t.get(p),
+            None => Some(p),
+        };
+        // The frame's draw times count only the frame's own pass (#1203)
+        let timer = twins.is_none().then_some(&self.draw_times);
         // Terrain rendering (early in pass — fills depth buffer for occlusion)
         if phase.draws_opaque() {
-            self.draw_layer(render_pass, Layer::Terrain);
+            self.draw_layer(render_pass, Layer::Terrain, twins);
 
             // Grass rendering (after terrain -- also writes depth)
             if let (Some(gp), Some(render_bg), Some(instance_bg), Some(args)) = (
@@ -1044,12 +1421,15 @@ impl SceneRenderer {
             ) {
                 if self.grass.drawing && !self.draws.grass_cut() {
                     let group = PassGroup::open(render_pass, "Grass");
+                    let slot = timer.and_then(|t| t.before(render_pass));
                     // Bind group 0 (transform): the grass's own view uniforms,
                     // so grass on a game's ground draws with no terrain loaded
                     if let Some(transform_bg) = &self.grass.transform_bind_group {
                         render_pass.set_bind_group(0, transform_bg, &[]);
                     }
-                    render_pass.set_pipeline(&gp.render_pipeline);
+                    if let Some(p) = pick(&gp.render_pipeline) {
+                        render_pass.set_pipeline(p);
+                    }
                     render_pass.set_bind_group(1, render_bg, &[]);
                     render_pass.set_bind_group(2, &self.lights.bind_group, &[]);
                     render_pass.set_bind_group(3, instance_bg, &[]);
@@ -1059,8 +1439,21 @@ impl SceneRenderer {
                         wgpu::IndexFormat::Uint16,
                     );
                     // The count is the compute pass's, culled to the view (ADR 0092)
-                    render_pass.draw_indexed_indirect(args, 0);
+                    if pick(&gp.render_pipeline).is_some() {
+                        render_pass.draw_indexed_indirect(args, 0);
+                    }
+                    if let Some(t) = timer {
+                        t.after(render_pass, slot);
+                    }
                     group.close(render_pass);
+                }
+            } else if self.grass.drawing
+                && self.pipelines.grass.is_some()
+                && !self.draws.grass_cut()
+            {
+                // Listed (`log_scene_draws`) though not drawn
+                if let Some(t) = timer {
+                    t.skip(1);
                 }
             }
         } // end opaque phase (terrain + grass)
@@ -1069,22 +1462,34 @@ impl SceneRenderer {
         // group 3 holds the grab-pass snapshots, or dummies when disabled)
         if self.water_active() && phase.draws_ocean() {
             let group = PassGroup::open(render_pass, "Water");
-            self.water.draw(
-                render_pass,
-                self.pipelines.ocean.as_deref(),
-                &self.lights.bind_group,
-            );
+            match depth_twins {
+                // The overdraw view: the water's depth alone, so what lies
+                // beneath it is tested as in the frame
+                Some(depth) => self.water.draw_through(
+                    render_pass,
+                    self.pipelines.ocean.as_deref(),
+                    &self.lights.bind_group,
+                    |p| depth.get(p),
+                ),
+                None => self.water.draw(
+                    render_pass,
+                    self.pipelines.ocean.as_deref(),
+                    &self.lights.bind_group,
+                ),
+            }
             group.close(render_pass);
         }
 
         if phase.draws_opaque() {
-            self.draw_layer(render_pass, Layer::OpaqueStatic);
-            self.draw_layer(render_pass, Layer::OpaqueSkinned);
+            self.draw_layer(render_pass, Layer::OpaqueStatic, twins);
+            self.draw_layer(render_pass, Layer::OpaqueSkinned, twins);
             // Billboard sprites (after geometry, uses depth test)
-            self.draw_layer(render_pass, Layer::Billboard);
+            self.draw_layer(render_pass, Layer::Billboard, twins);
 
             // After every opaque draw: an overlay, not geometry (#346)
-            self.draw_editor_grid(render_pass);
+            if twins.is_none() {
+                self.draw_editor_grid(render_pass);
+            }
         } // end opaque phase (entities + skinned + billboards + grid)
 
         if !phase.draws_rest() {
@@ -1095,15 +1500,24 @@ impl SceneRenderer {
         if let Some(sp) = &self.pipelines.sprite2d {
             if !self.sprite2d_batches.is_empty() {
                 let group = PassGroup::open(render_pass, "2D sprites");
-                render_pass.set_pipeline(&sp.pipeline);
+                let pipeline = pick(&sp.pipeline);
+                if let Some(p) = pipeline {
+                    render_pass.set_pipeline(p);
+                }
                 render_pass
                     .set_index_buffer(sp.quad_index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                 render_pass.set_bind_group(0, &sp.uniform_bind_group, &[]);
                 let drawn = self.draws.sprites_drawn();
                 for batch in self.sprite2d_batches.iter().take(drawn) {
+                    let slot = timer.and_then(|t| t.before(render_pass));
                     render_pass.set_bind_group(1, &batch.instance_bind_group, &[]);
                     render_pass.set_bind_group(2, &batch.texture_bind_group, &[]);
-                    render_pass.draw_indexed(0..6, 0, 0..batch.instance_count);
+                    if pipeline.is_some() {
+                        render_pass.draw_indexed(0..6, 0, 0..batch.instance_count);
+                    }
+                    if let Some(t) = timer {
+                        t.after(render_pass, slot);
+                    }
                 }
                 group.close(render_pass);
             }
@@ -1112,15 +1526,15 @@ impl SceneRenderer {
         // Blended PBR entities, then blended skinned ones (each sorted back to
         // front, depth write off; alpha blend draws back faces then front
         // faces so a mesh cannot blend over itself)
-        self.draw_layer(render_pass, Layer::BlendedStatic);
-        self.draw_layer(render_pass, Layer::BlendedSkinned);
+        self.draw_layer(render_pass, Layer::BlendedStatic, twins);
+        self.draw_layer(render_pass, Layer::BlendedSkinned, twins);
         // Living props' echoes (#228)
-        self.draw_layer(render_pass, Layer::Echo);
+        self.draw_layer(render_pass, Layer::Echo, twins);
         // Particle systems (after billboards + transparent, before wireframe overlay)
-        self.draw_layer(render_pass, Layer::Particles);
+        self.draw_layer(render_pass, Layer::Particles, twins);
 
         // Wireframe overlay pass (on top of solid geometry)
-        if self.debug_state.mode == DebugMode::WireframeOverlay {
+        if self.debug_state.mode == DebugMode::WireframeOverlay && twins.is_none() {
             let group = PassGroup::open(render_pass, "Wireframe overlay");
             render_pass.set_pipeline(&self.pipelines.main.overlay_line_pipeline);
             for draw in &self.wireframe_overlay_draws {
@@ -1139,27 +1553,49 @@ impl SceneRenderer {
     /// Draw one layer of the list in the main pass: what the layer sets up
     /// once, then each item this camera draws through the main pass's
     /// selector, then what it puts back.
-    fn draw_layer<'a>(&'a self, render_pass: &mut wgpu::RenderPass<'a>, layer: Layer) {
+    ///
+    /// `twins`: the overdraw view's (#1203), each draw through its
+    /// pipeline's twin and one with none left out; without them, the
+    /// frame's draw times are taken around each draw the list counts.
+    fn draw_layer<'a>(
+        &'a self,
+        render_pass: &mut wgpu::RenderPass<'a>,
+        layer: Layer,
+        twins: Option<&'a Twins>,
+    ) {
         let items = self.draws.layer(layer);
         if !items.iter().any(DrawItem::drawn) {
             return;
         }
+        let timer = twins.is_none().then_some(&self.draw_times);
+        // A layer this GPU can't draw still has its draws listed
+        let listed = || {
+            items
+                .iter()
+                .filter(|i| i.drawn() && self.main_pass_draws(i))
+                .count()
+        };
         match layer {
+            // Their pipelines are bound by draw_main, as every other's
             Layer::Terrain => {
-                let (Some(tp), Some(mat_bg)) =
+                let (Some(_), Some(mat_bg)) =
                     (&self.pipelines.terrain, &self.terrain.material_bind_group)
                 else {
+                    if let Some(t) = timer {
+                        t.skip(listed());
+                    }
                     return;
                 };
-                render_pass.set_pipeline(&tp.pipeline);
                 render_pass.set_bind_group(1, mat_bg, &[]);
                 render_pass.set_bind_group(2, &self.lights.bind_group, &[]);
             }
             Layer::Billboard => {
-                let Some(bp) = &self.pipelines.billboard else {
+                if self.pipelines.billboard.is_none() {
+                    if let Some(t) = timer {
+                        t.skip(listed());
+                    }
                     return;
-                };
-                render_pass.set_pipeline(&bp.pipeline);
+                }
             }
             // Re-bind lights for group 2 (billboard binds may have displaced them)
             Layer::BlendedStatic | Layer::Echo => {
@@ -1169,6 +1605,9 @@ impl SceneRenderer {
             // additive last) and all index one shared instance buffer (ADR 0068).
             Layer::Particles => {
                 let (Some(_), Some(pp)) = (&self.pipelines.particle, &self.particle_buffers) else {
+                    if let Some(t) = timer {
+                        t.skip(listed());
+                    }
                     return;
                 };
                 render_pass
@@ -1184,11 +1623,25 @@ impl SceneRenderer {
         let marks = crate::gpu_labels::draws();
         let mut label = DrawLabel::default();
         let mut state = MainPassState::default();
+        state.bound.twins = twins;
         for item in items.iter().filter(|i| i.drawn()) {
-            if marks && self.main_pass_draws(item) {
+            let listed = self.main_pass_draws(item);
+            if let Some(twins) = twins {
+                if !listed || !self.twinned(item, twins) {
+                    continue;
+                }
+            }
+            if marks && listed {
                 self.draws.mark(render_pass, &mut label, item);
             }
+            let slot = match timer {
+                Some(t) if listed => t.before(render_pass),
+                _ => None,
+            };
             self.draw_main(render_pass, item, &mut state);
+            if let Some(t) = timer {
+                t.after(render_pass, slot);
+            }
         }
         group.close(render_pass);
         match layer {
@@ -1239,137 +1692,132 @@ impl SceneRenderer {
         );
     }
 
-    /// The main pass's selector: one item, through the pipeline its kind,
-    /// blend and vertex stage ask for.
+    /// The pipeline the main pass draws `item` through (#1151), by its
+    /// kind, blend, vertex stage and sides; `None` when it draws nothing
+    /// (a blended wireframe box, a particle draw that isn't there). What
+    /// [`draw_main`](Self::draw_main) binds and the description names.
+    pub(super) fn main_pipe(&self, item: &DrawItem) -> Option<MainPipe> {
+        let woozy = item.wooze().is_some();
+        let woozy_static = woozy && self.pipelines.wooze_standard.is_some();
+        let woozy_skinned = woozy && self.pipelines.wooze_skinned.is_some();
+        let opaque = item.blend == Blend::Opaque;
+        let mode = item.blend.mesh_mode();
+        Some(match &item.draw {
+            Draw::Terrain(_) => MainPipe::Terrain,
+            Draw::Static(d) if d.is_wireframe => {
+                if !opaque {
+                    return None;
+                }
+                MainPipe::Line
+            }
+            Draw::Static(d) if opaque => MainPipe::Mesh {
+                woozy: woozy_static,
+                double_sided: d.double_sided,
+            },
+            Draw::Static(_) => MainPipe::MeshBlended {
+                woozy: woozy_static,
+                mode,
+            },
+            Draw::Skinned(d) if opaque => MainPipe::Skinned {
+                woozy: woozy_skinned,
+                double_sided: d.double_sided,
+            },
+            Draw::Skinned(d) if d.soft_edge_only && !woozy_skinned => MainPipe::SkinnedSoftEdge,
+            Draw::Skinned(_) => MainPipe::SkinnedBlended {
+                woozy: woozy_skinned,
+                mode,
+            },
+            Draw::Billboard(_) => MainPipe::Billboard,
+            Draw::Echo(_) => MainPipe::Echo {
+                lighten: item.blend == Blend::Lighten,
+            },
+            Draw::Particles(n) => MainPipe::Particles(self.particle_draws.get(*n as usize)?.blend),
+        })
+    }
+
+    /// The pipelines the main pass binds for `item` (#1203: the overdraw
+    /// view makes their twins).
+    pub(super) fn item_pipelines(&self, item: &DrawItem) -> Vec<wgpu::RenderPipeline> {
+        let Some(MainPipelines { back, front }) = self
+            .main_pipe(item)
+            .and_then(|pipe| pipe.pipelines(&self.pipelines))
+        else {
+            return Vec::new();
+        };
+        back.into_iter().chain([front]).cloned().collect()
+    }
+
+    /// Whether every pipeline `item` binds has a twin in `twins`.
+    // A wgpu handle hashes and compares by identity, which never changes
+    #[allow(clippy::mutable_key_type)]
+    fn twinned(&self, item: &DrawItem, twins: &Twins) -> bool {
+        let pipelines = self.item_pipelines(item);
+        !pipelines.is_empty() && pipelines.iter().all(|p| twins.contains_key(p))
+    }
+
+    /// The main pass's selector: one item, through the pipelines its
+    /// [`main_pipe`](Self::main_pipe) hands it, and nothing else.
     fn draw_main<'a>(
         &'a self,
         render_pass: &mut wgpu::RenderPass<'a>,
         item: &'a DrawItem,
         state: &mut MainPassState<'a>,
     ) {
-        let main = &self.pipelines.main;
+        let Some(pipelines) = self
+            .main_pipe(item)
+            .and_then(|pipe| pipe.pipelines(&self.pipelines))
+        else {
+            return;
+        };
+        let MainPipelines { back, front } = pipelines;
         match &item.draw {
             Draw::Terrain(n) => {
                 let Some(draw) = self.terrain_chunk_in_view(*n) else {
                     return;
                 };
+                state.bound.set(render_pass, front);
                 render_pass.set_bind_group(0, &draw.transform_bind_group, &[]);
                 render_pass.set_vertex_buffer(0, draw.vertex_buffer.slice(..));
                 render_pass
                     .set_index_buffer(draw.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                 render_pass.draw_indexed(0..draw.index_count, 0, 0..1);
             }
-            Draw::Static(draw) if item.blend == Blend::Opaque => {
-                if draw.is_wireframe {
-                    render_pass.set_pipeline(&main.line_pipeline);
-                } else if let Some(woozy) =
-                    item.wooze().and(self.pipelines.wooze_standard.as_deref())
-                {
-                    render_pass.set_pipeline(if draw.double_sided {
-                        &woozy.opaque_double_sided
-                    } else {
-                        &woozy.opaque
-                    });
-                } else if draw.double_sided {
-                    render_pass.set_pipeline(&main.pipeline_double_sided);
-                } else {
-                    render_pass.set_pipeline(&main.pipeline);
-                }
-                render_pass.set_bind_group(0, &*draw.transform_bind_group, &[]);
-                render_pass.set_bind_group(1, &*draw.material_bind_group, &[]);
-                render_pass.set_vertex_buffer(0, draw.vertex_buffer.slice(..));
-                render_pass
-                    .set_index_buffer(draw.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-                render_pass.draw_indexed(0..draw.index_count, 0, 0..1);
-            }
             Draw::Static(draw) => {
-                if draw.is_wireframe {
-                    return;
-                }
-                let mode = item.blend.mesh_mode();
-                let pipeline = match mode {
-                    crate::pipeline::BlendMode::Alpha => &main.transparent_alpha_pipeline,
-                    crate::pipeline::BlendMode::Additive => &main.transparent_additive_pipeline,
-                    crate::pipeline::BlendMode::Multiply => &main.transparent_multiply_pipeline,
-                };
-                let woozy = item.wooze().and(self.pipelines.wooze_standard.as_deref());
                 render_pass.set_bind_group(0, &*draw.transform_bind_group, &[]);
                 render_pass.set_bind_group(1, &*draw.material_bind_group, &[]);
                 render_pass.set_vertex_buffer(0, draw.vertex_buffer.slice(..));
                 render_pass
                     .set_index_buffer(draw.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-                if mode == crate::pipeline::BlendMode::Alpha {
-                    // Back faces first so the front faces blend over them.
-                    render_pass.set_pipeline(
-                        woozy.map_or(&main.transparent_alpha_back_pipeline, |w| &w.alpha_back),
-                    );
+                if let Some(back) = back {
+                    state.bound.set(render_pass, back);
                     render_pass.draw_indexed(0..draw.index_count, 0, 0..1);
                 }
-                render_pass.set_pipeline(woozy.map_or(pipeline, |w| w.blended(mode)));
-                render_pass.draw_indexed(0..draw.index_count, 0, 0..1);
-            }
-            Draw::Skinned(draw) if item.blend == Blend::Opaque => {
-                let Some(sp) = &self.pipelines.skinned else {
-                    return;
-                };
-                // Rebound only when a draw needs another of the four (woozy or
-                // not, double-sided or not)
-                let woozy = item.wooze().and(self.pipelines.wooze_skinned.as_deref());
-                let wants = (woozy.is_some(), draw.double_sided);
-                if state.skinned != Some(wants) {
-                    state.skinned = Some(wants);
-                    render_pass.set_pipeline(match (woozy, draw.double_sided) {
-                        (Some(w), true) => &w.opaque_double_sided,
-                        (Some(w), false) => &w.opaque,
-                        (None, true) => &sp.pipeline_double_sided,
-                        (None, false) => &sp.pipeline,
-                    });
-                }
-                render_pass.set_bind_group(0, &*draw.transform_bind_group, &[]);
-                render_pass.set_bind_group(1, &*draw.material_bind_group, &[]);
-                // Light bind group 2 is already set
-                render_pass.set_bind_group(3, &*draw.bone_bind_group, &[]);
-                render_pass.set_vertex_buffer(0, draw.vertex_buffer.slice(..));
-                render_pass
-                    .set_index_buffer(draw.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                state.bound.set(render_pass, front);
                 render_pass.draw_indexed(0..draw.index_count, 0, 0..1);
             }
             Draw::Skinned(draw) => {
-                let Some(sp) = &self.pipelines.skinned else {
-                    return;
-                };
-                let mode = item.blend.mesh_mode();
-                let pipeline = match mode {
-                    crate::pipeline::BlendMode::Alpha => &sp.transparent_alpha_pipeline,
-                    crate::pipeline::BlendMode::Additive => &sp.transparent_additive_pipeline,
-                    crate::pipeline::BlendMode::Multiply => &sp.transparent_multiply_pipeline,
-                };
                 render_pass.set_bind_group(0, &*draw.transform_bind_group, &[]);
                 render_pass.set_bind_group(1, &*draw.material_bind_group, &[]);
-                render_pass.set_bind_group(2, &self.lights.bind_group, &[]);
+                // An opaque one finds the lights at group 2 already
+                if item.blend != Blend::Opaque {
+                    render_pass.set_bind_group(2, &self.lights.bind_group, &[]);
+                }
                 render_pass.set_bind_group(3, &*draw.bone_bind_group, &[]);
                 render_pass.set_vertex_buffer(0, draw.vertex_buffer.slice(..));
                 render_pass
                     .set_index_buffer(draw.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-                let woozy = item.wooze().and(self.pipelines.wooze_skinned.as_deref());
-                if draw.soft_edge_only && woozy.is_none() {
-                    render_pass.set_pipeline(&sp.soft_edge_pipeline);
-                    render_pass.draw_indexed(0..draw.index_count, 0, 0..1);
-                    return;
-                }
-                if mode == crate::pipeline::BlendMode::Alpha {
-                    render_pass.set_pipeline(
-                        woozy.map_or(&sp.transparent_alpha_back_pipeline, |w| &w.alpha_back),
-                    );
+                if let Some(back) = back {
+                    state.bound.set(render_pass, back);
                     render_pass.draw_indexed(0..draw.index_count, 0, 0..1);
                 }
-                render_pass.set_pipeline(woozy.map_or(pipeline, |w| w.blended(mode)));
+                state.bound.set(render_pass, front);
                 render_pass.draw_indexed(0..draw.index_count, 0, 0..1);
             }
             Draw::Billboard(draw) => {
                 let Some(bp) = &self.pipelines.billboard else {
                     return;
                 };
+                state.bound.set(render_pass, front);
                 render_pass.set_bind_group(0, &draw.billboard_bind_group, &[]);
                 render_pass.set_bind_group(1, &draw.texture_bind_group, &[]);
                 render_pass
@@ -1383,18 +1831,7 @@ impl SceneRenderer {
             // hidden. A prop whose echoes may only add light (`echo_blend =
             // "lighten"`) draws them with a max blend instead.
             Draw::Echo(draw) => {
-                let Some(sp) = &self.pipelines.skinned else {
-                    return;
-                };
-                let lighten = item.blend == Blend::Lighten;
-                if state.echo_lighten != Some(lighten) {
-                    render_pass.set_pipeline(if lighten {
-                        &sp.echo_lighten_pipeline
-                    } else {
-                        &sp.transparent_alpha_pipeline
-                    });
-                    state.echo_lighten = Some(lighten);
-                }
+                state.bound.set(render_pass, front);
                 // A tree's echoes share a transform, and an echo's parts its
                 // bones, so a grove rebinds those far less often than it draws.
                 if state
@@ -1418,16 +1855,10 @@ impl SceneRenderer {
                 render_pass.draw_indexed(0..draw.index_count, 0, 0..1);
             }
             Draw::Particles(n) => {
-                let (Some(pipeline), Some(draw)) = (
-                    &self.pipelines.particle,
-                    self.particle_draws.get(*n as usize),
-                ) else {
+                let Some(draw) = self.particle_draws.get(*n as usize) else {
                     return;
                 };
-                if state.particles != Some(draw.blend) {
-                    render_pass.set_pipeline(pipeline.pipeline(draw.blend));
-                    state.particles = Some(draw.blend);
-                }
+                state.bound.set(render_pass, front);
                 render_pass.set_bind_group(2, draw.texture_bind_group.as_ref(), &[]);
                 let first = draw.first_instance;
                 render_pass.draw_indexed(0..6, 0, first..first + draw.instance_count);
@@ -1630,7 +2061,7 @@ impl SceneRenderer {
             let edges =
                 pp.styles
                     .encode_edges(&both, frame, encoder, &mut |label, encoder, run| {
-                        self.run_style_part(device, scopes, label, encoder, run, None, None)
+                        self.run_style_part(device, scopes, label, encoder, run, None, None, None)
                     });
             frame.edges = edges;
             scopes.note(crate::stylize::edges::EDGE_LABEL, |p| {
@@ -1667,7 +2098,8 @@ impl SceneRenderer {
                 &mut |label, encoder, run| {
                     let dst = dst_of(&hdr_dsts, label);
                     let refuse = history_refusal(scopes.knobs.is_some(), &hdr_styles, label);
-                    self.run_style_part(device, scopes, label, encoder, run, dst, refuse)
+                    let held = held_of(scopes.taps.is_some(), &hdr_styles, label);
+                    self.run_style_part(device, scopes, label, encoder, run, dst, refuse, held)
                 },
             ),
             _ => None,
@@ -1946,7 +2378,8 @@ impl SceneRenderer {
                 &mut |label, encoder, run| {
                     let dst = dst_of(&display_dsts, label);
                     let refuse = history_refusal(scopes.knobs.is_some(), &display_styles, label);
-                    self.run_style_part(device, scopes, label, encoder, run, dst, refuse)
+                    let held = held_of(scopes.taps.is_some(), &display_styles, label);
+                    self.run_style_part(device, scopes, label, encoder, run, dst, refuse, held)
                 },
             );
             log_style_steps(
@@ -2097,6 +2530,26 @@ fn history_refusal(
             .iter()
             .any(|(d, p)| d.label == label && p.keeps_history()))
     .then_some(crate::pass_knobs::KEEPS_HISTORY)
+}
+
+/// Where the style drawing as `label` notes the textures it holds itself,
+/// while the frame is captured (#1161): `None` on every other frame, and for
+/// a part that is no style's own (a blend, the ownership cut).
+fn held_of<'a>(
+    capturing: bool,
+    styles: &[(
+        &crate::stylize::StyleDescriptor,
+        &'a dyn crate::stylize::StylePass,
+    )],
+    label: &str,
+) -> Option<&'a crate::stylize::HeldTargets> {
+    if !capturing {
+        return None;
+    }
+    styles
+        .iter()
+        .find(|(d, _)| d.label == label)
+        .and_then(|(_, p)| p.held_targets())
 }
 
 /// A style stage's slot as the description names its target: the stage's

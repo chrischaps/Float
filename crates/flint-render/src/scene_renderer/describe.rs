@@ -60,8 +60,12 @@ impl SceneRenderer {
             page,
             panels,
             notes,
+            targets: held,
+            page_camera,
             ..
         } = log;
+        // The frame's camera: a page's own, else its one view's
+        let camera = page_camera.or_else(|| views.first().and_then(|v| v.camera.clone()));
         let styles = views.last().map(|v| v.styles.clone()).unwrap_or_default();
         let mut views = views.into_iter();
         let (passes, panels) = if panels.is_empty() {
@@ -75,6 +79,7 @@ impl SceneRenderer {
                 .map(|(i, v)| fc::PanelDescription {
                     name: format!("again {}", i + 1),
                     size: v.size,
+                    camera: v.camera,
                     passes: v.passes.into_iter().map(|p| names.pass(p)).collect(),
                 })
                 .collect();
@@ -85,6 +90,7 @@ impl SceneRenderer {
                 .map(|(v, name)| fc::PanelDescription {
                     name,
                     size: v.size,
+                    camera: v.camera,
                     passes: v.passes.into_iter().map(|p| names.pass(p)).collect(),
                 })
                 .collect();
@@ -93,7 +99,13 @@ impl SceneRenderer {
 
         let mut stats = self.collect_stats();
         stats.resolution = self.surface_size.into();
-        let targets = self.frame_targets();
+        let mut targets = self.frame_targets();
+        // What the styles hold themselves, as the capture read them (#1161)
+        for t in held {
+            if !targets.iter().any(|k| k.id == t.id) {
+                targets.push(t);
+            }
+        }
         let style_target_bytes = self.style_target_entries().iter().map(|t| t.bytes).sum();
         let config = self.effective_post_process_config();
         let post_process = flint_schema::post_effects::params()
@@ -122,6 +134,7 @@ impl SceneRenderer {
             casts_shadow,
         };
         let mut described = FrameDescription {
+            camera,
             frame: fc::FrameInfo {
                 index: None,
                 game_time: None,
@@ -160,8 +173,34 @@ impl SceneRenderer {
             notes,
             ..Default::default()
         };
+        self.lay_draw_times(&mut described);
         name_images(&mut described);
         Some(described)
+    }
+
+    /// The scene pass's draws' GPU times a replay gathered (#1203), each on
+    /// its draw; a count that isn't the pass's list is said, not laid.
+    fn lay_draw_times(&self, described: &mut FrameDescription) {
+        let times = self.draw_times.times();
+        if times.is_empty() {
+            return;
+        }
+        let Some(scene) = described.passes.iter_mut().find(|p| p.name == "Scene") else {
+            return;
+        };
+        if times.len() != scene.draws.len() {
+            let note = format!(
+                "the draw times counted {} scene draws where the Scene pass lists {}: \
+                 left off the draws",
+                times.len(),
+                scene.draws.len()
+            );
+            described.notes.push(note);
+            return;
+        }
+        for (draw, ms) in scene.draws.iter_mut().zip(times) {
+            draw.gpu_ms = ms.map(|ms| ms as f32);
+        }
     }
 
     /// Every texture this frame's view draws into or reads, each once.
@@ -216,6 +255,13 @@ impl SceneRenderer {
                 });
             }
         }
+        if let Some(t) = self
+            .selection_outline
+            .as_ref()
+            .and_then(|o| o.mask_texture())
+        {
+            out.push(fc::target("selection_mask", t));
+        }
         let (color, depth) = self.msaa.textures();
         if let Some(t) = color {
             out.push(fc::target("msaa_color", t));
@@ -225,6 +271,11 @@ impl SceneRenderer {
         }
         if let Some(sp) = &self.shadow_pass {
             out.push(fc::target("shadow_map", &sp.shadow_texture));
+        }
+        // A replay's overdraw view (#1203)
+        if let (true, Some((count, heat))) = (self.overdraw.wanted, self.overdraw_textures()) {
+            out.push(fc::target("overdraw_count", count));
+            out.push(fc::target("overdraw", heat));
         }
         if let Some((t, _)) = &self.water.grab.color {
             out.push(fc::target("ocean_grab_color", t));
@@ -248,15 +299,17 @@ impl SceneRenderer {
     }
 
     /// The scene pass's draws, in the order it draws them, each through the
-    /// main pass's own selector (`main_pass_draws`); the culled beside them
-    /// with their reason. `eye` is where this camera's culls were made from.
+    /// main pass's own selector (`main_pass_draws`) and named by the
+    /// pipeline it binds (`main_pipe`); the culled beside them with their
+    /// reason. `eye` is where this camera's culls were made from.
     pub(super) fn log_scene_draws(&self, pass: &mut LoggedPass, eye: [f32; 3]) {
         for layer in Layer::ALL {
             for item in self.draws.layer(layer) {
                 if let Some(why) = self.cull_reason(item, eye) {
                     pass.culled.push(self.logged_draw(item, Some(why), ""));
                 } else if self.main_pass_draws(item) {
-                    let pipeline = self.main_pipeline_name(item);
+                    // The choice draw_main binds by (#1151)
+                    let pipeline = self.main_pipe(item).map_or("", |p| p.name());
                     pass.draws.push(self.logged_draw(item, None, pipeline));
                 } else if let Draw::Terrain(_) = item.draw {
                     pass.culled
@@ -347,7 +400,7 @@ impl SceneRenderer {
             return Some("lod");
         };
         let d = distance_to_box(eye, lod.ref_min, lod.ref_max);
-        let far = lod.band.draw_distance * self.lod_settings.draw_distance_scale;
+        let far = lod.band.draw_distance * self.quality.draw_distance_scale;
         Some(if d >= far { "draw distance" } else { "lod" })
     }
 
@@ -448,57 +501,6 @@ impl SceneRenderer {
                 pipeline: pipeline.to_string(),
                 instances,
                 ..Default::default()
-            },
-        }
-    }
-
-    /// The pipeline [`draw_main`](Self::draw_main) draws `item` through, by
-    /// the same choices it makes (kind, blend, vertex stage, sides).
-    fn main_pipeline_name(&self, item: &DrawItem) -> &'static str {
-        let woozy_static = item.wooze().is_some() && self.pipelines.wooze_standard.is_some();
-        let woozy_skinned = item.wooze().is_some() && self.pipelines.wooze_skinned.is_some();
-        let opaque = item.blend == Blend::Opaque;
-        let mode = item.blend.mesh_mode();
-        let blended = |woozy: bool, skinned: bool| match (woozy, skinned, mode) {
-            (true, _, crate::pipeline::BlendMode::Alpha) => "wooze alpha (back, then front)",
-            (true, _, crate::pipeline::BlendMode::Additive) => "wooze additive",
-            (true, _, crate::pipeline::BlendMode::Multiply) => "wooze multiply",
-            (false, false, crate::pipeline::BlendMode::Alpha) => "pbr alpha (back, then front)",
-            (false, false, crate::pipeline::BlendMode::Additive) => "pbr additive",
-            (false, false, crate::pipeline::BlendMode::Multiply) => "pbr multiply",
-            (false, true, crate::pipeline::BlendMode::Alpha) => "skinned alpha (back, then front)",
-            (false, true, crate::pipeline::BlendMode::Additive) => "skinned additive",
-            (false, true, crate::pipeline::BlendMode::Multiply) => "skinned multiply",
-        };
-        match &item.draw {
-            Draw::Terrain(_) => "terrain",
-            Draw::Static(d) if opaque => match (d.is_wireframe, woozy_static, d.double_sided) {
-                (true, _, _) => "line",
-                (false, true, true) => "wooze opaque double-sided",
-                (false, true, false) => "wooze opaque",
-                (false, false, true) => "pbr double-sided",
-                (false, false, false) => "pbr",
-            },
-            Draw::Static(_) => blended(woozy_static, false),
-            Draw::Skinned(d) if opaque => match (woozy_skinned, d.double_sided) {
-                (true, true) => "wooze skinned double-sided",
-                (true, false) => "wooze skinned",
-                (false, true) => "skinned double-sided",
-                (false, false) => "skinned",
-            },
-            Draw::Skinned(d) if d.soft_edge_only && !woozy_skinned => "skinned soft edge",
-            Draw::Skinned(_) => blended(woozy_skinned, true),
-            Draw::Billboard(_) => "billboard",
-            Draw::Echo(_) if item.blend == Blend::Lighten => "echo lighten",
-            Draw::Echo(_) => "skinned alpha (echo)",
-            Draw::Particles(n) => match self.particle_draws.get(*n as usize).map(|d| d.blend) {
-                Some(flint_particles::ParticleBlendMode::Alpha) => "particles alpha",
-                Some(flint_particles::ParticleBlendMode::Premultiplied) => {
-                    "particles premultiplied"
-                }
-                Some(flint_particles::ParticleBlendMode::Additive) => "particles additive",
-                Some(flint_particles::ParticleBlendMode::Multiply) => "particles multiply",
-                None => "particles",
             },
         }
     }

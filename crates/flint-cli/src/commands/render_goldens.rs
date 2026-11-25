@@ -1,5 +1,5 @@
-//! `flint goldens <file>.goldens.toml` (#271, its own command since #327;
-//! the old `render-suite` given one still runs it): render a list of
+//! `flint goldens <file>.goldens.toml` (#271, its own command since #327,
+//! once `render-suite <file>.goldens.toml`): render a list of
 //! scenes with `flint render`, each with its own flags, and compare every
 //! image with a checked-in golden PNG. The suite fails when any case moves
 //! past its tolerance, so a change to the stylize framework (or anything
@@ -106,12 +106,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// `flint goldens <manifest>`: the manifest and the flags (#327). Its own
-/// command, so `--help` lists only what a golden suite takes; the old
-/// `render-suite` given a `.goldens.toml` is routed here before parsing
-/// ([`super::legacy_names::route`]).
+/// command, so `--help` lists only what a golden suite takes.
 #[derive(clap::Args, Debug)]
-#[command(after_help = "The old `flint render-suite <file>.goldens.toml` \
-    still runs this command, for one release.\nManifest format: `flint goldens` in the book \
+#[command(after_help = "Manifest format: `flint goldens` in the book \
     (guides/headless-rendering.md#golden-suites).")]
 pub struct GoldensArgs {
     /// The suite: a `.goldens.toml` of cases, each a scene and its
@@ -737,7 +734,10 @@ fn render_in_process(
         std::iter::once(std::ffi::OsString::from("flint render")).chain(argv[1..].iter().cloned()),
     ) {
         Ok(cli) => cli,
-        Err(e) => return Ok(Rendered::Failed(e.to_string())),
+        Err(e) => {
+            let e = super::render_retired::explained(e, argv);
+            return Ok(Rendered::Failed(e.to_string()));
+        }
     };
     cli.args.command_line = argv[1..].to_vec();
     let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {

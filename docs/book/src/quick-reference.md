@@ -88,6 +88,7 @@ Where a key's owner isn't in the scene, or the game binds the key, the press is 
 | Alt+drag | Move vertically (Y) |
 | Middle-drag | Orbit |
 | Right-drag | Pan |
+| O, `[` / `]` | Toggle auto-orbit, slower / faster |
 | Tab / Shift+Tab | Cycle control points |
 | I | Insert point |
 | Delete | Remove point |
@@ -359,7 +360,7 @@ position = [0, 0, 0]
 | `ui_set_style_array(id, prop, [..])` | --- | Override `color` / `bg_color` / `stroke_color` / `padding` / `uv` / `shadow` |
 | `ui_token(name)` | value or `()` | Read a style token (`"accent"`, `"$accent"`, `"color.accent"`) as float / float array / string |
 | `ui_hit(id, x, y)` | `bool` | Point-in-rect against the element's resolved layout (logical points) |
-| `draw_text(x, y, text, size, #{font, color, align, stroke, spacing, layer, shadow, glow})` | --- | HUD text in a project font (`fonts/*.ttf`, family = file stem) |
+| `draw_text(x, y, text, size, #{font, color, align, stroke, spacing, layer, shadow, glow})` | --- | HUD text in a project font (`fonts/*.ttf`, family = file stem), or `font: "monospace"` for egui's fixed-pitch face |
 | `measure_text(text, size, #{font, spacing})` | `#{width,height}` | Real laid-out text size (also `measure_text(text, size)`) |
 | `draw_ring(cx, cy, r_in, r_out, start_deg, end_deg, r, g, b, a, layer)` | --- | Annular sector; degrees from 12 o'clock, clockwise (`draw_arc(cx, cy, radius, a0, a1, r, g, b, a, thickness, layer)` for a stroke) |
 | `draw_polygon(points, r, g, b, a, layer)` | --- | Convex fill from `[[x,y],...]` or flat `[x0,y0,...]`; `draw_polygon_outline(points, r, g, b, a, thickness, closed, layer)` |
