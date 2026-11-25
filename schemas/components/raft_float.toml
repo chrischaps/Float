@@ -2,13 +2,13 @@
 description = "Buoyancy tuning for a raft riding the ocean surface (scripts/raft.rhai)"
 
 [component.raft_float.fields]
-heave_response = { type = "float", description = "Vertical follow rate (1/s); lower = heavier raft", default = 3.0 }
-angular_response = { type = "float", description = "Pitch/roll follow rate (1/s); lower = lazier tilt", default = 2.0 }
-normal_blend = { type = "float", description = "0 = footprint-average tilt, 1 = exact local wave slope; blends the analytic ocean_normal into the tilt target", default = 0.4 }
-draft = { type = "float", description = "How deep the raft sits below the surface mean (m)", default = 0.08 }
-half_width = { type = "float", description = "Height-sampling half extent across the logs, X (m)", default = 1.0 }
-half_length = { type = "float", description = "Height-sampling half extent along the logs, Z (m)", default = 0.9 }
-drift_speed = { type = "float", description = "Slow drift speed (m/s)", default = 0.25 }
-drift_dir_deg = { type = "float", description = "Drift direction in degrees (0 = +Z); usually the wave direction", default = 25.0 }
-yaw_sway_deg = { type = "float", description = "Amplitude of the slow yaw oscillation (degrees)", default = 5.0 }
-yaw_sway_rate = { type = "float", description = "Frequency of the yaw oscillation (rad/s)", default = 0.05 }
+heave_response = { type = "f32", description = "Vertical follow rate (1/s); lower = heavier raft", default = 3.0 }
+angular_response = { type = "f32", description = "Pitch/roll follow rate (1/s); lower = lazier tilt", default = 2.0 }
+normal_blend = { type = "f32", description = "0 = footprint-average tilt, 1 = exact local wave slope; blends the analytic ocean_normal into the tilt target", default = 0.4 }
+draft = { type = "f32", description = "How deep the raft sits below the surface mean (m)", default = 0.08 }
+half_width = { type = "f32", description = "Height-sampling half extent across the logs, X (m)", default = 1.0 }
+half_length = { type = "f32", description = "Height-sampling half extent along the logs, Z (m)", default = 0.9 }
+drift_speed = { type = "f32", description = "Slow drift speed (m/s)", default = 0.25 }
+drift_dir_deg = { type = "f32", description = "Drift direction in degrees (0 = +Z); usually the wave direction", default = 25.0 }
+yaw_sway_deg = { type = "f32", description = "Amplitude of the slow yaw oscillation (degrees)", default = 5.0 }
+yaw_sway_rate = { type = "f32", description = "Frequency of the yaw oscillation (rad/s)", default = 0.05 }

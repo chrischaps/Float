@@ -311,13 +311,13 @@ splash_response = 1.0
 foam_glow_color = [0.35, 0.95, 0.75, 1.0]
 foam_glow = 0.0
 rain_ripple = 0.0       # impact rings; weather.rhai drives it with the rain
-show_probe = false      # parity buoy; toggle in F3 Ocean Debug → Diagnostics
 
 # ── Wave probe: CPU/GPU parity check (bright buoy pinned to
 #    ocean_height; if it detaches from the surface, parity broke).
-#    Off by default — toggled by ocean.show_probe (F3 Ocean Debug →
-#    Diagnostics); spawns parked underwater so it never flashes on
-#    the first frame. ──
+#    Parked underwater for good: the ocean has no `show_probe` since
+#    Flint #749, whose F3 Ocean Debug → Wave probe switch draws the
+#    parity cross itself, and wave_probe.rhai parks the buoy when the
+#    field isn't there. ──
 
 [entities.wave_probe]
 [entities.wave_probe.transform]

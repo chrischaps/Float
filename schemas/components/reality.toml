@@ -4,32 +4,32 @@ description = "Reality tears: rare autonomous render-mode events that bleed an a
 # The F3 panel (Flint #744): each field's `panel` says what it is on it, status, tune or trigger.
 [component.reality.fields]
 enabled = { type = "bool", description = "false = reality stays whole (no autonomous tears; F3 triggers still work)", default = true }
-min_interval_s = { type = "float", description = "Minimum real seconds between autonomous tears", default = 480.0, panel = { role = "tune", label = "Min interval (s)", min = 10.0, max = 7200.0, step = 5.0 } }
-max_interval_s = { type = "float", description = "Maximum real seconds between autonomous tears", default = 1200.0, panel = { role = "tune", label = "Max interval (s)", min = 10.0, max = 7200.0, step = 5.0 } }
-duration_min_s = { type = "float", description = "Shortest tear hold time (real seconds, excluding eases)", default = 20.0, panel = { role = "tune", label = "Duration min (s)", min = 2.0, max = 600.0, step = 1.0 } }
-duration_max_s = { type = "float", description = "Longest tear hold time (real seconds, excluding eases)", default = 45.0, panel = { role = "tune", label = "Duration max (s)", min = 2.0, max = 600.0, step = 1.0 } }
-ease_in_s = { type = "float", description = "Seconds for a tear to bleed in (0 -> full mix)", default = 2.5, panel = { role = "tune", label = "Ease in (s)", min = 0.1, max = 30.0, step = 0.1 } }
-ease_out_s = { type = "float", description = "Seconds for a tear to heal shut (full mix -> 0)", default = 3.5, panel = { role = "tune", label = "Ease out (s)", min = 0.1, max = 30.0, step = 0.1 } }
-w_matrix = { type = "float", description = "Matrix code-bleed weight (0 disables the mode)", default = 1.0, panel = { role = "tune", label = "Matrix weight", min = 0.0, max = 5.0, step = 0.05 } }
-w_blood = { type = "float", description = "Blood ocean weight (0 disables the mode)", default = 1.0, panel = { role = "tune", label = "Blood weight", min = 0.0, max = 5.0, step = 0.05 } }
-w_drunk = { type = "float", description = "Drunk view weight (0 disables the mode)", default = 1.0, panel = { role = "tune", label = "Drunk weight", min = 0.0, max = 5.0, step = 0.05 } }
-w_tron = { type = "float", description = "Tron wireframe weight (0 disables the mode)", default = 1.0, panel = { role = "tune", label = "Tron weight", min = 0.0, max = 5.0, step = 0.05 } }
-hour_center_matrix = { type = "float", description = "Game hour where the Matrix tear is most likely", default = 23.0 }
-hour_width_matrix = { type = "float", description = "Affinity half-width in hours (<= 0 = any hour)", default = 3.0 }
-hour_center_blood = { type = "float", description = "Game hour where the blood tear is most likely (dusk)", default = 19.0 }
-hour_width_blood = { type = "float", description = "Affinity half-width in hours (<= 0 = any hour)", default = 1.5 }
-hour_center_drunk = { type = "float", description = "Game hour where the drunk tear is most likely", default = 0.0 }
-hour_width_drunk = { type = "float", description = "Affinity half-width in hours (<= 0 = any hour; drunk is hour-blind)", default = 0.0 }
-hour_center_tron = { type = "float", description = "Game hour where the Tron tear is most likely (late night)", default = 22.0 }
-hour_width_tron = { type = "float", description = "Affinity half-width in hours (<= 0 = any hour)", default = 3.0 }
-mask_scale = { type = "float", description = "Bleed-mask patch frequency (higher = smaller patches)", default = 3.0, panel = { role = "tune", label = "Mask scale", min = 0.2, max = 20.0, step = 0.1 } }
-mask_style = { type = "float", description = "0 = fbm patches, 1 = radial iris", default = 0.0, panel = { role = "tune", label = "Mask style", labels = ["fbm patches", "radial iris"] } }
-base_vignette = { type = "float", description = "The scene's [post_process] vignette_intensity, mirrored: the Matrix tear ramps from it and heals back to it", default = 0.18 }
-trigger_mode = { type = "float", description = "One-shot: 1..4 starts that tear now (panel sets; script clears to -1)", default = -1.0, panel = { role = "trigger", label = "Tear", labels = ["", "Matrix", "Blood", "Drunk", "Tron"] } }
+min_interval_s = { type = "f32", description = "Minimum real seconds between autonomous tears", default = 480.0, panel = { role = "tune", label = "Min interval (s)", min = 10.0, max = 7200.0, step = 5.0 } }
+max_interval_s = { type = "f32", description = "Maximum real seconds between autonomous tears", default = 1200.0, panel = { role = "tune", label = "Max interval (s)", min = 10.0, max = 7200.0, step = 5.0 } }
+duration_min_s = { type = "f32", description = "Shortest tear hold time (real seconds, excluding eases)", default = 20.0, panel = { role = "tune", label = "Duration min (s)", min = 2.0, max = 600.0, step = 1.0 } }
+duration_max_s = { type = "f32", description = "Longest tear hold time (real seconds, excluding eases)", default = 45.0, panel = { role = "tune", label = "Duration max (s)", min = 2.0, max = 600.0, step = 1.0 } }
+ease_in_s = { type = "f32", description = "Seconds for a tear to bleed in (0 -> full mix)", default = 2.5, panel = { role = "tune", label = "Ease in (s)", min = 0.1, max = 30.0, step = 0.1 } }
+ease_out_s = { type = "f32", description = "Seconds for a tear to heal shut (full mix -> 0)", default = 3.5, panel = { role = "tune", label = "Ease out (s)", min = 0.1, max = 30.0, step = 0.1 } }
+w_matrix = { type = "f32", description = "Matrix code-bleed weight (0 disables the mode)", default = 1.0, panel = { role = "tune", label = "Matrix weight", min = 0.0, max = 5.0, step = 0.05 } }
+w_blood = { type = "f32", description = "Blood ocean weight (0 disables the mode)", default = 1.0, panel = { role = "tune", label = "Blood weight", min = 0.0, max = 5.0, step = 0.05 } }
+w_drunk = { type = "f32", description = "Drunk view weight (0 disables the mode)", default = 1.0, panel = { role = "tune", label = "Drunk weight", min = 0.0, max = 5.0, step = 0.05 } }
+w_tron = { type = "f32", description = "Tron wireframe weight (0 disables the mode)", default = 1.0, panel = { role = "tune", label = "Tron weight", min = 0.0, max = 5.0, step = 0.05 } }
+hour_center_matrix = { type = "f32", description = "Game hour where the Matrix tear is most likely", default = 23.0 }
+hour_width_matrix = { type = "f32", description = "Affinity half-width in hours (<= 0 = any hour)", default = 3.0 }
+hour_center_blood = { type = "f32", description = "Game hour where the blood tear is most likely (dusk)", default = 19.0 }
+hour_width_blood = { type = "f32", description = "Affinity half-width in hours (<= 0 = any hour)", default = 1.5 }
+hour_center_drunk = { type = "f32", description = "Game hour where the drunk tear is most likely", default = 0.0 }
+hour_width_drunk = { type = "f32", description = "Affinity half-width in hours (<= 0 = any hour; drunk is hour-blind)", default = 0.0 }
+hour_center_tron = { type = "f32", description = "Game hour where the Tron tear is most likely (late night)", default = 22.0 }
+hour_width_tron = { type = "f32", description = "Affinity half-width in hours (<= 0 = any hour)", default = 3.0 }
+mask_scale = { type = "f32", description = "Bleed-mask patch frequency (higher = smaller patches)", default = 3.0, panel = { role = "tune", label = "Mask scale", min = 0.2, max = 20.0, step = 0.1 } }
+mask_style = { type = "f32", description = "0 = fbm patches, 1 = radial iris", default = 0.0, panel = { role = "tune", label = "Mask style", labels = ["fbm patches", "radial iris"] } }
+base_vignette = { type = "f32", description = "The scene's [post_process] vignette_intensity, mirrored: the Matrix tear ramps from it and heals back to it", default = 0.18 }
+trigger_mode = { type = "f32", description = "One-shot: 1..4 starts that tear now (panel sets; script clears to -1)", default = -1.0, panel = { role = "trigger", label = "Tear", labels = ["", "Matrix", "Blood", "Drunk", "Tron"] } }
 end_now = { type = "bool", description = "One-shot: ease the active tear out immediately (panel sets; script clears)", default = false, panel = { role = "trigger", label = "End tear now" } }
-mix_override = { type = "float", description = "Debug: pin the active tear's mix 0..1 (-1 = script envelope)", default = -1.0, panel = { role = "tune", label = "Pin mix", unset = -1.0, from = "mix", min = 0.0, max = 1.0, slider = true } }
-active_mode = { type = "float", description = "PUBLISHED active mode 0..4 (script-owned; read-only elsewhere)", default = 0.0, panel = { role = "status", labels = ["Whole", "Matrix", "Blood", "Drunk", "Tron"] } }
-mix = { type = "float", description = "PUBLISHED current tear mix 0..1 (script-owned)", default = 0.0, panel = { role = "status", format = "mix {:.0}%", scale = 100.0 } }
-next_in_s = { type = "float", description = "PUBLISHED real seconds until the next scheduled tear (-1 = none)", default = -1.0, panel = { role = "status", format = "next tear in {:.0} s", unset = -1.0 } }
-lowpass_scale = { type = "float", description = "PUBLISHED audio lowpass factor 0..1 — applied by water_ambience.rhai (drunk muffle)", default = 1.0 }
+mix_override = { type = "f32", description = "Debug: pin the active tear's mix 0..1 (-1 = script envelope)", default = -1.0, panel = { role = "tune", label = "Pin mix", unset = -1.0, from = "mix", min = 0.0, max = 1.0, slider = true } }
+active_mode = { type = "f32", description = "PUBLISHED active mode 0..4 (script-owned; read-only elsewhere)", default = 0.0, panel = { role = "status", labels = ["Whole", "Matrix", "Blood", "Drunk", "Tron"] } }
+mix = { type = "f32", description = "PUBLISHED current tear mix 0..1 (script-owned)", default = 0.0, panel = { role = "status", format = "mix {:.0}%", scale = 100.0 } }
+next_in_s = { type = "f32", description = "PUBLISHED real seconds until the next scheduled tear (-1 = none)", default = -1.0, panel = { role = "status", format = "next tear in {:.0} s", unset = -1.0 } }
+lowpass_scale = { type = "f32", description = "PUBLISHED audio lowpass factor 0..1 — applied by water_ambience.rhai (drunk muffle)", default = 1.0 }
 debug_log = { type = "bool", description = "Print scheduling and envelope transitions", default = false }

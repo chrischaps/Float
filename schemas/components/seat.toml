@@ -3,38 +3,38 @@ description = "Seated first-person camera anchor scooting along the raft edge (s
 
 [component.seat.fields]
 raft = { type = "string", description = "Name of the raft entity to sit on", default = "raft" }
-edge_offset_z = { type = "float", description = "Scoot path half-extent along raft-local Z (m from center)", default = 1.05 }
-half_x = { type = "float", description = "Scoot path half-extent along raft-local X (m from center)", default = 0.95 }
-corner_radius = { type = "float", description = "Rounded-corner radius of the scoot path (m); the turn IS the corner transition", default = 0.3 }
-scoot_speed = { type = "float", description = "Max scoot speed along the edge (m/s) — continuous fallback mode only", default = 0.4 }
-scoot_ease = { type = "float", description = "Scoot velocity slew rate (1/s); lower = heavier body — continuous fallback mode only", default = 5.0 }
+edge_offset_z = { type = "f32", description = "Scoot path half-extent along raft-local Z (m from center)", default = 1.05 }
+half_x = { type = "f32", description = "Scoot path half-extent along raft-local X (m from center)", default = 0.95 }
+corner_radius = { type = "f32", description = "Rounded-corner radius of the scoot path (m); the turn IS the corner transition", default = 0.3 }
+scoot_speed = { type = "f32", description = "Max scoot speed along the edge (m/s) — continuous fallback mode only", default = 0.4 }
+scoot_ease = { type = "f32", description = "Scoot velocity slew rate (1/s); lower = heavier body — continuous fallback mode only", default = 5.0 }
 
 # Animation-driven stepped scooting (the body pushes itself; see body.rhai)
 animated_scoot = { type = "bool", description = "true = discrete scoot steps synced to the body's scoot clips; false = the old continuous slide", default = true }
-step_time = { type = "float", description = "One scoot step duration (s) — MUST match the scoot clip length in tools/generate_body.py", default = 1.4 }
-step_distance = { type = "float", description = "Seat travel per scoot step (m along the perimeter)", default = 0.35 }
-step_pause = { type = "float", description = "Rest after a step whose key was RELEASED (s); held keys chain with no rest so the clip repeats seamlessly", default = 0.18 }
-step_bob = { type = "float", description = "Eye lift at the push-up peak of a step (m) — matches the clip's pelvis lift", default = 0.06 }
-eye_height = { type = "float", description = "Eye height above the deck top (m) — legacy fixed-offset path", default = 0.55 }
-eye_inboard = { type = "float", description = "Eye pulled inboard of the scoot path (m); lean-back posture that also flattens the eye-to-knee angle so the legs reach the frame — legacy fixed-offset path", default = 0.1 }
-eye_follow = { type = "float", description = "0-1: how much the camera follows the body's 'eye' bone (bone_probe) instead of the fixed offset. 1 = pose motion is fully felt in the view; the motion-comfort dial", default = 1.0 }
-body_inset = { type = "float", description = "Body origin pulled inboard of the scoot path (m) — read by BOTH seat_camera.rhai and body.rhai so eye and body can never disagree", default = 0.03 }
-body_seat_y = { type = "float", description = "Body origin height above the raft origin (m) — shared like body_inset", default = 0.28 }
-deck_top = { type = "float", description = "Deck surface height above the raft origin (m)", default = 0.26 }
-roll_transfer = { type = "float", description = "Fraction of raft roll transferred to the camera (0-1)", default = 0.3 }
-mouse_sens = { type = "float", description = "Mouse look sensitivity (rad per count)", default = 0.0028 }
+step_time = { type = "f32", description = "One scoot step duration (s) — MUST match the scoot clip length in tools/generate_body.py", default = 1.4 }
+step_distance = { type = "f32", description = "Seat travel per scoot step (m along the perimeter)", default = 0.35 }
+step_pause = { type = "f32", description = "Rest after a step whose key was RELEASED (s); held keys chain with no rest so the clip repeats seamlessly", default = 0.18 }
+step_bob = { type = "f32", description = "Eye lift at the push-up peak of a step (m) — matches the clip's pelvis lift", default = 0.06 }
+eye_height = { type = "f32", description = "Eye height above the deck top (m) — legacy fixed-offset path", default = 0.55 }
+eye_inboard = { type = "f32", description = "Eye pulled inboard of the scoot path (m); lean-back posture that also flattens the eye-to-knee angle so the legs reach the frame — legacy fixed-offset path", default = 0.1 }
+eye_follow = { type = "f32", description = "0-1: how much the camera follows the body's 'eye' bone (bone_probe) instead of the fixed offset. 1 = pose motion is fully felt in the view; the motion-comfort dial", default = 1.0 }
+body_inset = { type = "f32", description = "Body origin pulled inboard of the scoot path (m) — read by BOTH seat_camera.rhai and body.rhai so eye and body can never disagree", default = 0.03 }
+body_seat_y = { type = "f32", description = "Body origin height above the raft origin (m) — shared like body_inset", default = 0.28 }
+deck_top = { type = "f32", description = "Deck surface height above the raft origin (m)", default = 0.26 }
+roll_transfer = { type = "f32", description = "Fraction of raft roll transferred to the camera (0-1)", default = 0.3 }
+mouse_sens = { type = "f32", description = "Mouse look sensitivity (rad per count)", default = 0.0028 }
 
 # Underwater moments (render mode 5): seat_camera.rhai detects the eye
 # dipping under a swell and drives the transient underwater effect.
-submerge_full_m = { type = "float", description = "Eye depth below the local surface (m) at which the published submerged factor saturates to 1", default = 0.15 }
-submerge_release_s = { type = "float", description = "Underwater effect release ease (s) after the eye clears the hysteresis band", default = 0.12 }
-force_submerge_s = { type = "float", description = "DEBUG one-shot: seconds of forced submersion (eye treated as 0.4 m deep); the script decrements it", default = 0.0 }
-submerged = { type = "float", description = "RUNTIME: published 0..1 eye-submersion factor — water_ambience.rhai muffles/ducks off it, reality.rhai yields the render-mode slot", default = 0.0 }
+submerge_full_m = { type = "f32", description = "Eye depth below the local surface (m) at which the published submerged factor saturates to 1", default = 0.15 }
+submerge_release_s = { type = "f32", description = "Underwater effect release ease (s) after the eye clears the hysteresis band", default = 0.12 }
+force_submerge_s = { type = "f32", description = "DEBUG one-shot: seconds of forced submersion (eye treated as 0.4 m deep); the script decrements it", default = 0.0 }
+submerged = { type = "f32", description = "RUNTIME: published 0..1 eye-submersion factor — water_ambience.rhai muffles/ducks off it, reality.rhai yields the render-mode slot", default = 0.0 }
 
 # Written by seat_camera.rhai every frame; read by body.rhai so the
 # body is placed from the SAME scoot state as the eye. Not hand-tuned.
-seat_x = { type = "float", description = "RUNTIME: raft-local seat X on the scoot path", default = 0.0 }
-seat_z = { type = "float", description = "RUNTIME: raft-local seat Z on the scoot path", default = 1.05 }
-step_dir = { type = "float", description = "RUNTIME: -1/0/+1 — scoot step in progress and its direction (body.rhai fires clips off transitions)", default = 0.0 }
-step_seq = { type = "float", description = "RUNTIME: increments on every scoot step start; body.rhai restarts the clip on a change so held keys repeat the step without dropping to idle", default = 0.0 }
-seat_out_deg = { type = "float", description = "RUNTIME: seat-outward heading (deg, 0 = raft +Z)", default = 0.0 }
+seat_x = { type = "f32", description = "RUNTIME: raft-local seat X on the scoot path", default = 0.0 }
+seat_z = { type = "f32", description = "RUNTIME: raft-local seat Z on the scoot path", default = 1.05 }
+step_dir = { type = "f32", description = "RUNTIME: -1/0/+1 — scoot step in progress and its direction (body.rhai fires clips off transitions)", default = 0.0 }
+step_seq = { type = "f32", description = "RUNTIME: increments on every scoot step start; body.rhai restarts the clip on a change so held keys repeat the step without dropping to idle", default = 0.0 }
+seat_out_deg = { type = "f32", description = "RUNTIME: seat-outward heading (deg, 0 = raft +Z)", default = 0.0 }
